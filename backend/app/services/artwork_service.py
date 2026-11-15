@@ -43,7 +43,7 @@ _JPEG_QUALITY = 85
 _PILLOW_ERRORS = (OSError, ValueError, SyntaxError, Image.DecompressionBombError)
 
 # The 8 × 8 Bayer matrix, as the part of a level each pixel is moved by before
-# it is rounded down: between -0.5 and 0.5, and never either.
+# it is rounded to the nearest level: between -0.5 and 0.5, and never either.
 _BAYER = np.array(
     [
         [0, 32, 8, 40, 2, 34, 10, 42],
@@ -188,8 +188,9 @@ def _rgb565(rgb: NDArray[np.uint8]) -> bytes:
     """The pixels as little-endian RGB565, with ordered dithering.
 
     Each channel is moved by the Bayer matrix's part of a level before it is
-    rounded down to its 5 or 6 bits, so that an area of one colour averages
-    to that colour (section 1.9). A value that is a level stays on it.
+    rounded to the nearest of its 5 or 6 bits' levels, so that an area of one
+    colour averages to that colour (section 1.9). A value that is a level
+    stays on it.
     """
     height, width, _ = rgb.shape
     dither = np.tile(_DITHER, (height // 8 + 1, width // 8 + 1))[:height, :width]
