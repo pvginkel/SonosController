@@ -47,6 +47,16 @@ def household(sonos: FakeSonosClient) -> FakeSonosClient:
     return sonos
 
 
+class _HeldTopologySubscription:
+    """A ZoneGroupTopology subscription a speaker granted, as SoCo counts one."""
+
+    sid = "uuid:RINCON_FAKE0000000301400_sub0000000001"
+    time_left = 86400
+
+    def __init__(self, service) -> None:
+        self.service = service
+
+
 class _Listener:
     """Collects what a subscription delivers."""
 
@@ -152,6 +162,34 @@ class TestSonosClientHousehold:
 
         assert raised.value.operation == "read the household's layout"
         assert raised.value.cause == "none of the seed speakers answered"
+
+    def test_the_soco_client_asks_a_speaker_while_soco_holds_a_topology_subscription(
+        self, app
+    ):
+        client = SoCoSonosClient(
+            settings=AppSettings(
+                sonos_seed_hosts=["192.0.2.3"],
+                sonos_event_advertise_host="sonos-events.invalid",
+            ),
+            health_service=app.container.health_service(),
+        )
+        # The client once its seed has answered and a topology subscription is
+        # held: SoCo then answers its own polls from what the last event left.
+        [seed] = client._candidates()
+        seed._household_id = "Sonos_silent"
+        held = _HeldTopologySubscription(seed.zoneGroupTopology)
+        seed.zone_group_state.add_subscription(held)
+        client._entry = seed
+
+        try:
+            with pytest.raises(ExternalServiceException) as raised:
+                client.read_household()
+        finally:
+            seed.zone_group_state.remove_subscription(held)
+            seed._household_id = None
+
+        assert raised.value.operation == "read the household's layout"
+        assert "none of the 1 seed speakers answered" in raised.value.cause
 
     def test_read_model(self, household):
         assert household.read_model(GARAGE) == "Play:3"
@@ -340,11 +378,23 @@ class TestSonosClientPicture:
 
         assert household.read_picture(GARAGE, picture) == household.picture_of(picture)
 
-    def test_a_picture_the_speaker_no_longer_serves_fails(self, household):
+    def test_a_picture_is_served_after_its_track_stops_being_current(self, household):
         picture = household.read_playback(GARAGE).track.picture
         household.next(GARAGE)
+        assert household.read_playback(GARAGE).track.picture != picture
 
+        assert household.read_picture(GARAGE, picture) == household.picture_of(picture)
+
+    @pytest.mark.parametrize("address", ["/getaa?s=1", "/nosuchpath", ""])
+    def test_an_address_that_names_no_picture_fails(self, household, address):
         with pytest.raises(ExternalServiceException, match="404"):
+            household.read_picture(GARAGE, address)
+
+    def test_a_picture_fails_when_the_household_does_not_answer(self, household):
+        picture = household.read_playback(GARAGE).track.picture
+        household.reachable = False
+
+        with pytest.raises(ExternalServiceException):
             household.read_picture(GARAGE, picture)
 
 

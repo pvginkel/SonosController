@@ -203,6 +203,12 @@ class TestLiveTransport:
             assert moved.queue_position == elsewhere
             assert moved.track.uri != found.track.uri
 
+            # The speaker serves a track's picture whatever plays.
+            assert moved.track.picture != found.track.picture
+            assert sonos.read_picture(garage, found.track.picture).startswith(
+                b"\xff\xd8"
+            )
+
             sonos.pause(garage)
             assert state_is(TransportState.PAUSED).transport_state is (
                 TransportState.PAUSED

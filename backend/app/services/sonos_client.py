@@ -634,13 +634,12 @@ class SoCoSonosClient(SonosClient):
         return [self._entry, *(seed for seed in seeds if seed is not self._entry)]
 
     def _any_device(self) -> Any:
-        """A device that gives the household's layout: any that answers."""
+        """A device that has just given SoCo the household's layout: any that
+        answers."""
         error: Exception | None = None
         for device in self._candidates():
             try:
-                if device is not self._entry:
-                    _probe(device, _SEED_TIMEOUT_SECONDS)
-                device.zone_group_state.poll(device)
+                _read_layout(device)
             except _SPEAKER_ERRORS as exc:
                 error = exc
                 continue
@@ -670,6 +669,23 @@ def _probe(device: Any, timeout: float) -> None:
     service's description, with a timeout of 10 seconds that nothing sets.
     """
     device.deviceProperties.GetZoneInfo([], timeout=timeout)
+
+
+def _read_layout(device: Any) -> None:
+    """Ask the device for the household's layout and hand it to SoCo.
+
+    SoCo's own poll asks no speaker while it holds a ZoneGroupTopology
+    subscription, nor within 5 seconds of its last poll: it answers from the
+    layout it took last. The arguments are given as in ``_probe()``.
+    """
+    response = device.zoneGroupTopology.GetZoneGroupState(
+        [], timeout=_SEED_TIMEOUT_SECONDS
+    )
+    device.zone_group_state.process_payload(
+        payload=response["ZoneGroupState"],
+        source="poll",
+        source_ip=device.ip_address,
+    )
 
 
 @contextmanager

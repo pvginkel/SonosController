@@ -20,6 +20,7 @@ import threading
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from urllib.parse import parse_qs, urlsplit
 
 from app.core_exceptions import ExternalServiceException
 from app.services.health_service import CheckResult, CheckStatus, HealthService
@@ -438,9 +439,10 @@ class FakeSonosClient(SonosClient):
         self._send_group_volume(coordinator)
 
     def read_picture(self, speaker_id: str, picture: str) -> bytes:
-        room = self._coordinator(speaker_id, "read the picture served by")
-        track = self._track(room)
-        if track is None or track.picture != picture:
+        self._coordinator(speaker_id, "read the picture served by")
+        # A speaker serves /getaa for the address it is given, whatever plays.
+        address = urlsplit(picture)
+        if address.path != "/getaa" or "u" not in parse_qs(address.query):
             raise ExternalServiceException(
                 f"read the picture speaker {speaker_id} serves",
                 "404 Client Error: Not Found",
