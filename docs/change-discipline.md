@@ -50,12 +50,12 @@ Every change ships with a test. "I verified it by hand" is not a substitute: the
 time. The suite is pytest under `backend/tests/`, run as `kc project test`, against a real
 PostgreSQL and the real SSE machinery.
 
-**Sonos and Plex are the one thing that is faked, the one exception to the modern app guide's
-TEST-1 (no mocks or fakes), and it waits on the operator's approval: until that is given, no slice
-writes a fake.** CI has no speaker and no Plex. pytest overrides the
-two client providers with hand-written in-memory fakes that keep state (a speaker's queue, transport
-state, volume and group; a small Plex library). Never `MagicMock`, never `monkeypatch` of SoCo or
-plexapi internals, and no other fake anywhere: everything above the clients is real.
+**Sonos and Plex are the one thing that is faked: the one exception to the modern app guide's
+TEST-1 (no mocks or fakes), approved for this project at its onboarding.** CI has no speaker and no
+Plex. pytest overrides the two client providers with hand-written in-memory fakes that keep state
+(a speaker's queue, transport state, volume and group; a small Plex library). Never `MagicMock`,
+never `monkeypatch` of SoCo or plexapi internals, and no other fake anywhere: everything above the
+clients is real.
 
 What the fakes cannot prove is what the real clients send, so a separate **live suite**,
 `backend/tests/live/`, marked `live` and deselected by default, runs the real clients against the
