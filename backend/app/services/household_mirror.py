@@ -18,6 +18,10 @@ before, a household that did not answer when the app started.
 Playback and the group volume are a group's: the mirror takes them from the
 events of the group's coordinator and serves them for every member. Every
 string it serves is Unicode NFC.
+
+A track's ``artwork_id`` names its picture (section 3.7): Plex's for a track
+queued from Plex, which Plex is asked for whenever the playback is read, and
+otherwise the picture the group's coordinator serves.
 """
 
 import logging
@@ -39,6 +43,7 @@ from app.schemas.stream_event_schema import (
     VolumeChangedEvent,
 )
 from app.services.event_sender import EventSender
+from app.services.plex_client import PlexClient
 from app.services.sonos_client import (
     UNREPORTED,
     Group,
@@ -52,11 +57,13 @@ from app.services.sonos_client import (
     SonosEvent,
     SonosService,
     SonosSubscription,
+    Track,
     TransportAction,
     TransportState,
     Volume,
     VolumeChanged,
 )
+from app.utils.artwork_id import plex_artwork_id, speaker_artwork_id
 from app.utils.lifecycle_coordinator import LifecycleCoordinatorProtocol, LifecycleEvent
 
 logger = logging.getLogger(__name__)
@@ -119,15 +126,16 @@ class Speaker:
 class PlayingTrack:
     """The track a group has loaded.
 
-    ``album`` and ``duration_ms`` are None where the source gives none, as a
-    radio stream does; ``track_id`` is the Plex rating key of a track queued
-    from Plex, else None.
+    ``album``, ``duration_ms`` and ``artwork_id`` are None where the source
+    gives none, as a radio stream does; ``track_id`` is the Plex rating key
+    of a track queued from Plex, else None.
     """
 
     title: str
     artist: str
     album: str | None
     duration_ms: int | None
+    artwork_id: str | None
     track_id: str | None
 
 
@@ -252,11 +260,13 @@ class HouseholdMirror:
     def __init__(
         self,
         sonos_client: SonosClient,
+        plex_client: PlexClient,
         event_sender: EventSender,
         lifecycle_coordinator: LifecycleCoordinatorProtocol,
         check_seconds: float = CHECK_SECONDS,
     ) -> None:
         self._client = sonos_client
+        self._plex = plex_client
         self._events = event_sender
         self._check_seconds = check_seconds
         # Held while a layout is applied, across its calls to the speakers:
@@ -337,12 +347,51 @@ class HouseholdMirror:
     def playback(self, speaker_id: str) -> SpeakerPlayback:
         """What the room's group plays.
 
+        For a track queued from Plex this asks Plex for the track's picture.
+        While Plex fails the track has no ``artwork_id``, which is logged;
+        the rest is what the mirror holds.
+
         Raises:
             SpeakerNotFoundException: The household has no such room.
         """
         with self._lock:
-            group = self._groups[self._room(speaker_id).id]
-            return _playback(self._states[group.coordinator_id].playback)
+            coordinator_id = self._groups[self._room(speaker_id).id].coordinator_id
+            playback = self._states[coordinator_id].playback
+        return _playback(playback, self._artwork_id(coordinator_id, playback.track))
+
+    def speaker_picture(self, speaker_id: str, artwork_id: str) -> str | None:
+        """The address at which a room serves the picture an artwork id names,
+        for ``SonosClient.read_picture()``.
+
+        None unless the id is that of the track the room's group has loaded
+        now: a speaker serves a track's picture after the track stopped being
+        current, and section 3.7 has it served only while it is.
+        """
+        with self._lock:
+            group = self._groups.get(speaker_id)
+            if group is None or group.coordinator_id != speaker_id:
+                return None
+            track = self._states[speaker_id].playback.track
+        if track is None or _speaker_artwork_id(speaker_id, track) != artwork_id:
+            return None
+        return track.picture
+
+    def _artwork_id(self, coordinator_id: str, track: Track | None) -> str | None:
+        if track is None:
+            return None
+        plex_track = _PLEX_TRACK.match(track.uri)
+        if plex_track is None:
+            return _speaker_artwork_id(coordinator_id, track)
+        try:
+            picture = self._plex.read_track_picture(plex_track.group(1))
+        except ExternalServiceException as error:
+            logger.warning(
+                "The track speaker %s plays is served without its artwork: %s",
+                coordinator_id,
+                error,
+            )
+            return None
+        return plex_artwork_id(picture) if picture is not None else None
 
     def _room(self, speaker_id: str) -> Room:
         for room in self._household.rooms:
@@ -714,7 +763,7 @@ def _merged_playback(held: Playback, event: PlaybackChanged) -> Playback:
     return replace(held, **reported)
 
 
-def _playback(playback: Playback) -> SpeakerPlayback:
+def _playback(playback: Playback, artwork_id: str | None) -> SpeakerPlayback:
     source = _source(playback.transport_uri)
     queued = source is PlaybackSource.QUEUE
     return SpeakerPlayback(
@@ -726,7 +775,7 @@ def _playback(playback: Playback) -> SpeakerPlayback:
         shuffle=playback.shuffle,
         queue_position=(playback.queue_position or None) if queued else None,
         queue_length=playback.queue_length if queued else None,
-        track=_track(playback, source),
+        track=_track(playback, source, artwork_id),
     )
 
 
@@ -737,7 +786,9 @@ def _source(transport_uri: str) -> PlaybackSource:
     return PlaybackSource.OTHER
 
 
-def _track(playback: Playback, source: PlaybackSource) -> PlayingTrack | None:
+def _track(
+    playback: Playback, source: PlaybackSource, artwork_id: str | None
+) -> PlayingTrack | None:
     track = playback.track
     if track is None:
         return None
@@ -754,8 +805,18 @@ def _track(playback: Playback, source: PlaybackSource) -> PlayingTrack | None:
         artist=_nfc(artist),
         album=_nfc(track.album) or None,
         duration_ms=track.duration_seconds * 1000 or None,
+        artwork_id=artwork_id,
         track_id=plex_track.group(1) if plex_track else None,
     )
+
+
+def _speaker_artwork_id(coordinator_id: str, track: Track) -> str | None:
+    """The id of the picture a group's coordinator serves for a track: None
+    for a track from Plex, whose picture is Plex's, and for a track without
+    a picture."""
+    if _PLEX_TRACK.match(track.uri) or not track.picture:
+        return None
+    return speaker_artwork_id(coordinator_id, track.uri, track.picture)
 
 
 def _nfc(text: str) -> str:

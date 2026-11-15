@@ -209,6 +209,23 @@ class TestPlexClientPicture:
 
         _assert_colour(_image(library.read_picture(before, 100)), BLUE)
 
+    def test_a_test_gives_an_album_a_picture_of_its_own(self, library):
+        before = library.read_track_picture(TRACKS[0])
+        halves = Image.new("RGB", (400, 200), RED)
+        halves.paste(BLUE, (200, 0, 400, 200))
+
+        library.set_image(ALBUM, halves)
+
+        picture = library.read_track_picture(TRACKS[0])
+        assert picture != before
+        image = _image(library.read_picture(picture, 100)).convert("RGB")
+        assert image.size == (200, 100)
+        for at, colour in (((50, 50), RED), ((150, 50), BLUE)):
+            assert all(
+                abs(got - want) <= 8
+                for got, want in zip(image.getpixel(at), colour, strict=True)
+            )
+
     def test_an_item_without_a_picture_has_none(self, library):
         assert library.read_picture(f"/library/metadata/{BARE_ALBUM}/thumb/1", 100) is None
         # A track has no picture of its own.

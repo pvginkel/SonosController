@@ -16,11 +16,15 @@ delivered.
 
 from __future__ import annotations
 
+import hashlib
+import io
 import threading
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, urlsplit
+
+from PIL import Image
 
 from app.core_exceptions import ExternalServiceException
 from app.services.health_service import CheckResult, CheckStatus, HealthService
@@ -46,8 +50,8 @@ from app.services.sonos_client import (
 # What a speaker allows on a stream that cannot pause (section 1.7).
 _STREAM_ACTIONS = frozenset({TransportAction.PLAY, TransportAction.STOP})
 
-# A small JPEG header: what a test needs to tell a picture from another.
-_PICTURE_PREFIX = b"\xff\xd8\xff\xe0fake-picture:"
+# The side of the picture a speaker serves for a track (section 1.9).
+_PICTURE_SIZE = 300
 
 
 def queue_track(number: int, album: str = "An Album", artist: str = "An Artist") -> Track:
@@ -62,6 +66,28 @@ def queue_track(number: int, album: str = "An Album", artist: str = "An Artist")
         uri=uri,
         picture=f"/getaa?s=1&u={uri}",
     )
+
+
+def app_track(number: int) -> Track:
+    """A track as the speaker reports one the Sonos app queued from a music
+    service that is not Plex."""
+    uri = f"x-sonos-spotify:spotify%3atrack%3a{number}?sid=9&flags=8224&sn=7"
+    return Track(
+        title=f"App Track {number}",
+        artist="An App Artist",
+        album="An App Album",
+        stream_content="",
+        duration_seconds=200 + number,
+        uri=uri,
+        picture=f"/getaa?s=1&u={uri}",
+    )
+
+
+def picture_colour(picture: str) -> tuple[int, int, int]:
+    """The one colour of the picture a speaker serves at an address, unless a
+    test had it serve something else there."""
+    digest = hashlib.sha256(picture.encode()).digest()
+    return digest[0], digest[1], digest[2]
 
 
 @dataclass
@@ -139,6 +165,7 @@ class FakeSonosClient(SonosClient):
         self._next_address = 1
         self._lagging_group_volume: dict[str, int] = {}
         self._silent: set[str] = set()
+        self._served: dict[str, bytes] = {}
         # Called with the room's id before each call that reaches a room, and
         # not for the calls it makes itself: a test makes something happen in
         # the household between two calls of the code it tests.
@@ -393,9 +420,20 @@ class FakeSonosClient(SonosClient):
         it holds now."""
         return {subscription.address for subscription in self._held(speaker_id)}
 
+    def serve_picture(self, picture: str, content: bytes) -> None:
+        """Have the speakers serve these bytes at a ``Track.picture``."""
+        self._served[picture] = content
+
     def picture_of(self, picture: str) -> bytes:
-        """The bytes ``read_picture()`` answers for a ``Track.picture``."""
-        return _PICTURE_PREFIX + picture.encode()
+        """The bytes ``read_picture()`` answers for a ``Track.picture``: what
+        ``serve_picture()`` put there, else a JPEG of ``picture_colour()``."""
+        if picture in self._served:
+            return self._served[picture]
+        jpeg = io.BytesIO()
+        Image.new(
+            "RGB", (_PICTURE_SIZE, _PICTURE_SIZE), picture_colour(picture)
+        ).save(jpeg, "JPEG")
+        return jpeg.getvalue()
 
     # ------------------------------------------------------------------
     # SonosClient

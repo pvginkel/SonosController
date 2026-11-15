@@ -19,3 +19,8 @@ exc_tb  # unused variable
 # SQLAlchemy pool event listener signatures (checkout/checkin)
 conn_proxy  # unused variable
 conn_record  # unused variable
+
+# Parameters of methods LVGLImage.py leaves empty or unused. The file is
+# LVGL's own, kept byte for byte (app/utils/lvgl/__init__.py), so it is not
+# changed to use them.
+ext  # unused variable

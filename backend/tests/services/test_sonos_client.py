@@ -5,7 +5,10 @@ live suite (``tests/live/``) shows the same of the SoCo client on the real
 speakers.
 """
 
+import io
+
 import pytest
+from PIL import Image
 
 from app.app_config import AppSettings
 from app.core_exceptions import ExternalServiceException
@@ -23,7 +26,7 @@ from app.services.sonos_client import (
     Volume,
     VolumeChanged,
 )
-from tests.fakes.sonos_client import FakeSonosClient, queue_track
+from tests.fakes.sonos_client import FakeSonosClient, picture_colour, queue_track
 
 GARAGE = "RINCON_FAKE0000000101400"
 LOUNGE = "RINCON_FAKE0000000201400"
@@ -388,6 +391,26 @@ class TestSonosClientPicture:
         assert household.read_playback(GARAGE).track.picture != picture
 
         assert household.read_picture(GARAGE, picture) == household.picture_of(picture)
+
+    def test_a_picture_is_a_jpeg_of_its_own_colour(self, household):
+        first, second = queue_track(1).picture, queue_track(2).picture
+
+        image = Image.open(io.BytesIO(household.read_picture(GARAGE, first)))
+
+        assert (image.format, image.size) == ("JPEG", (300, 300))
+        assert picture_colour(first) != picture_colour(second)
+        pixel = image.convert("RGB").getpixel((150, 150))
+        assert all(
+            abs(got - want) <= 8
+            for got, want in zip(pixel, picture_colour(first), strict=True)
+        )
+
+    def test_a_test_has_a_speaker_serve_what_it_gives(self, household):
+        picture = household.read_playback(GARAGE).track.picture
+
+        household.serve_picture(picture, b"not a picture")
+
+        assert household.read_picture(GARAGE, picture) == b"not a picture"
 
     @pytest.mark.parametrize("address", ["/getaa?s=1", "/nosuchpath", ""])
     def test_an_address_that_names_no_picture_fails(self, household, address):

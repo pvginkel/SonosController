@@ -71,9 +71,14 @@ class FakePlexClient(PlexClient):
         size: tuple[int, int],
         colour: tuple[int, int, int],
     ) -> None:
-        """Give an album another picture: its path gets a new stamp."""
+        """Give an album another picture, of one colour: its path gets a new
+        stamp."""
+        self.set_image(rating_key, Image.new("RGB", size, colour))
+
+    def set_image(self, rating_key: str, image: Image.Image) -> None:
+        """Give an album this picture: its path gets a new stamp."""
         album = self._albums[rating_key]
-        album.picture = Image.new("RGB", size, colour)
+        album.picture = image
         album.stamp = self._next_stamp
         self._next_stamp += 1
 

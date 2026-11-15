@@ -22,6 +22,10 @@ dependencies = [
     "psycopg[binary]>=3.1.0,<4",
     "soco>=0.32.2,<0.33",
     "plexapi>=4.18,<5",
+    "pillow>=13.0.0,<14",
+    "numpy>=2.5.4,<3",
+    "pypng>=0.20220715.0,<0.20220716",
+    "lz4>=4.4.5,<5",
 ]
 
 [project.scripts]
@@ -43,7 +47,6 @@ dev = [
     "watchdog[watchmedo]>=6.0.0,<7",
     "pyyaml>=6.0,<7",
     "types-pyyaml>=6.0,<7",
-    "pillow>=13.0.0,<14",
 ]
 
 # Only app/ is a package; run.py and scripts/ are reached through the editable
@@ -81,6 +84,9 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
+# LVGL's own scripts/LVGLImage.py, kept byte for byte as pvginkel/IoTSupport
+# keeps it (docs/api-design.md section 3.7): its findings are not fixed here.
+"app/utils/lvgl/LVGLImage.py" = ["I001", "UP035", "B904", "UP006", "C416", "B905", "E741", "ERA001"]
 "alembic/**" = ["E402"]
 "tools/**" = ["ERA001"]
 
@@ -100,6 +106,11 @@ strict_equality = true
 [[tool.mypy.overrides]]
 module = "soco.*"
 ignore_missing_imports = true
+
+# LVGL's own scripts/LVGLImage.py, kept byte for byte: it is not typed.
+[[tool.mypy.overrides]]
+module = "app.utils.lvgl.LVGLImage"
+ignore_errors = true
 
 [[tool.mypy.overrides]]
 module = "vulture_whitelist"

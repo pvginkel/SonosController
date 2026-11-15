@@ -9,9 +9,6 @@ sends, with the schema of its payload.
 
 from typing import Any
 
-from flask import Flask, request
-from spectree import SpecTree
-
 from app.schemas.stream_event_schema import StreamMessage
 
 STREAM_PATH = "/api/sse/stream"
@@ -66,19 +63,6 @@ _REQUEST_ID = {
     ),
     "schema": {"type": "string"},
 }
-
-
-def document_event_stream(app: Flask, api: SpecTree) -> None:
-    """Have the app's OpenAPI document describe the event stream.
-
-    Spectree builds the document from the routes when it is first asked for
-    and keeps it; this completes the kept document each time it is asked for.
-    """
-
-    @app.before_request
-    def complete_document() -> None:
-        if request.path == api.config.spec_url:
-            describe_event_stream(api.spec)
 
 
 def describe_event_stream(document: dict[str, Any]) -> None:

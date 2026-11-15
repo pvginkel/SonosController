@@ -30,9 +30,14 @@ def register_blueprints(api_bp: Blueprint, app: Flask) -> None:
     """Register all app-specific blueprints on api_bp (under /api prefix)."""
     # Imported here: app.api's modules need Spectree configured when they
     # load, which create_app() has done for this app before it calls this.
-    from app.api.sse_docs import document_event_stream
+    from app.api.artwork import artwork_bp
+    from app.api.openapi_docs import complete_openapi_document
 
-    document_event_stream(app, spectree_config.api)
+    # api_bp is one object for every app a process creates, and Flask refuses
+    # a change to a blueprint that an app has registered.
+    if not api_bp._got_registered_once:
+        api_bp.register_blueprint(artwork_bp)
+    complete_openapi_document(app, spectree_config.api)
 
 
 def register_error_handlers(app: Flask) -> None:

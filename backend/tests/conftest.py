@@ -19,8 +19,11 @@ Without one the suite passes where ``.env`` sets it, and fails in CI.
 
 import json
 import os
+import subprocess
+import sys
 import uuid
 from collections.abc import Callable, Generator
+from pathlib import Path
 from queue import Empty
 from typing import Any
 
@@ -28,6 +31,7 @@ import pytest
 from flask import Flask
 
 from app.app_config import AppSettings
+from app.services.artwork_service import ArtworkService
 from app.services.event_sender import COALESCE_SECONDS
 from app.services.household_mirror import CHECK_SECONDS, HouseholdMirror
 from app.services.sse_connection_manager import SSEConnection
@@ -46,6 +50,45 @@ os.environ["SONOS_EVENT_ADVERTISE_HOST"] = "sonos-events.invalid"
 os.environ["PLEX_URL"] = "http://192.0.2.1:32400"
 os.environ["PLEX_TOKEN"] = "the-suites-plex-token"
 os.environ["PLEX_LIBRARY"] = "Music"
+
+
+_BACKEND_DIR = Path(__file__).resolve().parent.parent
+
+_DUMP_DOCUMENT = """
+import json
+import sys
+
+from app import create_app
+
+app = create_app(skip_background_services=True)
+response = app.test_client().get("/api/docs/openapi.json")
+if response.status_code != 200:
+    sys.exit(f"GET /api/docs/openapi.json answered {response.status_code}")
+with open(sys.argv[1], "w", encoding="utf-8") as f:
+    json.dump(response.get_json(), f)
+"""
+
+
+@pytest.fixture(scope="session")
+def openapi_document(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    """The app's OpenAPI document, as a deployed backend serves it.
+
+    Spectree documents a route under ``@api.validate`` for the first app of
+    a process alone, and the suite creates many: the document the ``client``
+    fixture gets has none of them. This one comes from an app built in a
+    process of its own, from the environment set above.
+    """
+    document_file = tmp_path_factory.mktemp("openapi") / "openapi.json"
+    result = subprocess.run(
+        [sys.executable, "-c", _DUMP_DOCUMENT, str(document_file)],
+        cwd=_BACKEND_DIR,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr[-4000:]
+    document: dict[str, Any] = json.loads(document_file.read_text(encoding="utf-8"))
+    return document
 
 
 @pytest.fixture(scope="session")
@@ -101,9 +144,9 @@ def check_seconds() -> float:
 
 @pytest.fixture
 def mirror(
-    app: Flask, sonos: FakeSonosClient, check_seconds: float
+    app: Flask, sonos: FakeSonosClient, plex: FakePlexClient, check_seconds: float
 ) -> Generator[HouseholdMirror]:
-    """The container's household mirror, on the test's household.
+    """The container's household mirror, on the test's household and library.
 
     Not started: a test builds its household and calls ``start()``. The
     container gives every test a mirror and an event sender of its own, so
@@ -120,6 +163,18 @@ def mirror(
         container.event_sender().stop()
         container.household_mirror.reset()
         container.event_sender.reset()
+
+
+@pytest.fixture
+def artwork(app: Flask, mirror: HouseholdMirror) -> Generator[ArtworkService]:
+    """The container's artwork service, on the test's mirror, household and
+    library, with no picture kept. It is the one the artwork endpoint uses."""
+    container = app.container
+    container.artwork_service.reset()
+    try:
+        yield container.artwork_service()
+    finally:
+        container.artwork_service.reset()
 
 
 class EventStream:

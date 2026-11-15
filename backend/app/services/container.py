@@ -8,6 +8,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.app_config import AppSettings
 from app.config import Settings
+from app.services.artwork_service import ArtworkService
 from app.services.event_sender import EventSender
 from app.services.frontend_version_service import FrontendVersionService
 from app.services.health_service import HealthService
@@ -130,10 +131,19 @@ class ServiceContainer(containers.DeclarativeContainer):
     household_mirror = providers.Singleton(
         HouseholdMirror,
         sonos_client=sonos_client,
+        plex_client=plex_client,
         event_sender=event_sender,
         lifecycle_coordinator=lifecycle_coordinator,
     )
     register_for_background_startup(lambda c: c.household_mirror())
+
+    # Artwork service - pictures by artwork id; it keeps the finished ones
+    artwork_service = providers.Singleton(
+        ArtworkService,
+        household_mirror=household_mirror,
+        sonos_client=sonos_client,
+        plex_client=plex_client,
+    )
 
 
 def start_background_services(container: Any) -> None:

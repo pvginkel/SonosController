@@ -24,8 +24,16 @@ from app.services.household_mirror import (
     SpeakerGroup,
 )
 from app.services.sonos_client import SonosService, Track
+from app.utils.artwork_id import (
+    PlexPicture,
+    SpeakerPicture,
+    parse_artwork_id,
+    plex_artwork_id,
+    speaker_artwork_id,
+)
 from app.utils.lifecycle_coordinator import LifecycleCoordinator
-from tests.fakes.sonos_client import FakeSonosClient, queue_track
+from tests.fakes.plex_client import FakePlexClient
+from tests.fakes.sonos_client import FakeSonosClient, app_track, queue_track
 
 GARAGE = "RINCON_FAKE0000000101400"
 LOUNGE = "RINCON_FAKE0000000201400"
@@ -212,6 +220,7 @@ class TestHouseholdMirrorPlayback:
             artist="An Artist",
             album="An Album",
             duration_ms=181000,
+            artwork_id=None,
             track_id="1001",
         )
 
@@ -283,6 +292,7 @@ class TestHouseholdMirrorPlayback:
             artist="Radio One",
             album=None,
             duration_ms=None,
+            artwork_id=None,
             track_id=None,
         )
 
@@ -319,6 +329,8 @@ class TestHouseholdMirrorPlayback:
         assert started.playback(GARAGE).source is source
 
     def test_a_track_that_is_not_from_plex_has_no_track_id(self, started, household):
+        uri = "x-file-cifs://nas.invalid/music/a-song.mp3"
+        picture = "/getaa?u=x-file-cifs%3a%2f%2fnas.invalid%2fa-song.mp3"
         household.load_queue(
             GARAGE,
             [
@@ -328,15 +340,20 @@ class TestHouseholdMirrorPlayback:
                     album="",
                     stream_content="",
                     duration_seconds=0,
-                    uri="x-file-cifs://nas.invalid/music/a-song.mp3",
-                    picture="/getaa?u=x-file-cifs%3a%2f%2fnas.invalid%2fa-song.mp3",
+                    uri=uri,
+                    picture=picture,
                 )
             ],
         )
         household.settle()
 
         assert started.playback(GARAGE).track == PlayingTrack(
-            title="A Song", artist="A Band", album=None, duration_ms=None, track_id=None
+            title="A Song",
+            artist="A Band",
+            album=None,
+            duration_ms=None,
+            artwork_id=speaker_artwork_id(GARAGE, uri, picture),
+            track_id=None,
         )
 
     def test_a_tracks_texts_are_nfc(self, started, household):
@@ -366,6 +383,168 @@ class TestHouseholdMirrorPlayback:
         assert mirror.playback(LOUNGE) == mirror.playback(GARAGE)
         assert mirror.playback(LOUNGE).state is PlaybackStatus.PLAYING
         assert mirror.playback(LOUNGE).track.title == "Track 1"
+
+
+class TestHouseholdMirrorArtwork:
+    """``queue_track(n)`` is Plex's track ``1000 + n``."""
+
+    @pytest.fixture
+    def library(self, plex: FakePlexClient) -> FakePlexClient:
+        """The first two queued tracks are of one album, the third of
+        another."""
+        plex.add_album("2001", ["1001", "1002"])
+        plex.add_album("2002", ["1003"])
+        return plex
+
+    def test_a_plex_tracks_artwork_is_plexs_picture(self, started, library):
+        artwork_id = started.playback(GARAGE).track.artwork_id
+
+        assert parse_artwork_id(artwork_id) == PlexPicture(
+            path=library.read_track_picture("1001")
+        )
+        assert artwork_id == plex_artwork_id(library.read_track_picture("1001"))
+
+    def test_the_tracks_of_an_album_share_an_id(self, started, household, library):
+        first = started.playback(GARAGE).track.artwork_id
+
+        household.next(GARAGE)
+        household.settle()
+        assert started.playback(GARAGE).track.track_id == "1002"
+        assert started.playback(GARAGE).track.artwork_id == first
+
+        household.next(GARAGE)
+        household.settle()
+        assert started.playback(GARAGE).track.track_id == "1003"
+        assert started.playback(GARAGE).track.artwork_id not in (None, first)
+
+    def test_a_new_picture_is_a_new_id(self, started, library):
+        before = started.playback(GARAGE).track.artwork_id
+
+        library.set_picture("2001", (600, 600), (1, 2, 3))
+
+        assert started.playback(GARAGE).track.artwork_id not in (None, before)
+
+    def test_an_album_without_a_picture_has_no_artwork(self, started, plex):
+        plex.add_album("2001", ["1001"], size=None)
+
+        assert started.playback(GARAGE).track.artwork_id is None
+
+    def test_a_track_plex_does_not_have_has_no_artwork(self, started):
+        assert started.playback(GARAGE).track.track_id == "1001"
+        assert started.playback(GARAGE).track.artwork_id is None
+
+    def test_while_plex_is_down_the_rest_is_served(
+        self, started, household, library, caplog
+    ):
+        library.reachable = False
+        household.play(GARAGE)
+        household.settle()
+
+        with caplog.at_level(logging.WARNING):
+            playback = started.playback(GARAGE)
+
+        assert playback.state is PlaybackStatus.PLAYING
+        assert playback.track == PlayingTrack(
+            title="Track 1",
+            artist="An Artist",
+            album="An Album",
+            duration_ms=181000,
+            artwork_id=None,
+            track_id="1001",
+        )
+        assert logged(caplog) == [
+            (
+                "WARNING",
+                f"The track speaker {GARAGE} plays is served without its artwork: "
+                "Cannot read the picture of Plex track 1001 because external "
+                "service failed: Plex did not answer (ConnectionError)",
+            )
+        ]
+
+        library.reachable = True
+        assert started.playback(GARAGE).track.artwork_id is not None
+
+    def test_another_tracks_artwork_is_the_speakers_picture(self, started, household):
+        household.load_queue(GARAGE, [app_track(1), app_track(2)])
+        household.settle()
+
+        first = started.playback(GARAGE).track.artwork_id
+        assert parse_artwork_id(first) == SpeakerPicture(speaker_id=GARAGE)
+        assert started.playback(GARAGE).track.track_id is None
+
+        household.next(GARAGE)
+        household.settle()
+        assert started.playback(GARAGE).track.artwork_id not in (None, first)
+
+    def test_a_track_without_a_picture_has_no_artwork(self, started, household):
+        household.start_stream(GARAGE, "Radio One", "An Artist - A Song")
+        household.settle()
+
+        assert started.playback(GARAGE).track.artwork_id is None
+
+    def test_the_rooms_of_a_group_share_an_id(self, started, household):
+        household.load_queue(GARAGE, [app_track(1)])
+        household.join(LOUNGE, GARAGE)
+        household.settle()
+
+        artwork_id = started.playback(GARAGE).track.artwork_id
+        assert parse_artwork_id(artwork_id) == SpeakerPicture(speaker_id=GARAGE)
+        assert started.playback(LOUNGE).track.artwork_id == artwork_id
+
+    def test_a_speakers_picture_is_served_while_its_track_is_current(
+        self, started, household
+    ):
+        household.load_queue(GARAGE, [app_track(1), app_track(2)])
+        household.settle()
+        artwork_id = started.playback(GARAGE).track.artwork_id
+
+        assert started.speaker_picture(GARAGE, artwork_id) == app_track(1).picture
+
+        household.next(GARAGE)
+        household.settle()
+        assert started.speaker_picture(GARAGE, artwork_id) is None
+        # The speaker itself still serves it.
+        assert household.read_picture(GARAGE, app_track(1).picture)
+
+        household.previous(GARAGE)
+        household.settle()
+        assert started.speaker_picture(GARAGE, artwork_id) == app_track(1).picture
+
+    def test_a_speakers_picture_is_its_coordinators(self, started, household):
+        household.load_queue(GARAGE, [app_track(1)])
+        household.load_queue(LOUNGE, [app_track(1)])
+        household.settle()
+        of_the_garage = started.playback(GARAGE).track.artwork_id
+        of_the_lounge = started.playback(LOUNGE).track.artwork_id
+        assert of_the_garage != of_the_lounge
+        assert started.speaker_picture(LOUNGE, of_the_garage) is None
+
+        household.join(LOUNGE, GARAGE)
+        household.settle()
+
+        assert started.speaker_picture(GARAGE, of_the_garage) == app_track(1).picture
+        # The Lounge still holds the track it had loaded, and follows now.
+        assert started.speaker_picture(LOUNGE, of_the_lounge) is None
+
+    def test_a_plex_track_has_no_speakers_picture(self, started, household, library):
+        track = queue_track(1)
+        assert household.read_picture(GARAGE, track.picture)
+
+        for artwork_id in (
+            started.playback(GARAGE).track.artwork_id,
+            speaker_artwork_id(GARAGE, track.uri, track.picture),
+        ):
+            assert started.speaker_picture(GARAGE, artwork_id) is None
+
+    def test_no_speakers_picture_without_a_track_or_a_speaker(self, started, household):
+        track = app_track(1)
+        artwork_id = speaker_artwork_id(LOUNGE, track.uri, track.picture)
+        assert started.speaker_picture(LOUNGE, artwork_id) is None
+
+        household.load_queue(LOUNGE, [track])
+        household.settle()
+        assert started.speaker_picture(LOUNGE, artwork_id) == track.picture
+        assert started.speaker_picture(KITCHEN, artwork_id) is None
 
 
 class TestHouseholdMirrorLayout:
@@ -505,10 +684,11 @@ class TestHouseholdMirrorSubscriptions:
         assert started.speakers() == []
         assert household.subscription_count(KITCHEN) == 0
 
-    def test_it_starts_and_stops_with_the_apps_lifecycle(self, app, household):
+    def test_it_starts_and_stops_with_the_apps_lifecycle(self, app, household, plex):
         coordinator = LifecycleCoordinator(graceful_shutdown_timeout=1)
         mirror = HouseholdMirror(
             sonos_client=household,
+            plex_client=plex,
             event_sender=app.container.event_sender(),
             lifecycle_coordinator=coordinator,
         )
@@ -901,11 +1081,12 @@ class TestHouseholdMirrorChecks:
         household.settle()
         assert mirror.speaker(LOUNGE).volume == 41
 
-    def test_the_app_starts_when_no_speaker_answers(self, app, household):
+    def test_the_app_starts_when_no_speaker_answers(self, app, household, plex):
         household.reachable = False
         coordinator = LifecycleCoordinator(graceful_shutdown_timeout=1)
         mirror = HouseholdMirror(
             sonos_client=household,
+            plex_client=plex,
             event_sender=app.container.event_sender(),
             lifecycle_coordinator=coordinator,
             check_seconds=0.05,
