@@ -57,7 +57,11 @@ def live_settings() -> AppSettings:
             returncode=1,
         )
     try:
-        return AppSettings.load(AppEnvironment.model_validate(held))
+        # PLEX_LIBRARY is optional: absent from the file, it is unset, as the
+        # app reads it, and not the suite's own from the environment.
+        return AppSettings.load(
+            AppEnvironment.model_validate({"PLEX_LIBRARY": None, **held})
+        )
     except (ValidationError, ConfigurationError) as exc:
         pytest.exit(
             f"The live suite reads the household and Plex from {_ENV_FILE}, "
