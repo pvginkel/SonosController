@@ -20,6 +20,7 @@ dependencies = [
     "flask-sqlalchemy>=3.1.0,<4",
     "alembic>=1.13.0,<2",
     "psycopg[binary]>=3.1.0,<4",
+    "soco>=0.32.2,<0.33",
 ]
 
 [project.scripts]
@@ -39,6 +40,8 @@ dev = [
     "types-waitress>=3.0.1.20250801,<4",
     "vulture>=2.14,<3",
     "watchdog[watchmedo]>=6.0.0,<7",
+    "pyyaml>=6.0,<7",
+    "types-pyyaml>=6.0,<7",
 ]
 
 # Only app/ is a package; run.py and scripts/ are reached through the editable
@@ -91,6 +94,11 @@ warn_unused_ignores = true
 warn_return_any = true
 strict_equality = true
 
+# SoCo ships no type information.
+[[tool.mypy.overrides]]
+module = "soco.*"
+ignore_missing_imports = true
+
 [[tool.mypy.overrides]]
 module = "vulture_whitelist"
 ignore_errors = true
@@ -113,8 +121,10 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = "-v"
+# The live suite (tests/live/) needs the real speakers: `pytest -m live tests/live`.
+addopts = "-v -m 'not live'"
 markers = [
+    "live: runs the real Sonos client against the Garage speaker; never in CI",
     "integration: marks tests as integration tests (requires external dependencies)",
     "slow: marks tests as slow running tests"
 ]

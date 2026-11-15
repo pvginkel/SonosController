@@ -28,7 +28,10 @@ projects:
       Plays music from a Plex library on Sonos speakers and serves the touch-screen displays that control them — Flask backend.
     setup:
       - cexec python uv sync
-      - "test -f .env || printf 'DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/sonos_controller\\n' > .env"
+      # Adds to the git-ignored .env the settings the app cannot start without
+      # and .env lacks: the database, the speakers' addresses from the deploy
+      # repo's prd values, this environment's own name for their events.
+      - cexec python uv run python scripts/write_dev_env.py
       - cexec python uv run python scripts/init-dev-database.py
       - cexec python uv run cli upgrade-db
     test: cexec python uv run pytest

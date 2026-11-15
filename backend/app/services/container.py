@@ -11,6 +11,7 @@ from app.config import Settings
 from app.services.frontend_version_service import FrontendVersionService
 from app.services.health_service import HealthService
 from app.services.metrics_service import MetricsService
+from app.services.sonos_client import SoCoSonosClient
 from app.services.sse_connection_manager import SSEConnectionManager
 from app.services.task_service import TaskService
 from app.services.testing_service import TestingService
@@ -49,6 +50,15 @@ class ServiceContainer(containers.DeclarativeContainer):
         lifecycle_coordinator=lifecycle_coordinator,
         settings=config,
     )
+
+    # Sonos client - the only way to the speakers; pytest overrides it with a
+    # fake. Built at startup so that its readiness check is registered.
+    sonos_client = providers.Singleton(
+        SoCoSonosClient,
+        settings=app_config,
+        health_service=health_service,
+    )
+    register_for_background_startup(lambda c: c.sonos_client())
 
     # Testing service - test sessions, content generation, the SSE test hooks
     testing_service = providers.Factory(TestingService)
