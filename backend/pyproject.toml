@@ -1,0 +1,138 @@
+[project]
+name = "sonos-controller"
+version = "0.1.0"
+description = "Plays music from a Plex library on Sonos speakers and serves the touch-screen displays that control them"
+authors = [{ name = "Pieter van Ginkel", email = "pvginkel@gmail.com" }]
+readme = "README.md"
+requires-python = ">=3.13,<4"
+dependencies = [
+    "flask>=3.0.0,<4",
+    "pydantic>=2.5.0,<3",
+    "pydantic-settings>=2.1.0,<3",
+    "spectree>=2.0.0,<3",
+    "flask-cors>=6.0.0,<7",
+    "waitress>=3.0.0,<4",
+    "paste>=3.10.1,<4",
+    "dependency-injector>=4.48.1,<5",
+    "requests>=2.31.0,<3",
+    "prometheus-flask-exporter>=0.23.0,<0.24",
+    "python-dotenv>=1.0.0,<2",
+    "flask-sqlalchemy>=3.1.0,<4",
+    "alembic>=1.13.0,<2",
+    "psycopg[binary]>=3.1.0,<4",
+]
+
+[project.scripts]
+cli = "app.cli:main"
+dev = "run:main"
+check = "scripts.check:main"
+
+[dependency-groups]
+dev = [
+    "copier>=9.0.0,<10",
+    "ruff>=0.15.0,<0.16",
+    "mypy>=1.8.0,<2",
+    "pytest>=9.0.0,<10",
+    "pytest-cov>=7.0.0,<8",
+    "types-flask-cors>=6.0.0,<7",
+    "types-requests>=2.31.0,<3",
+    "types-waitress>=3.0.1.20250801,<4",
+    "vulture>=2.14,<3",
+    "watchdog[watchmedo]>=6.0.0,<7",
+]
+
+# Only app/ is a package; run.py and scripts/ are reached through the editable
+# install's path entry (the project root), which is what `uv run dev` and
+# `uv run check` need. The image installs no project at all (--no-install-project).
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+extend-exclude = ["vulture_whitelist.py"]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "B",     # flake8-bugbear
+    "C4",    # flake8-comprehensions
+    "UP",    # pyupgrade
+    "ERA",   # eradicate (commented-out code)
+    "RUF100", # unused noqa directives
+]
+ignore = [
+    "E501", # line too long, handled by black
+    "B008", # do not perform function calls in argument defaults
+    "W191", # indentation contains tabs
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"alembic/**" = ["E402"]
+"tools/**" = ["ERA001"]
+
+[tool.mypy]
+python_version = "3.13"
+check_untyped_defs = true
+disallow_any_generics = true
+disallow_incomplete_defs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_return_any = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = "vulture_whitelist"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "alembic.*"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "app.models.*"
+disable_error_code = ["attr-defined"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v"
+markers = [
+    "integration: marks tests as integration tests (requires external dependencies)",
+    "slow: marks tests as slow running tests"
+]
+filterwarnings = [
+    "ignore::pydantic.warnings.PydanticDeprecatedSince20",
+    "ignore::pluggy._warnings.PluggyTeardownRaisedWarning",
+    "ignore::DeprecationWarning:pydantic.*"
+]
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["*/tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if TYPE_CHECKING:",
+    "raise AssertionError",
+    "raise NotImplementedError",
+]

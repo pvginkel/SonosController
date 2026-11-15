@@ -1,0 +1,17 @@
+# Changes here will be overwritten by Copier; NEVER EDIT MANUALLY
+_commit: v0.16.0
+_src_path: ../../ModernAppTemplate/backend
+author_email: pvginkel@gmail.com
+author_name: Pieter van Ginkel
+backend_port: 3601
+database_name: sonos_controller
+frontend_port: 3600
+project_description: Plays music from a Plex library on Sonos speakers and serves
+    the touch-screen displays that control them
+project_name: sonos-controller
+s3_bucket_name: sonos-controller-attachments
+testing_port_offset: 10
+use_database: true
+use_oidc: false
+use_s3: false
+use_sse: true

@@ -1,0 +1,463 @@
+"""Configuration management using Pydantic settings.
+
+This module implements a two-layer configuration system:
+1. Environment: Loads raw values from environment variables (UPPER_CASE)
+2. Settings: Clean application settings with lowercase fields and derived values
+
+Usage:
+    # Production: Load from environment
+    settings = Settings.load()
+
+    # Tests: Construct directly with test values
+    settings = Settings(secret_key="test", flask_env="testing", ...)
+
+Fields are organized by feature flag so each group can be independently enabled:
+- Core (always present): Flask, stage, CORS, tasks, metrics, shutdown, logging
+- use_database: DATABASE_URL, pool settings, diagnostics, engine options
+- use_oidc: BASEURL, all OIDC_* settings
+- use_s3: all S3_* settings
+- use_sse: SSE_*, FRONTEND_VERSION_URL
+
+App-specific fields live in app/app_config.py as AppSettings.
+
+Fields that hold a secret are annotated ``Annotated[str, Sensitive]``, so the
+settings dump at boot (``dump_for_logging()``) shows them as ``***``.
+"""
+
+from pathlib import Path
+from typing import Annotated, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic.fields import FieldInfo
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy import make_url
+
+# Project root directory (parent of app/)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Default secret key that must be changed in production
+_DEFAULT_SECRET_KEY = "dev-secret-key-change-in-production"
+
+
+class Sensitive:
+    """Marks a settings field that holds a secret: ``Annotated[str, Sensitive]``.
+
+    The settings dump shows such a field as ``***``. Mark every new secret on
+    Settings and AppSettings this way.
+    """
+
+
+def is_sensitive(field_info: FieldInfo) -> bool:
+    """Whether a Pydantic field carries the Sensitive marker."""
+    return any(m is Sensitive or isinstance(m, Sensitive) for m in field_info.metadata)
+
+
+def dump_config_for_logging(model: BaseModel) -> dict[str, str]:
+    """Every field of a settings model, for the log: ``repr()``, or ``***`` if Sensitive."""
+    return {
+        name: "***" if is_sensitive(field_info) else repr(getattr(model, name))
+        for name, field_info in type(model).model_fields.items()
+    }
+
+
+StageName = Literal["local-dev", "dev", "uat", "prd", "local-tst", "tst"]
+STAGES: tuple[StageName, ...] = ("local-dev", "dev", "uat", "prd", "local-tst", "tst")
+
+
+class Stage:
+    """The deployment tier (STAGE), apart from FLASK_ENV.
+
+    ``dev``, ``uat`` and ``prd`` are deployed tiers, ``tst`` is CI, and
+    ``local-dev`` and ``local-tst`` are a developer's machine running the app
+    and its tests. Not a str subclass: ask ``is_env()`` and ``is_local()``.
+    Comparing with a str (``stage == "prd"``) works too.
+    """
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: str) -> None:
+        if value not in STAGES:
+            raise ValueError(f"Invalid stage {value!r}; must be one of {STAGES}")
+        self._value: StageName = value
+
+    @property
+    def value(self) -> StageName:
+        """The stage's name, such as ``prd``."""
+        return self._value
+
+    def is_local(self) -> bool:
+        """True for local-dev and local-tst."""
+        return self._value.startswith("local-")
+
+    def is_env(self, env: str) -> bool:
+        """True for ``env`` and its local variant: ``Stage("local-dev").is_env("dev")``."""
+        return self._value in (env, f"local-{env}")
+
+    def __str__(self) -> str:
+        return self._value
+
+    def __repr__(self) -> str:
+        return f"Stage({self._value!r})"
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Stage):
+            return self._value == other._value
+        if isinstance(other, str):
+            return self._value == other
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self._value)
+
+
+def default_stage(flask_env: str) -> StageName:
+    """STAGE when it is not set: local-tst under testing, local-dev under development, else prd.
+
+    A deployment that forgets STAGE therefore counts as production, and shows
+    no internal detail (Settings.expose_internals).
+    """
+    if flask_env == "testing":
+        return "local-tst"
+    if flask_env == "development":
+        return "local-dev"
+    return "prd"
+
+
+# Connection pool under FLASK_ENV=testing: the pytest apps and the Playwright
+# backends. They share the local PostgreSQL server (50 connections) with the
+# dev stack, so they stay far below the production default of 20 + 30.
+TEST_DB_POOL_SIZE = 2
+TEST_DB_POOL_MAX_OVERFLOW = 3
+
+
+class Environment(BaseSettings):
+    """Raw environment variable loading.
+
+    This class loads values directly from environment variables with UPPER_CASE names.
+    It should not contain any derived values or transformation logic.
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=_PROJECT_ROOT / ".env",
+        env_file_encoding="utf-8",
+        case_sensitive=True,
+        extra="ignore",
+    )
+
+    # ── Core (always present) ──────────────────────────────────────────
+
+    SECRET_KEY: str = Field(default=_DEFAULT_SECRET_KEY)
+    FLASK_ENV: str = Field(default="development")
+    STAGE: StageName | None = Field(
+        default=None,
+        description="Deployment tier, apart from FLASK_ENV (unset: see default_stage())",
+    )
+    HOMELAB_INTERNAL: bool = Field(
+        default=False,
+        description="An internal app: show internal detail, such as exception text, even on prd",
+    )
+    DEBUG: bool = Field(default=True)
+    CORS_ORIGINS: list[str] = Field(
+        default=["http://localhost:3600"], description="Allowed CORS origins"
+    )
+    TASK_MAX_WORKERS: int = Field(
+        default=4, description="Maximum number of concurrent background tasks"
+    )
+    TASK_TIMEOUT_SECONDS: int = Field(
+        default=300, description="Task execution timeout in seconds (5 minutes)"
+    )
+    TASK_CLEANUP_INTERVAL_SECONDS: int = Field(
+        default=600,
+        description="How often to clean up completed tasks in seconds (10 minutes)",
+    )
+    METRICS_UPDATE_INTERVAL: int = Field(
+        default=60, description="Metrics background update interval in seconds"
+    )
+    GRACEFUL_SHUTDOWN_TIMEOUT: int = Field(
+        default=600,
+        description="Maximum seconds to wait for tasks during shutdown (10 minutes)",
+    )
+    DRAIN_AUTH_KEY: str = Field(
+        default="", description="Bearer token for authenticating drain endpoint access"
+    )
+    LOG_LEVEL: str = Field(
+        default="INFO",
+        description="Root logger level (DEBUG, INFO, WARNING, ERROR, CRITICAL); anything else means INFO",
+    )
+    MAX_UPLOAD_SIZE_MB: int = Field(
+        default=50,
+        description="Largest request body accepted, in MB; a larger one gets 413",
+    )
+
+    # ── use_database ───────────────────────────────────────────────────
+
+    DATABASE_URL: str = Field(
+        default="postgresql+psycopg://postgres:postgres@localhost:5432/sonos_controller",
+        description="PostgreSQL connection string",
+    )
+    DB_POOL_SIZE: int = Field(
+        default=20, description="Number of persistent connections in the pool"
+    )
+    DB_POOL_MAX_OVERFLOW: int = Field(
+        default=30, description="Max temporary connections above pool_size"
+    )
+    DB_POOL_TIMEOUT: int = Field(
+        default=10, description="Seconds to wait for a connection before timeout"
+    )
+    DB_POOL_ECHO: bool | str = Field(
+        default=False,
+        description="Log connection pool checkout/checkin events. Use 'debug' for verbose output.",
+    )
+    DIAGNOSTICS_ENABLED: bool = Field(
+        default=False,
+        description="Enable request timing and query profiling diagnostics",
+    )
+    DIAGNOSTICS_SLOW_QUERY_THRESHOLD_MS: int = Field(
+        default=100, description="Log queries taking longer than this (milliseconds)"
+    )
+    DIAGNOSTICS_SLOW_REQUEST_THRESHOLD_MS: int = Field(
+        default=500, description="Log requests taking longer than this (milliseconds)"
+    )
+    DIAGNOSTICS_LOG_ALL_QUERIES: bool = Field(
+        default=False, description="Log all queries (verbose, use for debugging only)"
+    )
+
+    # ── use_sse ────────────────────────────────────────────────────────
+
+    FRONTEND_VERSION_URL: str = Field(
+        default="http://localhost:3600/version.json",
+        description="URL to fetch frontend version information",
+    )
+    SSE_HEARTBEAT_INTERVAL: int = Field(
+        default=5,
+        description="SSE heartbeat interval in seconds (5 for development, 30 for production)",
+    )
+    SSE_QUEUE_MAX_FRAMES: int = Field(
+        default=1000,
+        gt=0,
+        description="Events an SSE connection queues before it counts as stalled and is closed",
+    )
+
+
+class Settings(BaseModel):
+    """Application settings with lowercase fields and derived values.
+
+    This class represents the final, resolved application configuration.
+    All field names are lowercase for consistency.
+
+    For production, use Settings.load() to load from environment.
+    For tests, construct directly with test values (defaults provided for convenience).
+
+    Fields are grouped by feature flag (see Environment docstring).
+    """
+
+    model_config = ConfigDict(from_attributes=True, arbitrary_types_allowed=True)
+
+    # ── Core (always present) ──────────────────────────────────────────
+
+    secret_key: Annotated[str, Sensitive] = _DEFAULT_SECRET_KEY
+    flask_env: str = "development"
+    # Resolved: from flask_env when not given (default_stage)
+    stage: Stage = Field(
+        default_factory=lambda data: Stage(default_stage(data["flask_env"]))
+    )
+    homelab_internal: bool = False
+    debug: bool = True
+    cors_origins: list[str] = Field(default=["http://localhost:3600"])
+    task_max_workers: int = 4
+    task_timeout_seconds: int = 300
+    task_cleanup_interval_seconds: int = 600
+    metrics_update_interval: int = 60
+    graceful_shutdown_timeout: int = 600
+    drain_auth_key: Annotated[str, Sensitive] = ""
+    log_level: str = "INFO"
+    max_upload_size_mb: int = 50
+
+    # ── use_database ───────────────────────────────────────────────────
+
+    # Sensitive for its password; dump_for_logging() shows the rest of it.
+    database_url: Annotated[str, Sensitive] = (
+        "postgresql+psycopg://postgres:postgres@localhost:5432/sonos_controller"
+    )
+    db_pool_size: int = 20
+    db_pool_max_overflow: int = 30
+    db_pool_timeout: int = 10
+    db_pool_echo: bool | str = False
+    diagnostics_enabled: bool = False
+    diagnostics_slow_query_threshold_ms: int = 100
+    diagnostics_slow_request_threshold_ms: int = 500
+    diagnostics_log_all_queries: bool = False
+    sqlalchemy_engine_options: dict[str, Any] = Field(default_factory=dict)
+
+    # ── use_sse ────────────────────────────────────────────────────────
+
+    frontend_version_url: str = "http://localhost:3600/version.json"
+    sse_heartbeat_interval: int = 5  # Resolved: 30 for production via load()
+    sse_queue_max_frames: int = 1000
+
+    @field_validator("stage", mode="before")
+    @classmethod
+    def _stage_from_str(cls, value: Any) -> Any:
+        return Stage(value) if isinstance(value, str) else value
+
+    @property
+    def expose_internals(self) -> bool:
+        """Whether the app may show internal detail: STAGE is not prd, or HOMELAB_INTERNAL.
+
+        It decides whether a 500 response carries the exception text, and the
+        frontend reads it from GET /api/ui-setup.
+        """
+        return self.stage != "prd" or self.homelab_internal
+
+    @property
+    def is_testing(self) -> bool:
+        """Check if running in testing environment."""
+        return self.flask_env == "testing"
+
+    @property
+    def is_production(self) -> bool:
+        """Check if running in production environment."""
+        return self.flask_env == "production"
+
+    def dump_for_logging(self) -> dict[str, str]:
+        """Every setting, for the boot log, with the Sensitive ones as ``***``."""
+        dump = dump_config_for_logging(self)
+        # The URL without its password still says which database this is.
+        dump["database_url"] = repr(
+            make_url(self.database_url).render_as_string(hide_password=True)
+        )
+        return dump
+
+    def to_flask_config(self) -> "FlaskConfig":
+        """Create Flask configuration object from settings."""
+        return FlaskConfig(
+            SECRET_KEY=self.secret_key,
+            MAX_CONTENT_LENGTH=self.max_upload_size_mb * 1024 * 1024,
+            SQLALCHEMY_DATABASE_URI=self.database_url,
+            SQLALCHEMY_TRACK_MODIFICATIONS=False,
+            SQLALCHEMY_ENGINE_OPTIONS=self.sqlalchemy_engine_options,
+        )
+
+    def validate_production_config(self) -> None:
+        """Validate that required configuration is set for production.
+
+        Raises:
+            ConfigurationError: If required settings are missing or insecure
+        """
+        from app.exceptions import ConfigurationError
+
+        errors: list[str] = []
+
+        # SECRET_KEY must be changed from default in production
+        if self.is_production and self.secret_key == _DEFAULT_SECRET_KEY:
+            errors.append(
+                "SECRET_KEY must be set to a secure value in production "
+                "(current value is the insecure default)"
+            )
+
+        if errors:
+            raise ConfigurationError(
+                "Configuration validation failed:\n  - " + "\n  - ".join(errors)
+            )
+
+    @classmethod
+    def load(cls, env: Environment | None = None) -> "Settings":
+        """Load settings from environment variables.
+
+        This method:
+        1. Loads Environment from environment variables
+        2. Computes derived values (sse_heartbeat_interval)
+        3. Builds default SQLAlchemy engine options
+        4. Constructs and returns a Settings instance
+
+        Args:
+            env: Optional Environment instance (for testing). If None, loads from environment.
+
+        Returns:
+            Settings instance with all values resolved
+        """
+        if env is None:
+            env = Environment()
+
+        # Compute sse_heartbeat_interval: 30 for production, else use env value
+        sse_heartbeat_interval = (
+            30 if env.FLASK_ENV == "production" else env.SSE_HEARTBEAT_INTERVAL
+        )
+
+        # Testing mode takes the small test pool, unless DB_POOL_SIZE or
+        # DB_POOL_MAX_OVERFLOW is set explicitly (each one on its own).
+        is_testing = env.FLASK_ENV == "testing"
+        db_pool_size = (
+            TEST_DB_POOL_SIZE
+            if is_testing and "DB_POOL_SIZE" not in env.model_fields_set
+            else env.DB_POOL_SIZE
+        )
+        db_pool_max_overflow = (
+            TEST_DB_POOL_MAX_OVERFLOW
+            if is_testing and "DB_POOL_MAX_OVERFLOW" not in env.model_fields_set
+            else env.DB_POOL_MAX_OVERFLOW
+        )
+
+        # Build default SQLAlchemy engine options
+        sqlalchemy_engine_options = {
+            "pool_size": db_pool_size,
+            "max_overflow": db_pool_max_overflow,
+            "pool_timeout": env.DB_POOL_TIMEOUT,
+            "pool_pre_ping": True,  # Verify connections before use
+            "echo_pool": env.DB_POOL_ECHO,
+        }
+
+        return cls(
+            # Core (always present)
+            secret_key=env.SECRET_KEY,
+            flask_env=env.FLASK_ENV,
+            stage=Stage(env.STAGE or default_stage(env.FLASK_ENV)),
+            homelab_internal=env.HOMELAB_INTERNAL,
+            debug=env.DEBUG,
+            cors_origins=env.CORS_ORIGINS,
+            task_max_workers=env.TASK_MAX_WORKERS,
+            task_timeout_seconds=env.TASK_TIMEOUT_SECONDS,
+            task_cleanup_interval_seconds=env.TASK_CLEANUP_INTERVAL_SECONDS,
+            metrics_update_interval=env.METRICS_UPDATE_INTERVAL,
+            graceful_shutdown_timeout=env.GRACEFUL_SHUTDOWN_TIMEOUT,
+            drain_auth_key=env.DRAIN_AUTH_KEY,
+            log_level=env.LOG_LEVEL,
+            max_upload_size_mb=env.MAX_UPLOAD_SIZE_MB,
+            # use_database
+            database_url=env.DATABASE_URL,
+            db_pool_size=db_pool_size,
+            db_pool_max_overflow=db_pool_max_overflow,
+            db_pool_timeout=env.DB_POOL_TIMEOUT,
+            db_pool_echo=env.DB_POOL_ECHO,
+            diagnostics_enabled=env.DIAGNOSTICS_ENABLED,
+            diagnostics_slow_query_threshold_ms=env.DIAGNOSTICS_SLOW_QUERY_THRESHOLD_MS,
+            diagnostics_slow_request_threshold_ms=env.DIAGNOSTICS_SLOW_REQUEST_THRESHOLD_MS,
+            diagnostics_log_all_queries=env.DIAGNOSTICS_LOG_ALL_QUERIES,
+            sqlalchemy_engine_options=sqlalchemy_engine_options,
+            # use_sse
+            frontend_version_url=env.FRONTEND_VERSION_URL,
+            sse_heartbeat_interval=sse_heartbeat_interval,
+            sse_queue_max_frames=env.SSE_QUEUE_MAX_FRAMES,
+        )
+
+
+class FlaskConfig:
+    """Flask-specific configuration for app.config.from_object().
+
+    This is a simple DTO with the UPPER_CASE attributes Flask and Flask-SQLAlchemy expect.
+    Create via Settings.to_flask_config().
+    """
+
+    def __init__(
+        self,
+        SECRET_KEY: str,
+        MAX_CONTENT_LENGTH: int,
+        SQLALCHEMY_DATABASE_URI: str,
+        SQLALCHEMY_TRACK_MODIFICATIONS: bool,
+        SQLALCHEMY_ENGINE_OPTIONS: dict[str, Any],
+    ) -> None:
+        self.SECRET_KEY = SECRET_KEY
+        self.MAX_CONTENT_LENGTH = MAX_CONTENT_LENGTH
+        self.SQLALCHEMY_DATABASE_URI = SQLALCHEMY_DATABASE_URI
+        self.SQLALCHEMY_TRACK_MODIFICATIONS = SQLALCHEMY_TRACK_MODIFICATIONS
+        self.SQLALCHEMY_ENGINE_OPTIONS = SQLALCHEMY_ENGINE_OPTIONS
