@@ -8,8 +8,10 @@ from sqlalchemy.orm import sessionmaker
 
 from app.app_config import AppSettings
 from app.config import Settings
+from app.services.event_sender import EventSender
 from app.services.frontend_version_service import FrontendVersionService
 from app.services.health_service import HealthService
+from app.services.household_mirror import HouseholdMirror
 from app.services.metrics_service import MetricsService
 from app.services.sonos_client import SoCoSonosClient
 from app.services.sse_connection_manager import SSEConnectionManager
@@ -105,6 +107,23 @@ class ServiceContainer(containers.DeclarativeContainer):
         sse_connection_manager=sse_connection_manager,
     )
     register_for_background_startup(lambda c: c.frontend_version_service())
+
+    # Event sender - the app's events on the SSE stream, coalesced
+    event_sender = providers.Singleton(
+        EventSender,
+        sse_connection_manager=sse_connection_manager,
+        lifecycle_coordinator=lifecycle_coordinator,
+    )
+
+    # Household mirror - the speakers' state in memory, fed by their events.
+    # Built at startup; it mirrors the household on the STARTUP event.
+    household_mirror = providers.Singleton(
+        HouseholdMirror,
+        sonos_client=sonos_client,
+        event_sender=event_sender,
+        lifecycle_coordinator=lifecycle_coordinator,
+    )
+    register_for_background_startup(lambda c: c.household_mirror())
 
 
 def start_background_services(container: Any) -> None:

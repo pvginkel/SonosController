@@ -79,3 +79,11 @@ class ValidationException(BusinessLogicException):
 
     def __init__(self, message: str) -> None:
         super().__init__(message, error_code="VALIDATION_FAILED")
+
+
+class SpeakerNotFoundException(RecordNotFoundException):
+    """Exception raised when the household has no room with the given Sonos id."""
+
+    def __init__(self, speaker_id: str) -> None:
+        super().__init__("Speaker", speaker_id)
+        self.error_code = "SPEAKER_NOT_FOUND"

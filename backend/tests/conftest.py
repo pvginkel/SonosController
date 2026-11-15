@@ -17,13 +17,20 @@ this file, after the imports: ``os.environ.setdefault("MY_SETTING", "value")``.
 Without one the suite passes where ``.env`` sets it, and fails in CI.
 """
 
+import json
 import os
-from collections.abc import Generator
+import uuid
+from collections.abc import Callable, Generator
+from queue import Empty
+from typing import Any
 
 import pytest
 from flask import Flask
 
 from app.app_config import AppSettings
+from app.services.event_sender import COALESCE_SECONDS
+from app.services.household_mirror import HouseholdMirror
+from app.services.sse_connection_manager import SSEConnection
 
 # Import all infrastructure fixtures
 from tests.conftest_infrastructure import *  # noqa: F403
@@ -60,3 +67,65 @@ def sonos(app: Flask) -> Generator[FakeSonosClient]:
         yield fake
     finally:
         fake.close()
+
+
+@pytest.fixture
+def mirror(app: Flask, sonos: FakeSonosClient) -> Generator[HouseholdMirror]:
+    """The container's household mirror, on the test's household.
+
+    Not started: a test builds its household and calls ``start()``. The
+    container gives every test a mirror and an event sender of its own, so
+    that neither holds what an earlier test left.
+    """
+    container = app.container
+    container.event_sender.reset()
+    container.household_mirror.reset()
+    mirror = container.household_mirror()
+    try:
+        yield mirror
+    finally:
+        mirror.stop()
+        container.event_sender().stop()
+        container.household_mirror.reset()
+        container.event_sender.reset()
+
+
+class EventStream:
+    """A client's connection to the event stream: the events it was sent."""
+
+    def __init__(self, connection: SSEConnection) -> None:
+        self.connection = connection
+
+    def events(self) -> list[dict[str, Any]]:
+        """The events sent so far, and those that follow within the time the
+        backend may hold an event back."""
+        events = []
+        while True:
+            try:
+                frame = self.connection.next_frame(COALESCE_SECONDS + 0.25)
+            except Empty:
+                return events
+            assert frame is not None, "the connection was closed"
+            assert frame.startswith("data: ") and frame.endswith("\n\n")
+            events.append(json.loads(frame.removeprefix("data: ")))
+
+
+@pytest.fixture
+def connect(app: Flask) -> Generator[Callable[[], EventStream]]:
+    """Open connections to the event stream, as the stream's route does for a
+    client: each is the local admin's."""
+    manager = app.container.sse_connection_manager()
+    streams: list[EventStream] = []
+
+    def connect() -> EventStream:
+        connection = manager.on_connect(
+            f"test-{uuid.uuid4()}", "local-user", local_admin=True
+        )
+        streams.append(EventStream(connection))
+        return streams[-1]
+
+    try:
+        yield connect
+    finally:
+        for stream in streams:
+            manager.on_disconnect(stream.connection)

@@ -18,6 +18,7 @@ import click
 from flask import Blueprint, Flask
 
 from app.services.container import ServiceContainer
+from app.utils import spectree_config
 
 
 def create_container() -> ServiceContainer:
@@ -27,7 +28,11 @@ def create_container() -> ServiceContainer:
 
 def register_blueprints(api_bp: Blueprint, app: Flask) -> None:
     """Register all app-specific blueprints on api_bp (under /api prefix)."""
-    pass
+    # Imported here: app.api's modules need Spectree configured when they
+    # load, which create_app() has done for this app before it calls this.
+    from app.api.sse_docs import document_event_stream
+
+    document_event_stream(app, spectree_config.api)
 
 
 def register_error_handlers(app: Flask) -> None:

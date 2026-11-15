@@ -119,6 +119,11 @@ class _FakeSubscription(SonosSubscription):
         self.unsubscribed = True
         # A handler that is running finishes before this returns.
         self._client.settle()
+        self._client._require_answer(
+            self.speaker_id,
+            f"end the subscription to {self.service} events of speaker "
+            f"{self.speaker_id}",
+        )
 
 
 class FakeSonosClient(SonosClient):
@@ -129,6 +134,12 @@ class FakeSonosClient(SonosClient):
         self._rooms: dict[str, _Room] = {}
         self._subscriptions: list[_FakeSubscription] = []
         self._next_address = 1
+        self._lagging_group_volume: dict[str, int] = {}
+        self._silent: set[str] = set()
+        # Called with the room's id before each call that reaches a room, and
+        # not for the calls it makes itself: a test makes something happen in
+        # the household between two calls of the code it tests.
+        self.before_call: Callable[[str], None] | None = None
         # False: no speaker answers, as when the household is switched off.
         self.reachable = True
         self._condition = threading.Condition()
@@ -184,15 +195,21 @@ class FakeSonosClient(SonosClient):
         self._send_playback(room, full=True)
 
     def start_stream(
-        self, speaker_id: str, station: str, stream_content: str = ""
+        self,
+        speaker_id: str,
+        station: str,
+        stream_content: str = "",
+        scheme: str = "x-rincon-mp3radio",
     ) -> None:
         """Play a radio stream on the room's group, as the Sonos app starts one.
 
-        The queue stays as it was (section 1.7).
+        The queue stays as it was (section 1.7). With another ``scheme`` the
+        transport's address is that of another source: ``x-rincon-stream``
+        a line-in, ``x-sonos-htastream`` a TV.
         """
         room = self._coordinator(speaker_id)
         slug = station.lower().replace(" ", "-")
-        room.stream_uri = f"x-rincon-mp3radio://stream.invalid/{slug}"
+        room.stream_uri = f"{scheme}://stream.invalid/{slug}"
         room.stream_title = station
         room.stream = Track(
             title=slug,
@@ -219,6 +236,12 @@ class FakeSonosClient(SonosClient):
             uri=room.stream.uri,
             picture="",
         )
+        self._send_playback(room)
+
+    def start_buffering(self, speaker_id: str) -> None:
+        """The room's group waits for what it is to play: ``TRANSITIONING``."""
+        room = self._coordinator(speaker_id)
+        room.state = TransportState.TRANSITIONING
         self._send_playback(room)
 
     def set_shuffle(self, speaker_id: str, shuffle: bool) -> None:
@@ -285,6 +308,24 @@ class FakeSonosClient(SonosClient):
         self._next_address += 1
         self._send_household()
         return room.address
+
+    def lag_group_volume(self, speaker_id: str, volume: int) -> None:
+        """The room's device has not caught up with its group's volume.
+
+        Until the group volume next changes, a new GroupRenderingControl
+        subscription to the device starts with ``volume``, as the Garage's
+        started with a volume the room had left a minute before. A read
+        answers the group's volume as it is.
+        """
+        self._lagging_group_volume[speaker_id] = volume
+
+    def silence_room(self, speaker_id: str) -> None:
+        """The room's device stops answering.
+
+        Every call to it fails, the end of a subscription included. The
+        household still lists the room.
+        """
+        self._silent.add(speaker_id)
 
     def fail_renewals(self, speaker_id: str) -> None:
         """Every renewal of the room's subscriptions fails: each is lost."""
@@ -472,13 +513,25 @@ class FakeSonosClient(SonosClient):
                 operation, "none of the seed speakers answered"
             )
 
+    def _require_answer(self, speaker_id: str, operation: str) -> None:
+        if speaker_id in self._silent:
+            raise ExternalServiceException(operation, "timed out")
+
     def _room(self, speaker_id: str, operation: str = "reach") -> _Room:
+        before_call = self.before_call
+        if before_call is not None:
+            self.before_call = None
+            try:
+                before_call(speaker_id)
+            finally:
+                self.before_call = before_call
         described = f"{operation} speaker {speaker_id}"
         self._require_reachable(described)
         if speaker_id not in self._rooms:
             raise ExternalServiceException(
                 described, f"speaker {speaker_id} is not in the household"
             )
+        self._require_answer(speaker_id, described)
         return self._rooms[speaker_id]
 
     def _coordinator(self, speaker_id: str, operation: str = "reach") -> _Room:
@@ -585,7 +638,8 @@ class FakeSonosClient(SonosClient):
             return VolumeChanged(room.id, volume=room.volume, muted=room.muted)
         if service is SonosService.GROUP_RENDERING_CONTROL:
             group = self._group_volume(self._rooms[room.coordinator_id])
-            return GroupVolumeChanged(room.id, volume=group.volume, muted=group.muted)
+            volume = self._lagging_group_volume.get(room.id, group.volume)
+            return GroupVolumeChanged(room.id, volume=volume, muted=group.muted)
         return HouseholdChanged(room.id, self._household())
 
     def _playback_event(
@@ -629,6 +683,7 @@ class FakeSonosClient(SonosClient):
 
     def _send_group_volume(self, coordinator: _Room) -> None:
         group = self._group_volume(coordinator)
+        self._lagging_group_volume.pop(coordinator.id, None)
         self._send(
             coordinator.id,
             GroupVolumeChanged(coordinator.id, volume=group.volume, muted=group.muted),

@@ -37,8 +37,14 @@ condition: it surfaces as an error to the caller, never as a silent default.
 
 ## Sonos and Plex stay behind two clients
 
-The queue lives on the speaker and the backend holds no playback state; favourites in PostgreSQL are
-its only stored data. Do not cache speaker or library state in the backend to save a round trip.
+The speakers own their state: the queue, what plays and the volume live on the speaker, and the
+backend stores none of it. Favourites in PostgreSQL are its only stored data.
+
+In memory the backend keeps what the design (`docs/api-design.md`) names, and nothing else: the
+mirror of the speakers' state, fed by their events and read again from the speaker at every
+subscription (section 2), and a small cache of finished artwork by id, size and format
+(section 3.7). Both are lost at a restart and built again. Do not cache anything else of a speaker
+or of the library to save a round trip: the library is read from Plex on each request.
 
 The backend reaches Sonos and Plex only through two thin client services in the DI container, one
 wrapping SoCo and one wrapping the Plex library. Nothing else imports SoCo or the Plex library. This

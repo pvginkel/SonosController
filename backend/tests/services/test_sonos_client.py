@@ -653,3 +653,78 @@ class TestSonosClientSubscriptions:
 
         with pytest.raises(RuntimeError, match="the handler failed"):
             household.settle()
+
+    def test_a_subscription_can_start_with_a_group_volume_the_room_has_left(
+        self, household
+    ):
+        household.lag_group_volume(GARAGE, 55)
+        events = []
+        household.subscribe(
+            GARAGE, SonosService.GROUP_RENDERING_CONTROL, events.append, lambda: None
+        )
+        household.settle()
+
+        assert events == [GroupVolumeChanged(GARAGE, volume=55, muted=False)]
+        assert household.read_group_volume(GARAGE) == Volume(20, False)
+
+        household.set_volume(GARAGE, 21)
+        household.settle()
+        later = []
+        household.subscribe(
+            GARAGE, SonosService.GROUP_RENDERING_CONTROL, later.append, lambda: None
+        )
+        household.settle()
+        assert later == [GroupVolumeChanged(GARAGE, volume=21, muted=False)]
+
+    def test_a_transport_that_waits_is_reported(self, household):
+        events = []
+        household.subscribe(
+            GARAGE, SonosService.AV_TRANSPORT, events.append, lambda: None
+        )
+        household.settle()
+
+        household.start_buffering(GARAGE)
+        household.settle()
+
+        assert events[1].transport_state is TransportState.TRANSITIONING
+        assert household.read_playback(GARAGE).transport_state is (
+            TransportState.TRANSITIONING
+        )
+
+    def test_a_source_that_is_not_radio_has_its_own_address(self, household):
+        household.start_stream(GARAGE, "Line In", scheme="x-rincon-stream")
+
+        assert household.read_playback(GARAGE).transport_uri.startswith(
+            "x-rincon-stream:"
+        )
+
+    def test_a_room_that_is_silent_fails_every_call_to_it(self, household):
+        subscription = household.subscribe(
+            GARAGE, SonosService.RENDERING_CONTROL, lambda event: None, lambda: None
+        )
+        household.silence_room(GARAGE)
+
+        with pytest.raises(ExternalServiceException, match="timed out"):
+            household.read_volume(GARAGE)
+        with pytest.raises(ExternalServiceException, match="timed out"):
+            household.subscribe(
+                GARAGE, SonosService.AV_TRANSPORT, lambda event: None, lambda: None
+            )
+        with pytest.raises(ExternalServiceException, match="timed out"):
+            subscription.unsubscribe()
+        assert household.subscription_count(GARAGE) == 0
+        # The household still lists it, and the other rooms answer.
+        assert len(household.read_household().rooms) == 2
+        assert household.read_volume(LOUNGE) == Volume(40, False)
+
+    def test_before_call_runs_between_two_calls_and_not_for_its_own(self, household):
+        seen = []
+
+        def turn_the_lounge_up(speaker_id):
+            seen.append(speaker_id)
+            household.set_volume(LOUNGE, 41)
+
+        household.before_call = turn_the_lounge_up
+
+        assert household.read_volume(LOUNGE) == Volume(41, False)
+        assert seen == [LOUNGE]
