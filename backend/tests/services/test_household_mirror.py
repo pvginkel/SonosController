@@ -638,7 +638,9 @@ class TestHouseholdMirrorEvents:
 
         # Both rooms' group changed, and with it their group volume; the
         # Lounge now plays what the Garage plays. The Garage's own event for
-        # its group's new volume follows.
+        # its group's new volume follows. The Lounge's device reports its own
+        # transport, which names the Garage: that is not the group's playback,
+        # and the Garage's has not changed.
         assert in_any_order(stream.events()) == [
             playback_changed(LOUNGE),
             speakers_changed(),

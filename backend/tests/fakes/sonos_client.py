@@ -261,6 +261,11 @@ class FakeSonosClient(SonosClient):
         room.coordinator_id = coordinator_id
         self._send_household()
         self._send_group_volume(self._rooms[coordinator_id])
+        # The room joins by setting its own transport to the coordinator
+        # (section 1.2), and its own device reports that.
+        self._send(
+            room.id, PlaybackChanged(room.id, transport_uri=f"x-rincon:{coordinator_id}")
+        )
 
     def unjoin(self, speaker_id: str) -> None:
         """The room leaves its group and plays alone."""
@@ -270,6 +275,8 @@ class FakeSonosClient(SonosClient):
         self._send_household()
         self._send_group_volume(former)
         self._send_group_volume(room)
+        # Its transport is its own queue again.
+        self._send_playback(room, full=True)
 
     def rename_room(self, speaker_id: str, name: str) -> None:
         self._rooms[speaker_id].name = name

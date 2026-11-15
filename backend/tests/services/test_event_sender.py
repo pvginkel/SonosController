@@ -98,13 +98,18 @@ class TestEventSender:
 
     def test_a_burst_is_one_event_at_once_and_the_last_one_after(self, sender, connect):
         stream = connect()
+        started = time.perf_counter()
 
         for _ in range(20):
             sender.send(volume_changed(GARAGE))
+        windows = (time.perf_counter() - started) // COALESCE_SECONDS
 
-        assert stream.events() == [
+        # Two, and one more for every 250 ms the burst itself took.
+        events = stream.events()
+        assert 2 <= len(events) <= 2 + windows
+        assert events == [
             {"type": "volume_changed", "payload": {"speaker_id": GARAGE}}
-        ] * 2
+        ] * len(events)
 
     def test_at_most_one_event_in_250_ms_while_changes_keep_coming(
         self, sender, connect
