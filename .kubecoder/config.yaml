@@ -1,0 +1,23 @@
+repos: []
+cwd: SonosController
+capabilities:
+  github: rw
+  fleetAdmin: false
+  capacityExempt: false
+services: []
+tools:
+  - use: python
+imageBuilder: false
+env: []
+secrets:
+  LIVE_PLEX_TOKEN: plex-token
+secretFiles: []
+packages: []
+setup: []
+preamble:
+  instructions: ''
+ports:
+  - name: upnp-events
+    port: 1400
+    type: http
+homeOverlays: []
