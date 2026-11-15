@@ -59,6 +59,14 @@ class TestPlexClientReadiness:
     def test_plex_answers_and_has_the_library(self, plex):
         assert plex.check_readiness().status is CheckStatus.OK
 
+    def test_without_a_library_named_plexs_one_music_library_passes(
+        self, app, live_settings
+    ):
+        # PLEX_LIBRARY is optional when the server has one music library.
+        client = _other(app, live_settings, plex_library=None)
+
+        assert client.check_readiness().status is CheckStatus.OK
+
     def test_a_library_plex_does_not_have_is_reported(self, app, live_settings):
         client = _other(app, live_settings, plex_library="No such library")
 
