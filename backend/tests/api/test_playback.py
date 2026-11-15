@@ -394,8 +394,8 @@ class TestPlaybackCommands:
         assert response.status_code == 502
         assert response.get_json()["error"] == (
             f"Cannot skip to the next track on speaker {GARAGE} because external "
-            "service failed: the speaker answered UPnP error 701 (Transition not "
-            "available)"
+            "service failed: the speaker answered UPnP error 711 (Illegal seek "
+            "target)"
         )
 
     @pytest.mark.parametrize("name", COMMANDS)

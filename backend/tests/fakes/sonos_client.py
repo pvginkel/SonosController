@@ -603,9 +603,18 @@ class FakeSonosClient(SonosClient):
     ) -> _Room:
         room = self._coordinator(speaker_id, operation)
         if action not in self._actions(room):
+            # The Garage answers a previous at its queue's first track with
+            # 711, and a next on a radio stream with 701 (docs/api-design.md
+            # section 1.7).
+            seek = action in (TransportAction.NEXT, TransportAction.PREVIOUS)
+            refusal = (
+                "711 (Illegal seek target)"
+                if seek and room.queue and not room.stream
+                else "701 (Transition not available)"
+            )
             raise ExternalServiceException(
                 f"{operation} speaker {speaker_id}",
-                "the speaker answered UPnP error 701 (Transition not available)",
+                f"the speaker answered UPnP error {refusal}",
             )
         return room
 

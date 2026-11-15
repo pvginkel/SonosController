@@ -272,7 +272,7 @@ class TestSonosClientPlayback:
         assert household.read_playback(GARAGE).queue_position == 2
 
     def test_a_command_the_speaker_does_not_allow_fails(self, household):
-        with pytest.raises(ExternalServiceException, match="UPnP error 701"):
+        with pytest.raises(ExternalServiceException, match="UPnP error 711"):
             household.previous(GARAGE)
 
         assert household.read_playback(GARAGE).queue_position == 1

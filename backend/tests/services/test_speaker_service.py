@@ -132,7 +132,7 @@ class TestSpeakerServiceCommand:
             speakers.command(GARAGE, NEXT)
 
         assert raised.value.cause == (
-            "the speaker answered UPnP error 701 (Transition not available)"
+            "the speaker answered UPnP error 711 (Illegal seek target)"
         )
 
     def test_an_unknown_speaker_is_not_found(self, speakers):
