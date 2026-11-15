@@ -21,6 +21,7 @@ dependencies = [
     "alembic>=1.13.0,<2",
     "psycopg[binary]>=3.1.0,<4",
     "soco>=0.32.2,<0.33",
+    "plexapi>=4.18,<5",
 ]
 
 [project.scripts]
@@ -42,6 +43,7 @@ dev = [
     "watchdog[watchmedo]>=6.0.0,<7",
     "pyyaml>=6.0,<7",
     "types-pyyaml>=6.0,<7",
+    "pillow>=13.0.0,<14",
 ]
 
 # Only app/ is a package; run.py and scripts/ are reached through the editable
@@ -121,10 +123,11 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-# The live suite (tests/live/) needs the real speakers: `pytest -m live tests/live`.
+# The live suite (tests/live/) needs the real speakers and the real Plex:
+# `pytest -m live tests/live`.
 addopts = "-v -m 'not live'"
 markers = [
-    "live: runs the real Sonos client against the Garage speaker; never in CI",
+    "live: runs the real Sonos and Plex clients against the Garage speaker and the real Plex; never in CI",
     "integration: marks tests as integration tests (requires external dependencies)",
     "slow: marks tests as slow running tests"
 ]

@@ -29,8 +29,10 @@ projects:
     setup:
       - cexec python uv sync
       # Adds to the git-ignored .env the settings the app cannot start without
-      # and .env lacks: the database, the speakers' addresses from the deploy
-      # repo's prd values, this environment's own name for their events.
+      # and .env lacks: the database, the speakers' addresses and Plex's
+      # address and library from the deploy repo's prd values, this
+      # environment's own name for the speakers' events, and the Plex token
+      # from LIVE_PLEX_TOKEN.
       - cexec python uv run python scripts/write_dev_env.py
       - cexec python uv run python scripts/init-dev-database.py
       - cexec python uv run cli upgrade-db

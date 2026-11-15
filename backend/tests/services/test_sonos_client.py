@@ -117,6 +117,8 @@ class TestSonosClientReadiness:
             settings=AppSettings(
                 sonos_seed_hosts=["192.0.2.1", "192.0.2.2"],
                 sonos_event_advertise_host="sonos-events.invalid",
+                plex_url="http://192.0.2.1:32400",
+                plex_token="the-suites-plex-token",
             ),
             health_service=app.container.health_service(),
         )
@@ -170,6 +172,8 @@ class TestSonosClientHousehold:
             settings=AppSettings(
                 sonos_seed_hosts=["192.0.2.3"],
                 sonos_event_advertise_host="sonos-events.invalid",
+                plex_url="http://192.0.2.1:32400",
+                plex_token="the-suites-plex-token",
             ),
             health_service=app.container.health_service(),
         )

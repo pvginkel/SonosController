@@ -34,22 +34,30 @@ from app.services.sse_connection_manager import SSEConnection
 
 # Import all infrastructure fixtures
 from tests.conftest_infrastructure import *  # noqa: F403
+from tests.fakes.plex_client import FakePlexClient
 from tests.fakes.sonos_client import FakeSonosClient
 
 # conftest_infrastructure has loaded .env into the environment, and in a
-# SonosController environment .env names the real household. A process the
-# suite starts gets these instead: TEST-NET-1 (RFC 5737) and .invalid
-# (RFC 2606) reach nothing.
+# SonosController environment .env names the real household and the real
+# Plex, with its token. A process the suite starts gets these instead:
+# TEST-NET-1 (RFC 5737) and .invalid (RFC 2606) reach nothing.
 os.environ["SONOS_SEED_HOSTS"] = "192.0.2.1"
 os.environ["SONOS_EVENT_ADVERTISE_HOST"] = "sonos-events.invalid"
+os.environ["PLEX_URL"] = "http://192.0.2.1:32400"
+os.environ["PLEX_TOKEN"] = "the-suites-plex-token"
+os.environ["PLEX_LIBRARY"] = "Music"
 
 
 @pytest.fixture(scope="session")
 def test_app_settings() -> AppSettings:
-    """The app settings of the suite's apps: no speaker is behind them."""
+    """The app settings of the suite's apps: no speaker and no Plex is behind
+    them."""
     return AppSettings(
         sonos_seed_hosts=["192.0.2.1"],
         sonos_event_advertise_host="sonos-events.invalid",
+        plex_url="http://192.0.2.1:32400",
+        plex_token="the-suites-plex-token",
+        plex_library="Music",
     )
 
 
@@ -67,6 +75,20 @@ def sonos(app: Flask) -> Generator[FakeSonosClient]:
         yield fake
     finally:
         fake.close()
+
+
+@pytest.fixture(autouse=True)
+def plex(app: Flask) -> FakePlexClient:
+    """The Plex every test runs against: the in-memory fake, its library
+    empty.
+
+    It overrides the container's Plex client for every test, so that no test
+    reaches Plex; ``session_app_isolation`` undoes the override. The live
+    suite replaces this fixture with the real client.
+    """
+    fake = FakePlexClient(health_service=app.container.health_service())
+    app.container.plex_client.override(fake)
+    return fake
 
 
 @pytest.fixture

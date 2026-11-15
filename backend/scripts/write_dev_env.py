@@ -14,6 +14,9 @@ lives:
 - SONOS_EVENT_ADVERTISE_HOST: this environment's own DNS name, as
   `kc env describe` gives it, where its port `upnp-events` is published. Never
   prd's events Service: the speakers would call production.
+- PLEX_URL and PLEX_LIBRARY: `plex.url` and `plex.library` in the same prd
+  values.
+- PLEX_TOKEN: this environment's secret LIVE_PLEX_TOKEN.
 
 A value it cannot find stops it, with where the value comes from. It prints
 the names it adds, never a value.
@@ -23,9 +26,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import yaml
@@ -46,23 +50,56 @@ class SetupError(Exception):
     """A value setup could not find; the message says where it comes from."""
 
 
-def seed_hosts(deploy_values: Path) -> str:
-    """SONOS_SEED_HOSTS: the speakers' addresses in the deploy repo's prd values."""
-    source = f"sonos.seedHosts in {deploy_values}"
+def _deploy_value(deploy_values: Path, name: str, key: str) -> object:
+    """What the deploy repo's prd values hold at ``key``, a dotted path."""
     if not deploy_values.is_file():
         raise SetupError(
-            f"SONOS_SEED_HOSTS comes from {source}, and that file is missing. "
-            "It is in the SonosControllerDeploy checkout that "
+            f"{name} comes from {key} in {deploy_values}, and that file is "
+            "missing. It is in the SonosControllerDeploy checkout that "
             ".kubecoder/config.yaml lists under repos."
         )
-    values = yaml.safe_load(deploy_values.read_text(encoding="utf-8")) or {}
-    hosts = (values.get("sonos") or {}).get("seedHosts")
+    value: object = yaml.safe_load(deploy_values.read_text(encoding="utf-8"))
+    for part in key.split("."):
+        value = value.get(part) if isinstance(value, dict) else None
+    return value
+
+
+def seed_hosts(deploy_values: Path) -> str:
+    """SONOS_SEED_HOSTS: the speakers' addresses in the deploy repo's prd values."""
+    hosts = _deploy_value(deploy_values, "SONOS_SEED_HOSTS", "sonos.seedHosts")
     if not isinstance(hosts, list) or not hosts:
         raise SetupError(
-            f"SONOS_SEED_HOSTS comes from {source}, and that list is missing or "
-            "empty. Bring the SonosControllerDeploy checkout up to date."
+            f"SONOS_SEED_HOSTS comes from sonos.seedHosts in {deploy_values}, "
+            "and that list is missing or empty. Bring the SonosControllerDeploy "
+            "checkout up to date."
         )
     return ",".join(str(host) for host in hosts)
+
+
+def plex_value(deploy_values: Path, name: str, key: str) -> str:
+    """PLEX_URL and PLEX_LIBRARY: Plex's address and its music library in the
+    deploy repo's prd values."""
+    value = _deploy_value(deploy_values, name, key)
+    if not isinstance(value, str) or not value:
+        raise SetupError(
+            f"{name} comes from {key} in {deploy_values}, and that value is "
+            "missing or empty. Bring the SonosControllerDeploy checkout up to "
+            "date."
+        )
+    return value
+
+
+def plex_token(environ: Mapping[str, str]) -> str:
+    """PLEX_TOKEN: the environment's secret LIVE_PLEX_TOKEN."""
+    token = environ.get("LIVE_PLEX_TOKEN")
+    if not token:
+        raise SetupError(
+            "PLEX_TOKEN comes from this environment's LIVE_PLEX_TOKEN, which "
+            ".kubecoder/config.yaml lists under secrets, and it is not set. "
+            "Outside a KubeCoder environment, set PLEX_TOKEN in .env to a token "
+            "of the Plex server."
+        )
+    return token
 
 
 def environment_dns_name() -> str:
@@ -90,13 +127,21 @@ def environment_dns_name() -> str:
 
 
 def write_dev_env(
-    env_file: Path, deploy_values: Path, dns_name: Callable[[], str]
+    env_file: Path,
+    deploy_values: Path,
+    dns_name: Callable[[], str],
+    environ: Mapping[str, str],
 ) -> list[str]:
     """Append the settings ``env_file`` lacks. Returns the names it added."""
     sources: dict[str, Callable[[], str]] = {
         "DATABASE_URL": lambda: DATABASE_URL,
         "SONOS_SEED_HOSTS": lambda: seed_hosts(deploy_values),
         "SONOS_EVENT_ADVERTISE_HOST": dns_name,
+        "PLEX_URL": lambda: plex_value(deploy_values, "PLEX_URL", "plex.url"),
+        "PLEX_LIBRARY": lambda: plex_value(
+            deploy_values, "PLEX_LIBRARY", "plex.library"
+        ),
+        "PLEX_TOKEN": lambda: plex_token(environ),
     }
     held = dotenv_values(env_file) if env_file.exists() else {}
     added = {name: source() for name, source in sources.items() if name not in held}
@@ -115,7 +160,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--deploy-values", type=Path, default=DEFAULT_DEPLOY_VALUES)
     args = parser.parse_args(argv)
     try:
-        added = write_dev_env(args.env_file, args.deploy_values, environment_dns_name)
+        added = write_dev_env(
+            args.env_file, args.deploy_values, environment_dns_name, os.environ
+        )
     except SetupError as exc:
         print(f"write_dev_env: {exc}", file=sys.stderr)
         return 1
