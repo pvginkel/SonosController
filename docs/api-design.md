@@ -61,6 +61,10 @@ What follows from the detail:
   them out. The backend merges each event into the state it holds.
 - **Events come in bursts.** Queueing track by track produced 17 `Queue` events in two seconds.
   The backend coalesces what it passes on (section 4).
+- **Events can arrive late.** On the Garage some notifications came within 40 ms of the change
+  and others up to 44 s after it, on and off, with a callback by name and by address alike. The
+  speaker folds what changed meanwhile into one notification, so nothing is lost. The cause is
+  not established.
 - **Nothing reports the elapsed time.** There is no event for it, so showing progress would mean
   polling. Seeking is left out of the project, and the API has no elapsed time.
 
@@ -251,8 +255,11 @@ first and title second. Section 5 stores a favourite accordingly.
   a JPEG in about 65 ms (`format=png` gives PNG). With `minSize=1` the picture covers the box and
   keeps its shape; without it, it fits inside. Neither crops, so a square needs a crop
   afterwards.
+- **Plex ignores the stamp.** A `thumb` path with any stamp answers the item's picture as it is
+  now.
 - **The speaker serves artwork for whatever it plays**, at `/getaa?…` on its own port: a
   300 × 300 JPEG for a Plex track. This is the only source for something that is not from Plex.
+  It goes on serving a track's picture after the track has stopped being the one loaded.
 - **IoT Support's converter** (`backend/app/utils/lvgl/LVGLImage.py`) is LVGL's own
   `scripts/LVGLImage.py`, kept verbatim. It writes LVGL 9's binary image: a 12-byte header
   (magic `0x19`, colour format, flags, width, height, stride, reserved; little-endian) and then
@@ -278,23 +285,32 @@ first and title second. Section 5 stores a favourite accordingly.
 
 - **The backend mirrors, and does not own, the speakers' state.** A singleton service holds, per
   speaker, what the events report, and re-reads a speaker in full when it subscribes or
-  subscribes again. A `GET` answers from this mirror. Nothing of it is stored: after a restart
-  the backend reads the speakers again, and the music has played on.
+  subscribes again. A `GET` answers from this mirror, and asks Plex only for the picture of a
+  Plex track (3.7). The mirror changes on the speakers' events and on its own reads of the
+  layout, never on a command: after a command a `GET` answers the old state until the speaker's
+  event arrives (1.1). Nothing of it is stored: after a restart the backend reads the speakers
+  again, and the music has played on.
 - **Speakers are found from configured addresses.** `SONOS_SEED_HOSTS` lists one or more
   speakers; any one that answers gives the household's layout and the addresses of the rest.
 - **The subscriptions heal themselves.** SoCo renews them. On a failed renewal, a speaker that
-  restarted or a changed address in the topology, the backend subscribes again and re-reads the
-  state. This is one background service on the template's lifecycle hooks, and the reason the
-  app runs as one replica.
+  restarted or a changed address in the topology, the backend subscribes again, re-reads the
+  state and sends the events of what the read changed. A speaker that restarts forgets its
+  subscriptions without a word, so the backend also reads the layout itself, every 10 seconds
+  and at once after a failed renewal: that read finds a restart by the device's boot sequence
+  number, and a room that did not answer before. When no speaker answers at the app's start, the
+  app starts with an empty mirror, which fills once one does. This is one background service on
+  the template's lifecycle hooks, and the reason the app runs as one replica.
 - **Plex is read directly**, with `PLEX_URL` and `PLEX_TOKEN`, for the library, for the order of
   an artist, for favourites and for artwork. The token also sees a server shared by someone
   else; the configured address settles which server is meant.
 - **Text is Unicode NFC.** Every string from Plex or a speaker is normalised before it leaves the
   API. The display's fonts hold composed characters only.
 - **Readiness**: the Sonos and the Plex service each register a check of their own, neither
-  critical (READY-1, READY-2). The app serves favourites without either.
+  critical (READY-1, READY-2). Sonos's passes when a speaker answers, Plex's when Plex answers
+  and has the music library. The app serves favourites without either.
 - **Failures** of a speaker or of Plex are `ExternalServiceException`, a `502` in the template's
-  envelope (BE-3).
+  envelope (BE-3). Its message is the client's own wording, which names no address and never the
+  token.
 
 ## 3. The API
 
@@ -341,7 +357,8 @@ Conventions that hold for every endpoint:
 - A room alone has a group with itself as the only member (1.2).
 - `id` is what a display stores as its choice. It is the device's own and does not change with
   the room's name or address.
-- Hidden devices are not listed (1.2).
+- Hidden devices are not listed (1.2). The list is sorted by name, and empty while no speaker
+  answers.
 - An unknown `speaker_id` is a `404` with code `SPEAKER_NOT_FOUND`, here and below.
 
 ### 3.2 Playback
@@ -378,12 +395,16 @@ group's coordinator.
 
 - `state`: `playing`, `paused`, `stopped` or `buffering` (the speaker's `TRANSITIONING`).
 - `source`: `queue`, `radio`, `line_in`, `tv` or `other`, from the transport address.
-- `actions`: what the speaker allows now, of `play`, `pause`, `next`, `previous`. A command that
-  is not among them is a `409` with code `ACTION_NOT_AVAILABLE`.
-- `queue_position` is 1-based and `null` when the source is not the queue.
-- `track` is `null` when nothing is loaded. `album`, `duration_ms` and `artwork_id` are `null`
-  when the source gives none, as a radio stream does. `track_id` is the Plex track when the queue
-  entry is one (1.3), else `null`.
+- `actions`: what the speaker allows now, of `play`, `pause`, `next`, `previous`; `pause` is
+  there when the speaker allows a pause or a stop (1.7). A command that is not among them is a
+  `409` with code `ACTION_NOT_AVAILABLE`. The check reads the mirror, so a command the speaker
+  stopped allowing before its event arrived goes to the speaker, which refuses it: a `502`.
+- `queue_position` is 1-based and `null` when the source is not the queue, and for an empty
+  queue. `queue_length` is `null` when the source is not the queue.
+- `track` is `null` when nothing is loaded. For a radio stream the title is what the stream
+  reports as playing, the station until it reports anything, and the artist is the station.
+  `album`, `duration_ms` and `artwork_id` are `null` when the source gives none, as a radio
+  stream does. `track_id` is the Plex track when the queue entry is one (1.3), else `null`.
 - There is no elapsed time (1.1) and no repeat.
 
 ### 3.3 Volume
@@ -393,9 +414,12 @@ group's coordinator.
 | `POST /api/speakers/{speaker_id}/volume` | Sets this room's volume. |
 | `POST /api/speakers/{speaker_id}/group/volume` | Sets the group's volume. |
 
-The body holds `volume` (0 to 100) or `delta` (−100 to 100), and may hold `muted`. The answer is
-`200` with the new `{"volume": …, "muted": …}`, so a client can show it at once. The current
-values are in the speaker (3.1).
+The body holds exactly one of `volume` (0 to 100) and `delta` (−100 to 100), and may hold
+`muted`: `{"delta": 0, "muted": true}` mutes and leaves the volume. Anything else is a `400`:
+`muted` alone, both of the two or neither, a value out of range or of another JSON type, a field
+that is not one of the three. The answer is `200` with `{"volume": …, "muted": …}` as the speaker
+gives them after the change, so a client can show it at once. The current values are in the
+speaker (3.1).
 
 - `delta` is the speaker's own relative step. Two displays that each press "louder" both count,
   where two absolute values would overwrite each other.
@@ -562,9 +586,10 @@ An artist, an album, a track and a playlist:
   keep a picture by id and size for as long as it likes, and the answer says so
   (`Cache-Control: public, max-age=31536000, immutable`).
 - **The id is the backend's to shape.** For a library item it encodes Plex's `thumb` or
-  `composite` path with its stamp (1.9). For something that plays from another source it encodes
-  the speaker and the track's address, and the picture is the speaker's own (`/getaa`), served
-  while that track is still current.
+  `composite` path with its stamp (1.9). For something that plays from another source it names
+  the group's coordinator and a digest of the track's address and of its picture's, and the
+  picture is the one that speaker serves (`/getaa`), answered only while that track is the one
+  the coordinator has loaded.
 - **`size`** is the side of a square in pixels. The picture is scaled to cover the square and
   cropped at the centre.
 - **`format=jpeg`** (the default), 16 to 1024 pixels: `image/jpeg`. This is the ordinary image,
@@ -574,14 +599,19 @@ An artist, an album, a track and a playlist:
   alpha, dithered, at exactly `size` × `size`, as `application/octet-stream` with
   `Content-Length`. The display asks for 400, 160 and 80. This is the one part of the API made
   for the device.
-- **An unknown id is a `404`.** A client shows its placeholder.
+- **An unknown id is a `404`** with code `RECORD_NOT_FOUND`, and so is a speaker's picture once
+  its track is no longer loaded. A client shows its placeholder. Plex ignores the stamp (1.9), so
+  the id of a Plex picture that has since changed answers the picture as it is now.
+- **A source that fails** (Plex, the speaker, or bytes that are no picture) is a `502`.
 
-How it is made: Plex resizes the source (`/photo/:/transcode` with `minSize=1`), Pillow crops
-the square, and for `lvgl` the backend applies the ordered dither of 1.9 and writes the file
+How it is made: Plex resizes its own picture first (`/photo/:/transcode` with `minSize=1`),
+Pillow scales what it has to cover the square and crops it at the centre, and for `lvgl` the
+backend applies the ordered dither of 1.9 and writes the file
 with IoT Support's `LVGLImage.py`, copied verbatim to `backend/app/utils/lvgl/` as IoT Support
 keeps it. That module imports `pypng` and `lz4` when it loads, so both are dependencies, with
 Pillow and numpy. The whole conversion is under 15 ms, so a cache of finished pictures is a
-convenience and not a need; a small in-memory one, by id, size and format, is enough.
+convenience and not a need: the backend keeps the ones used last in memory, 16 MB of them, by id,
+size and format, and checks that a speaker's picture is still current before it looks there.
 
 ## 4. Events
 
@@ -678,7 +708,7 @@ erDiagram
 
 | Setting | Holds |
 |---|---|
-| `SONOS_SEED_HOSTS` | Addresses of one or more speakers, comma-separated. |
+| `SONOS_SEED_HOSTS` | IPv4 addresses of one or more speakers, comma-separated. A name is refused: SoCo reaches a speaker by address. |
 | `SONOS_EVENT_ADVERTISE_HOST` | The name or address the speakers call back: that of the events Service below. |
 | `SONOS_EVENT_PORT` | The port the backend listens on for speaker events, and advertises. Default 1400. |
 | `PLEX_URL` | The Plex server's address, plain HTTP on the local network. |
@@ -700,22 +730,20 @@ configuration, the token in its secret.
   is renewed.
 - **`externalTrafficPolicy: Local`**, as the dev environment's Service has. It is safe with one
   replica, and keeps the speaker's address as the source.
-- **The container declares port 1400.** The deployment template has port 3601 only.
+- **The container declares port 1400**, beside the API's 3601.
 - **No network policy**: the cluster has none that applies, in either direction.
 
 **On the network:**
 
-- **From the speakers to the events Service, TCP 1400.** In the test this was already open: the
-  dev environment's Service had drawn its address from the cluster's pool minutes before, and
-  the speaker reached it. A production Service draws from the same pool, so nothing more is
-  expected; it is the first thing to check after the first deployment, by the events arriving.
+- **From the speakers to the events Service, TCP 1400.** Open, with nothing to set up: the
+  speakers reach a Service whose address is from the cluster's pool, the dev environment's as
+  prd's, and their events arrive at both.
 - **From the pod to the speakers, TCP 1400, and to Plex, TCP 32400.** Both work from a pod
   today.
-- **The speakers need addresses that stay.** They hold dynamic leases at present: the DHCP
-  reservations made for them are not in effect, and neither speaker answers at its reserved
-  address. A lease that changes while a speaker is switched off leaves `SONOS_SEED_HOSTS`
-  pointing at nothing. This is the operator's to settle before the first deployment: reservations
-  that hold, and those addresses in the deployment's configuration.
+- **The speakers need addresses that stay.** A lease that changes while a speaker is switched
+  off leaves `SONOS_SEED_HOSTS` pointing at nothing. The seeds in the deployment's configuration
+  are the speakers' DHCP reservations, and any one that answers gives the addresses of the rest
+  (section 2).
 
 ## 7. Not tried, and to check first
 
@@ -725,12 +753,10 @@ configuration, the token in its secret.
   the leaving room's queue holds afterwards.
 - **A favourite across a rescan** (1.8): the lookup by `guid` is proven; that a `guid` survives a
   rescan is from Plex's forum, not from a rescan of this library.
-- **A subscription across a day**: renewal after 24 hours, a speaker that restarts, and a speaker
-  whose address changes were not waited for. The healing in section 2 is designed for them and is
-  to be shown in milestone 1.
+- **A subscription across a day** on the real speakers: renewal after 24 hours, a speaker that
+  restarts, and a speaker whose address changes were not waited for. The healing in section 2 is
+  built for them, and the suite shows each case on the in-memory fake of the Sonos client.
+- **A speaker's own picture** (1.9) has not gone through the artwork endpoint on a real speaker:
+  the suite serves it from the fake, and the live suite reads one through the Sonos client alone.
 - **The limit for a playlist** (1.6) lies between 1,243 and 12,019 tracks and was not narrowed
   down; 1,000 is on the safe side of what was seen to work.
-- **Testing without speakers.** CI has neither speakers nor Plex, and the template's rules allow
-  no mock or fake without the operator's approval (TEST-1). All speaker and Plex traffic sits
-  behind the two services of section 2, so the slice that builds them can put that question once.
-  The dev environment reaches the real Garage speaker and the real Plex with `LIVE_PLEX_TOKEN`.

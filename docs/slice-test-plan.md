@@ -65,18 +65,22 @@ left behind, and that `git status --short` is clean (`logs/` is git-ignored).
 
 ## 3. The live suite
 
-Whenever the slice changes what a client sends to Sonos or Plex, run the live suite. It exists once
-the first slice that adds a client has added it, with its `live` marker; until then there is nothing
-to run, and a slice whose criteria need the real speaker reports them as *not verified*.
+Whenever the slice changes what a client sends to Sonos or Plex, run the live suite,
+`backend/tests/live/` (marker `live`), with step 2's dev stack stopped: both listen for the
+speakers' events on port 1400. It runs on the settings `kc project setup` wrote to `backend/.env`.
 
 ```bash
 [ -n "${LIVE_PLEX_TOKEN:+x}" ] && echo token present
-cexec python sh -c 'cd backend && uv run pytest -m live tests/live'   # the first client slice adds tests/live
+cexec python sh -c 'cd backend && uv run pytest -m live tests/live'
 ```
 
 The suite's conftest checks both systems at session start and stops with `pytest.exit()` and a
-message on how to fix what is missing (never a skip); follow the message. If it cannot run, the
-criteria that need it are *not verified*: say so, never pass them by inspection.
+message on how to fix what is missing (never a skip); follow the message. It wants the Garage alone
+in its group, stopped, on a queue of two tracks or more at a track of the Plex library. One test
+also wants the Garage at the first or the last track of that queue, which the conftest does not
+check: queue an album of the Plex library from the Sonos app and stop it, and the Garage is fit for
+all of them. If it cannot run, the criteria that need it are *not verified*: say so, never pass them
+by inspection.
 
 Standing rules, here and in every check against the real systems: the **Garage** speaker only, at
 low volume, with its queue, position, volume and grouping left as found. **Zitkuil** is never

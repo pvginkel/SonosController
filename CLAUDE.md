@@ -8,9 +8,10 @@ Plays music from a Plex library on Sonos speakers and serves the touch-screen di
   shared `Procfile.dev` dev stack and its `scripts/dev.py` launcher, the `Jenkinsfile`, and the
   `Jenkinsfile.architecture` that publishes the architecture model in `docs/architecture/`.
 - **`backend/`** — the Flask API (Python, uv).
-- **`docs/`** — the change-discipline rules every change obeys (`change-discipline.md`: no shims or
-  tombstones, Sonos and Plex reached only through their two clients and faked only there, this repo
-  is public), and the slice test and doc plans the dev workflow executes.
+- **`docs/`** — the API's design (`api-design.md`), the change-discipline rules every change obeys
+  (`change-discipline.md`: no shims or tombstones, Sonos and Plex reached only through their two
+  clients and faked only there, this repo is public), and the slice test and doc plans the dev
+  workflow executes.
 - **Spec repo** — `../SonosControllerSpecs` (private, named in `.aiworkflowrc`), shared by every
   session: commit early there, staging by path.
 

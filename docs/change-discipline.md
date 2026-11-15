@@ -46,9 +46,10 @@ subscription (section 2), and a small cache of finished artwork by id, size and 
 (section 3.7). Both are lost at a restart and built again. Do not cache anything else of a speaker
 or of the library to save a round trip: the library is read from Plex on each request.
 
-The backend reaches Sonos and Plex only through two thin client services in the DI container, one
-wrapping SoCo and one wrapping the Plex library. Nothing else imports SoCo or the Plex library. This
-is what makes the next section possible.
+The backend reaches Sonos and Plex only through two thin client services in the DI container:
+`sonos_client`, wrapping SoCo (`backend/app/services/sonos_client.py`), and `plex_client`, wrapping
+plexapi (`backend/app/services/plex_client.py`). Nothing else imports SoCo or plexapi. This is what
+makes the next section possible.
 
 ## Testability is critical
 
@@ -58,8 +59,9 @@ PostgreSQL and the real SSE machinery.
 
 **Sonos and Plex are the one thing that is faked: the one exception to the modern app guide's
 TEST-1 (no mocks or fakes), approved for this project at its onboarding.** CI has no speaker and no
-Plex. pytest overrides the two client providers with hand-written in-memory fakes that keep state
-(a speaker's queue, transport state, volume and group; a small Plex library). Never `MagicMock`,
+Plex. pytest overrides the two client providers with hand-written in-memory fakes that keep state,
+in `backend/tests/fakes/` (a household's rooms with their queues, transport, volume and groups;
+Plex's albums and their pictures). Never `MagicMock`,
 never `monkeypatch` of SoCo or plexapi internals, and no other fake anywhere: everything above the
 clients is real.
 
@@ -67,8 +69,7 @@ What the fakes cannot prove is what the real clients send, so a separate **live 
 `backend/tests/live/`, marked `live` and deselected by default, runs the real clients against the
 Garage speaker and the real Plex from a KubeCoder environment. CI never runs it. Its conftest checks
 both systems at session start and stops with `pytest.exit()` and a message saying how to fix it,
-never a skip (TEST-2). The live suite does not exist yet: the first slice that adds a client adds
-it and its marker.
+never a skip (TEST-2). `docs/slice-test-plan.md`, step 3, has how it is run.
 
 Live rules, standing for every session: use the **Garage** speaker only, at low volume, and leave its
 queue, position, volume and grouping as found. **Zitkuil** (a room of three devices) is a living
