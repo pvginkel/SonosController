@@ -1,23 +1,54 @@
-repos: []
-cwd: SonosController
+# KubeCoder environment manifest for the SonosController monorepo (backend only).
+#
+# The python sidecar carries uv for the backend and the root, and is the tool
+# container scripts/dev.py runs the dev stack in. The root template selects
+# modern-app (Node beside Python) for every app; a backend-only app needs no
+# Node, and python is a fifth of its memory.
+#
+# `postgres` serves the dev stack's database: the backend's default
+# DATABASE_URL points at localhost:5432/sonos_controller, and `kc project setup`
+# creates that database and applies the migrations. The backend suite creates
+# its own databases on the same server (TEST_DATABASE_ADMIN_URL) and never
+# touches the dev one.
+#
+# No imageBuilder: the Dockerfile is built by Jenkins with
+# helmCharts.kaniko2(...), and nothing builds an image from inside this
+# environment.
+
+repos:
+  # The AI workflow's spec repository, shared across every environment that
+  # works on SonosController.
+  - url: https://github.com/pvginkel/SonosControllerSpecs
+    shared: true
+  # The Argo CD deploy repository the Jenkinsfile pins images into
+  # (cicd.writeVersionPins); its project.yaml runs through iac and aac-tools.
+  - url: https://github.com/pvginkel/SonosControllerDeploy
+
 capabilities:
   github: rw
-  fleetAdmin: false
-  capacityExempt: false
-services: []
+
 tools:
   - use: python
-imageBuilder: false
-env: []
+  # arch-validate, for the architecture models' lint steps (this repo's and
+  # the deploy repo's project.yaml); the AaC jobs run the same command.
+  - use: aac-tools
+  # helm and terraform, for the deploy repo's verbs.
+  - use: iac
+
+services:
+  - postgres
+
 secrets:
+  # The Plex token for live tests against the real Plex server
+  # (kv/eso/prd/sonos-controller/prd/plex#token, copied into the catalog).
   LIVE_PLEX_TOKEN: plex-token
-secretFiles: []
-packages: []
-setup: []
-preamble:
-  instructions: ''
+
 ports:
+  - name: backend
+    port: 3601
+    type: http
+  # Plain HTTP, published on the environment's LoadBalancer: the Sonos
+  # speakers deliver their UPnP event notifications here.
   - name: upnp-events
     port: 1400
     type: http
-homeOverlays: []

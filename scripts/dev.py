@@ -12,7 +12,7 @@ SIGTERM sent to this script from another shell (what `stop` does): the signal
 is forwarded to honcho as a Ctrl-C through the PTY. The script's pid is in
 logs/dev.pid while it runs.
 
-honcho runs inside the modern-app tool container: the dev container has neither
+honcho runs inside the python tool container: the dev container has neither
 uv nor honcho, and every service needs that container anyway, so the
 Procfile lines run there natively without their own cexec. Do not kill the
 cexec client to stop the stack: honcho dies of the hangup without stopping its
@@ -166,7 +166,7 @@ def main() -> None:
     # Run honcho inside a PTY (for colors) and a PID namespace (for cleanup).
     status = pty.spawn(
         ["unshare", "--user", "--pid", "--fork",
-         "cexec", "modern-app",
+         "cexec", "python",
          "uv", "run", "honcho", "start", "-f", "Procfile.dev"] + sys.argv[1:],
         read,
     )

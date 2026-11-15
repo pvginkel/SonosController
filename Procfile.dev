@@ -2,7 +2,7 @@
 # per-service logs under logs/). Lower-level: `uv run honcho -f Procfile.dev start`.
 # The backend restarts on a code change (backend/scripts/dev-watch.sh, under
 # watchmedo), on :3601.
-# scripts/dev.py runs honcho itself inside the modern-app tool container (the
+# scripts/dev.py runs honcho itself inside the python tool container (the
 # dev container has neither uv nor honcho), so this line runs there natively —
 # no cexec.
 # honcho runs from the root project's venv and children inherit VIRTUAL_ENV;

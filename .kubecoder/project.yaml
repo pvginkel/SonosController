@@ -6,11 +6,11 @@ projects:
     description: >-
       SonosController monorepo — orchestration tooling (the suite runner), the
       shared Procfile.dev dev stack, and CI.
-    setup: cexec modern-app uv sync
+    setup: cexec python uv sync
     # The root's own Python, and the architecture model; backend/ lints itself.
     lint:
       # The rule set and the Ruff version are pinned in the root pyproject.toml.
-      - cexec modern-app uv run ruff check scripts tools
+      - cexec python uv run ruff check scripts tools
       # The model AaC/SonosController validates (Jenkinsfile.architecture).
       # A new app has none until it is seeded (CLAUDE.md), and this skips it.
       # arch-validate exits 0 valid, 1 invalid, 2 transport: a 2 is the
@@ -27,13 +27,13 @@ projects:
     description: >-
       Plays music from a Plex library on Sonos speakers and serves the touch-screen displays that control them — Flask backend.
     setup:
-      - cexec modern-app uv sync
+      - cexec python uv sync
       - "test -f .env || printf 'DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/sonos_controller\\n' > .env"
-      - cexec modern-app uv run python scripts/init-dev-database.py
-      - cexec modern-app uv run cli upgrade-db
-    test: cexec modern-app uv run pytest
+      - cexec python uv run python scripts/init-dev-database.py
+      - cexec python uv run cli upgrade-db
+    test: cexec python uv run pytest
     # The same three checks backend/scripts/check.py runs.
     lint:
-      - cexec modern-app uv run ruff check .
-      - cexec modern-app uv run mypy .
-      - cexec modern-app uv run vulture app/ vulture_whitelist.py --min-confidence 80
+      - cexec python uv run ruff check .
+      - cexec python uv run mypy .
+      - cexec python uv run vulture app/ vulture_whitelist.py --min-confidence 80

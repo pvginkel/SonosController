@@ -15,11 +15,11 @@ generating `frontend/` from the frontend template and turning `use_frontend` on 
 `copier update` (ModernAppTemplate's `docs/copier_approach.md`, "Backend-only apps", has the steps).
 
 Everything builds through `kc project build|test|lint|setup`, run **from the repo root** — those
-verbs are cwd-bound. The toolchain lives in the `modern-app` sidecar, so ad-hoc `uv` commands need
-`cexec modern-app`. The root and `backend/` are two uv projects, each with its own `uv.lock`;
+verbs are cwd-bound. The toolchain lives in the `python` sidecar, so ad-hoc `uv` commands need
+`cexec python`. The root and `backend/` are two uv projects, each with its own `uv.lock`;
 `kc project setup` writes both on a fresh app, and they are committed, because CI and the image sync
 `--locked`. `scripts/dev.py` starts the dev stack and `scripts/dev.py stop` stops it from another
-shell. `cexec modern-app python3 scripts/check_updates.py` reports the dependencies with a newer
+shell. `cexec python python3 scripts/check_updates.py` reports the dependencies with a newer
 release, major, minor and patch, in every component it finds.
 
 ## Template ownership

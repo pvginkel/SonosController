@@ -17,8 +17,8 @@ be checked is a warning, and the rest are still reported.
 
 Run it where uv and pnpm are, from anywhere in the repository:
 
-    cexec modern-app python3 scripts/check_updates.py           # report
-    cexec modern-app python3 scripts/check_updates.py --json    # machine-readable
+    cexec python python3 scripts/check_updates.py           # report
+    cexec python python3 scripts/check_updates.py --json    # machine-readable
 """
 
 from __future__ import annotations
