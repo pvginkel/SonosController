@@ -29,7 +29,7 @@ from flask import Flask
 
 from app.app_config import AppSettings
 from app.services.event_sender import COALESCE_SECONDS
-from app.services.household_mirror import HouseholdMirror
+from app.services.household_mirror import CHECK_SECONDS, HouseholdMirror
 from app.services.sse_connection_manager import SSEConnection
 
 # Import all infrastructure fixtures
@@ -70,7 +70,17 @@ def sonos(app: Flask) -> Generator[FakeSonosClient]:
 
 
 @pytest.fixture
-def mirror(app: Flask, sonos: FakeSonosClient) -> Generator[HouseholdMirror]:
+def check_seconds() -> float:
+    """The time between two reads of the layout by the test's mirror: the
+    app's, which no test waits for. A test of what those reads heal replaces
+    this fixture with a time it can wait for."""
+    return CHECK_SECONDS
+
+
+@pytest.fixture
+def mirror(
+    app: Flask, sonos: FakeSonosClient, check_seconds: float
+) -> Generator[HouseholdMirror]:
     """The container's household mirror, on the test's household.
 
     Not started: a test builds its household and calls ``start()``. The
@@ -80,7 +90,7 @@ def mirror(app: Flask, sonos: FakeSonosClient) -> Generator[HouseholdMirror]:
     container = app.container
     container.event_sender.reset()
     container.household_mirror.reset()
-    mirror = container.household_mirror()
+    mirror = container.household_mirror(check_seconds=check_seconds)
     try:
         yield mirror
     finally:

@@ -634,6 +634,11 @@ class TestSonosClientSubscriptions:
         assert address != before
         assert listener.events[0].household.rooms[0].address == address
         assert household.subscription_count(GARAGE) == 1
+        # The device keeps the subscription it took at its old address.
+        assert household.subscribed_addresses(GARAGE) == {before}
+
+        _subscribe(household, GARAGE, SonosService.RENDERING_CONTROL)
+        assert household.subscribed_addresses(GARAGE) == {before, address}
 
     def test_subscribe_fails_when_the_household_does_not_answer(self, household):
         household.reachable = False
@@ -716,6 +721,12 @@ class TestSonosClientSubscriptions:
         # The household still lists it, and the other rooms answer.
         assert len(household.read_household().rooms) == 2
         assert household.read_volume(LOUNGE) == Volume(40, False)
+
+    def test_a_silent_room_can_answer_again(self, household):
+        household.silence_room(GARAGE)
+        household.answer_again(GARAGE)
+
+        assert household.read_volume(GARAGE) == Volume(20, False)
 
     def test_before_call_runs_between_two_calls_and_not_for_its_own(self, household):
         seen = []

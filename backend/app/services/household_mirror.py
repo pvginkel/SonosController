@@ -8,13 +8,19 @@ section 4's ``speakers_changed``, ``volume_changed`` and ``playback_changed``
 when what it holds changes. Nothing of it is stored.
 
 Its subscriptions live in this process, which is why the app runs as one
-replica.
+replica. They heal themselves: a room is subscribed to and read again after
+a failed renewal, after its device restarted and after it took another
+address. A layout the speakers send is applied as it arrives, and the mirror
+reads the layout itself every ``CHECK_SECONDS``, which finds what no event
+reported: a device that restarted without a word, a room that did not answer
+before, a household that did not answer when the app started.
 
 Playback and the group volume are a group's: the mirror takes them from the
 events of the group's coordinator and serves them for every member. Every
 string it serves is Unicode NFC.
 """
 
+import logging
 import re
 import threading
 import unicodedata
@@ -52,6 +58,11 @@ from app.services.sonos_client import (
     VolumeChanged,
 )
 from app.utils.lifecycle_coordinator import LifecycleCoordinatorProtocol, LifecycleEvent
+
+logger = logging.getLogger(__name__)
+
+# The time between two reads of the household's layout.
+CHECK_SECONDS = 10.0
 
 
 class PlaybackStatus(StrEnum):
@@ -196,11 +207,17 @@ class _Feed:
     """A room's subscriptions.
 
     ``early`` holds the room's events that arrived before it was read in
-    full, and is None once they are merged into what was read.
+    full, and is None once they are merged into what was read. ``stale`` is
+    set when a renewal failed, or when the room could not be subscribed to
+    again: the next layout that is applied replaces the feed. ``ended`` is
+    set once the mirror no longer uses the feed: its handlers do nothing
+    more.
     """
 
     subscriptions: list[SonosSubscription] = field(default_factory=list)
     early: list[_GroupEvent] | None = field(default_factory=list)
+    stale: bool = False
+    ended: bool = False
 
 
 @dataclass
@@ -218,6 +235,17 @@ class _RoomState:
     playback: Playback
 
 
+@dataclass(frozen=True)
+class _Served:
+    """What the mirror serves of a room: what its events are about."""
+
+    name: str
+    group: Group
+    volume: Volume
+    group_volume: Volume
+    playback: Playback
+
+
 class HouseholdMirror:
     """The household in memory."""
 
@@ -226,9 +254,11 @@ class HouseholdMirror:
         sonos_client: SonosClient,
         event_sender: EventSender,
         lifecycle_coordinator: LifecycleCoordinatorProtocol,
+        check_seconds: float = CHECK_SECONDS,
     ) -> None:
         self._client = sonos_client
         self._events = event_sender
+        self._check_seconds = check_seconds
         # Held while a layout is applied, across its calls to the speakers:
         # layouts are applied one after the other.
         self._layout_lock = threading.Lock()
@@ -237,21 +267,33 @@ class HouseholdMirror:
         self._lock = threading.Lock()
         self._stopped = False
         self._household = Household(rooms=(), groups=())
-        # Every room of _household: its group, and what is held of it.
+        # Every room of _household: its group, what is held of it, and the
+        # feed that keeps it current.
         self._groups: dict[str, Group] = {}
         self._states: dict[str, _RoomState] = {}
-        # The rooms of _states, and those being read in full.
         self._feeds: dict[str, _Feed] = {}
+        # The healing thread reads the layout when it is woken with _due set,
+        # and every _check_seconds.
+        self._healer: threading.Thread | None = None
+        self._wake = threading.Condition(self._lock)
+        self._due = False
+        # Why the last layout was not applied in full; None when it was.
+        self._failure: str | None = None
         lifecycle_coordinator.register_lifecycle_notification(self._on_lifecycle_event)
 
     def start(self) -> None:
-        """Mirror the household: subscribe to every room and read it in full.
+        """Mirror the household, and keep it mirrored until ``stop()``.
 
-        Raises:
-            ExternalServiceException: No speaker answers, or a room failed.
-                Nothing new is mirrored then.
+        Every room is subscribed to and read in full. A household that does
+        not answer and a room that fails are logged, not raised: the mirror
+        holds nothing new then, and the layout is read again every
+        ``check_seconds`` until every room is mirrored.
         """
-        self._apply_layout(self._client.read_household())
+        self._heal()
+        self._healer = threading.Thread(
+            target=self._keep_healing, name="household-mirror", daemon=True
+        )
+        self._healer.start()
 
     def stop(self) -> None:
         """End every subscription. The mirror is empty afterwards.
@@ -263,11 +305,19 @@ class HouseholdMirror:
         with self._layout_lock, self._lock:
             self._stopped = True
             feeds = list(self._feeds.values())
+            for feed in feeds:
+                feed.ended = True
             self._feeds = {}
             self._states = {}
             self._groups = {}
             self._household = Household(rooms=(), groups=())
-        self._unsubscribe(feeds)
+            self._failure = None
+            self._wake.notify_all()
+        if self._healer is not None:
+            self._healer.join()
+        failure = self._end(feeds)
+        if failure is not None:
+            raise failure
 
     def speakers(self) -> list[Speaker]:
         """Every room of the household, by name."""
@@ -318,18 +368,70 @@ class HouseholdMirror:
             ),
         )
 
+    def _keep_healing(self) -> None:
+        """The healing thread: read the layout when woken, and every
+        ``check_seconds``."""
+        while True:
+            with self._lock:
+                if not self._due:
+                    self._wake.wait(self._check_seconds)
+                if self._stopped:
+                    return
+                self._due = False
+            self._heal()
+
+    def _heal(self, household: Household | None = None) -> None:
+        """Apply a layout: the one given, or the one a speaker gives now.
+
+        What fails stays as it was and is logged: the healing thread's next
+        read of the layout tries it again.
+        """
+        try:
+            if household is None:
+                household = self._client.read_household()
+            self._apply_layout(household)
+        except ExternalServiceException as error:
+            self._report(str(error))
+        else:
+            self._report(None)
+
+    def _report(self, failure: str | None) -> None:
+        """Log that the household is not mirrored in full, or is again: once
+        for each failure, not at every read of the layout."""
+        with self._lock:
+            before, self._failure = self._failure, failure
+        if failure is not None and failure != before:
+            logger.warning(
+                "The household is not mirrored in full; the layout is read "
+                "again every %s s: %s",
+                self._check_seconds,
+                failure,
+            )
+        elif failure is None and before is not None:
+            logger.info("The household is mirrored in full again")
+
     def _apply_layout(self, household: Household) -> None:
         """Make the mirror's rooms and groups those of the layout.
 
-        A room the mirror does not hold is subscribed to and read in full. A
-        room that now coordinates a group and followed another room before is
-        read again: while it followed, its own device's events were not the
-        group's. A room the layout no longer has is dropped.
+        A room the mirror does not hold is subscribed to and read in full.
+        So is a room whose feed is stale, or whose device has another address
+        or boot sequence number than the mirror holds: its subscriptions are
+        over, or their renewal fails, and what it reported since is unknown.
+        A room that now coordinates a group and followed another room before
+        is read again: while it followed, its own device's events were not
+        the group's. A room the layout no longer has is dropped.
+
+        Raises:
+            ExternalServiceException: A room failed. A room that is new, or
+                that now coordinates, leaves the layout unapplied. A held
+                room that could not be subscribed to again keeps what is
+                held of it, and its feed is stale.
         """
         events: list[StreamEvent] = []
         # The feeds this layout ends. Their subscriptions are ended outside
         # the locks: a client may wait there for a handler that waits here.
         ended: list[_Feed] = []
+        failure: ExternalServiceException | None = None
         try:
             with self._layout_lock:
                 if self._stopped:
@@ -339,77 +441,115 @@ class HouseholdMirror:
                     for group in household.groups
                     for member_id in group.member_ids
                 }
-                appeared = [
-                    room for room in household.rooms if room.id not in self._states
-                ]
-                promoted = [
-                    room.id
-                    for room in household.rooms
-                    if room.id in self._states
-                    and self._groups[room.id].coordinator_id != room.id
-                    and groups[room.id].coordinator_id == room.id
-                ]
-                try:
-                    read = {
-                        room.id: self._subscribe_and_read(room) for room in appeared
+                with self._lock:
+                    held = {room.id: room for room in self._household.rooms}
+                    stale = {
+                        room_id for room_id, feed in self._feeds.items() if feed.stale
                     }
+                feeds: dict[str, _Feed] = {}
+                read: dict[str, _RoomState] = {}
+                # The held rooms that could not be subscribed to again.
+                unanswered: list[str] = []
+                try:
+                    for room in household.rooms:
+                        known = held.get(room.id)
+                        if (
+                            known is not None
+                            and room.id not in stale
+                            and (room.address, room.boot_seq)
+                            == (known.address, known.boot_seq)
+                        ):
+                            continue
+                        feed = _Feed()
+                        try:
+                            read[room.id] = self._subscribe_and_read(room, feed)
+                        except ExternalServiceException as error:
+                            ended.append(feed)
+                            if known is None:
+                                raise
+                            unanswered.append(room.id)
+                            failure = failure or error
+                        else:
+                            feeds[room.id] = feed
                     read_again = {
-                        room_id: (
-                            self._client.read_playback(room_id),
-                            self._client.read_group_volume(room_id),
+                        room.id: (
+                            self._client.read_playback(room.id),
+                            self._client.read_group_volume(room.id),
                         )
-                        for room_id in promoted
+                        for room in household.rooms
+                        if room.id in held
+                        and room.id not in read
+                        and self._groups[room.id].coordinator_id != room.id
+                        and groups[room.id].coordinator_id == room.id
                     }
                 except ExternalServiceException:
+                    ended.extend(feeds.values())
                     with self._lock:
-                        ended = [
-                            self._feeds.pop(room.id)
-                            for room in appeared
-                            if room.id in self._feeds
-                        ]
+                        for feed in ended:
+                            feed.ended = True
                     raise
 
                 with self._lock:
-                    before = self._layout()
+                    before = self._served()
                     for room_id in self._states.keys() - groups.keys():
                         del self._states[room_id]
                         ended.append(self._feeds.pop(room_id))
                     self._household = household
                     self._groups = groups
+                    for room_id in unanswered:
+                        self._feeds[room_id].stale = True
                     for room_id, state in read.items():
+                        if room_id in held:
+                            ended.append(self._feeds[room_id])
                         self._states[room_id] = state
-                        feed = self._feeds[room_id]
+                        self._feeds[room_id] = feed = feeds[room_id]
                         early, feed.early = feed.early or [], None
                         for event in early:
                             self._merge(room_id, event)
                     for room_id, (playback, group_volume) in read_again.items():
                         self._states[room_id].playback = playback
                         self._states[room_id].group_volume = group_volume
-                    events = _layout_events(before, self._layout())
+                    for feed in ended:
+                        feed.ended = True
+                    events = _layout_events(before, self._served())
             for stream_event in events:
                 self._events.send(stream_event)
         finally:
-            self._unsubscribe(ended)
+            unended = self._end(ended)
+            if unended is not None:
+                logger.warning(
+                    "A subscription the mirror no longer uses was not ended; "
+                    "the speaker ends it when it is not renewed: %s",
+                    unended,
+                )
+        if failure is not None:
+            raise failure
 
-    def _layout(self) -> dict[str, tuple[str, Group]]:
-        """Each room's name and group: what ``speakers_changed`` is about."""
-        return {
-            room.id: (room.name, self._groups[room.id]) for room in self._household.rooms
-        }
+    def _served(self) -> dict[str, _Served]:
+        served = {}
+        for room in self._household.rooms:
+            group = self._groups[room.id]
+            coordinator = self._states[group.coordinator_id]
+            served[room.id] = _Served(
+                name=room.name,
+                group=group,
+                volume=self._states[room.id].volume,
+                group_volume=coordinator.group_volume,
+                playback=coordinator.playback,
+            )
+        return served
 
-    def _subscribe_and_read(self, room: Room) -> _RoomState:
-        """Subscribe to the room's four services, then read it in full.
+    def _subscribe_and_read(self, room: Room, feed: _Feed) -> _RoomState:
+        """Subscribe the feed to the room's four services, then read the room
+        in full.
 
         In that order: what changes after the read arrives as an event, and
         the events that arrive before the read is held wait in the feed.
         """
-        feed = _Feed()
-        with self._lock:
-            self._feeds[room.id] = feed
         for service in SonosService:
             feed.subscriptions.append(
                 self._client.subscribe(
-                    room.id, service, self._handler(room.id, feed), _subscription_lost
+                    room.id, service, self._handler(room.id, feed), self._lost(feed)
                 )
             )
         return _RoomState(
@@ -419,8 +559,12 @@ class HouseholdMirror:
             playback=self._client.read_playback(room.id),
         )
 
-    def _unsubscribe(self, feeds: list[_Feed]) -> None:
-        """End the feeds' subscriptions, every one, also when one fails."""
+    def _end(self, feeds: list[_Feed]) -> ExternalServiceException | None:
+        """End the feeds' subscriptions, every one, also when one fails.
+
+        Returns:
+            The first failure, None when every subscription was ended.
+        """
         failure: ExternalServiceException | None = None
         for feed in feeds:
             for subscription in feed.subscriptions:
@@ -428,8 +572,20 @@ class HouseholdMirror:
                     subscription.unsubscribe()
                 except ExternalServiceException as error:
                     failure = failure or error
-        if failure is not None:
-            raise failure
+        return failure
+
+    def _lost(self, feed: _Feed) -> Callable[[], None]:
+        """What a subscription of the feed calls when its renewal failed."""
+
+        def on_lost() -> None:
+            with self._lock:
+                if feed.ended:
+                    return
+                feed.stale = True
+                self._due = True
+                self._wake.notify()
+
+        return on_lost
 
     def _handler(self, speaker_id: str, feed: _Feed) -> Callable[[SonosEvent], None]:
         """The handler of one subscription of the feed."""
@@ -450,12 +606,12 @@ class HouseholdMirror:
     def _on_event(self, speaker_id: str, feed: _Feed, event: SonosEvent) -> None:
         if isinstance(event, HouseholdChanged):
             with self._lock:
-                current = self._feeds.get(speaker_id) is feed
-            if current:
-                self._apply_layout(event.household)
+                ended = feed.ended
+            if not ended:
+                self._heal(event.household)
             return
         with self._lock:
-            if self._feeds.get(speaker_id) is not feed:
+            if feed.ended:
                 return
             if feed.early is not None:
                 feed.early.append(event)
@@ -507,26 +663,32 @@ class HouseholdMirror:
             self.stop()
 
 
-def _subscription_lost() -> None:
-    """A subscription's renewal failed: its events have ended."""
-
-
 def _layout_events(
-    before: dict[str, tuple[str, Group]], after: dict[str, tuple[str, Group]]
+    before: dict[str, _Served], after: dict[str, _Served]
 ) -> list[StreamEvent]:
-    """The events of a change of layout.
+    """The events of a layout that was applied.
 
     A room whose group changed has another group volume, and one whose
-    coordinator changed plays something else.
+    coordinator changed plays something else. A room that was read again has
+    the events of what the read changed.
     """
-    if before == after:
-        return []
-    events: list[StreamEvent] = [SpeakersChangedEvent()]
+    events: list[StreamEvent] = []
+    if {room_id: (room.name, room.group) for room_id, room in before.items()} != {
+        room_id: (room.name, room.group) for room_id, room in after.items()
+    }:
+        events.append(SpeakersChangedEvent())
     for room_id in sorted(before.keys() & after.keys()):
-        group_before, group_after = before[room_id][1], after[room_id][1]
-        if group_before != group_after:
+        was, now = before[room_id], after[room_id]
+        if (was.group, was.volume, was.group_volume) != (
+            now.group,
+            now.volume,
+            now.group_volume,
+        ):
             events.append(VolumeChangedEvent(payload=SpeakerPayload(speaker_id=room_id)))
-        if group_before.coordinator_id != group_after.coordinator_id:
+        if (
+            was.group.coordinator_id != now.group.coordinator_id
+            or was.playback != now.playback
+        ):
             events.append(
                 PlaybackChangedEvent(payload=SpeakerPayload(speaker_id=room_id))
             )

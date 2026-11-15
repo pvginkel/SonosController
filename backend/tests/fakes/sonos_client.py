@@ -91,12 +91,15 @@ class _FakeSubscription(SonosSubscription):
         self,
         client: FakeSonosClient,
         speaker_id: str,
+        address: str,
         service: SonosService,
         on_event: Callable[[SonosEvent], None],
         on_lost: Callable[[], None],
     ) -> None:
         self._client = client
         self.speaker_id = speaker_id
+        # The device's address when it took the subscription.
+        self.address = address
         self.service = service
         self.on_event = on_event
         self.on_lost = on_lost
@@ -334,6 +337,10 @@ class FakeSonosClient(SonosClient):
         """
         self._silent.add(speaker_id)
 
+    def answer_again(self, speaker_id: str) -> None:
+        """The room's device answers again, after ``silence_room()``."""
+        self._silent.remove(speaker_id)
+
     def fail_renewals(self, speaker_id: str) -> None:
         """Every renewal of the room's subscriptions fails: each is lost."""
         for subscription in self._held(speaker_id):
@@ -380,6 +387,11 @@ class FakeSonosClient(SonosClient):
                 if service is None or subscription.service is service
             ]
         )
+
+    def subscribed_addresses(self, speaker_id: str) -> set[str]:
+        """The addresses the room's device had when it took the subscriptions
+        it holds now."""
+        return {subscription.address for subscription in self._held(speaker_id)}
 
     def picture_of(self, picture: str) -> bytes:
         """The bytes ``read_picture()`` answers for a ``Track.picture``."""
@@ -505,7 +517,9 @@ class FakeSonosClient(SonosClient):
         on_lost: Callable[[], None],
     ) -> SonosSubscription:
         room = self._room(speaker_id, f"subscribe to {service} events of")
-        subscription = _FakeSubscription(self, speaker_id, service, on_event, on_lost)
+        subscription = _FakeSubscription(
+            self, speaker_id, room.address, service, on_event, on_lost
+        )
         self._subscriptions.append(subscription)
         self._enqueue(lambda: self._deliver_to(subscription, self._full(room, service)))
         return subscription

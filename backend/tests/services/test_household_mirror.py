@@ -5,7 +5,9 @@ a change made "elsewhere" is a call on the fake, as the Sonos app or another
 display would make it.
 """
 
+import logging
 import time
+from collections.abc import Callable
 
 import pytest
 
@@ -50,6 +52,37 @@ def playback_changed(speaker_id: str) -> dict:
 
 def in_any_order(events: list[dict]) -> list[dict]:
     return sorted(events, key=lambda event: (event["type"], str(event["payload"])))
+
+
+def eventually(condition: Callable[[], bool]) -> None:
+    """Wait for what the mirror's healing thread does: ``settle()`` waits for
+    the household's events alone."""
+    deadline = time.perf_counter() + 5.0
+    while not condition():
+        assert time.perf_counter() < deadline, "the mirror did not heal in time"
+        time.sleep(0.01)
+
+
+def logged(caplog: pytest.LogCaptureFixture) -> list[tuple[str, str]]:
+    """What the mirror logged, each line with its level."""
+    return [
+        (record.levelname, record.message)
+        for record in caplog.records
+        if record.name == "app.services.household_mirror"
+    ]
+
+
+def once(change: Callable[[], None]) -> Callable[[str], None]:
+    """A ``before_call`` that makes the change before the first call that
+    reaches a room, and not again."""
+    made = []
+
+    def before_call(speaker_id: str) -> None:
+        if not made:
+            made.append(speaker_id)
+            change()
+
+    return before_call
 
 
 @pytest.fixture
@@ -495,19 +528,17 @@ class TestHouseholdMirrorSubscriptions:
         assert isinstance(mirror, HouseholdMirror)
         assert mirror.speaker(GARAGE).name == "Garage"
 
-    def test_start_fails_when_no_speaker_answers(self, household, mirror):
+    def test_start_mirrors_nothing_when_no_speaker_answers(self, household, mirror):
         household.reachable = False
 
-        with pytest.raises(ExternalServiceException):
-            mirror.start()
+        mirror.start()
 
         assert mirror.speakers() == []
 
     def test_a_room_that_fails_leaves_nothing_mirrored(self, household, mirror):
         household.silence_room(LOUNGE)
 
-        with pytest.raises(ExternalServiceException):
-            mirror.start()
+        mirror.start()
 
         assert mirror.speakers() == []
         assert household.subscription_count(GARAGE) == 0
@@ -618,7 +649,7 @@ class TestHouseholdMirrorEvents:
         # Every room's device reports the layout: one event all the same.
         assert stream.events() == [speakers_changed()]
 
-    def test_a_layout_with_only_a_new_address_sends_nothing(
+    def test_a_room_read_again_that_has_not_changed_sends_nothing(
         self, started, household, connect
     ):
         stream = connect()
@@ -680,3 +711,328 @@ class TestHouseholdMirrorEvents:
         household.remove_room(KITCHEN)
         household.settle()
         assert stream.events() == [speakers_changed()]
+
+
+class TestHouseholdMirrorHealing:
+    """What the speakers' events set off: the layout they send, and a renewal
+    that failed. The mirror's own reads of the layout are not waited for."""
+
+    def test_a_failed_renewal_is_subscribed_to_again_and_read_again(
+        self, started, household, connect
+    ):
+        stream = connect()
+        # Made while the room has no subscription: no event reports it.
+        household.before_call = once(lambda: household.set_volume(GARAGE, 33))
+
+        household.fail_renewals(GARAGE)
+        eventually(lambda: started.speaker(GARAGE).volume == 33)
+
+        assert started.speaker(GARAGE).group.volume == 33
+        assert household.subscription_count(GARAGE) == 4
+        assert stream.events() == [volume_changed(GARAGE)]
+
+        household.set_volume(GARAGE, 34)
+        household.play(GARAGE)
+        household.settle()
+        assert started.speaker(GARAGE).volume == 34
+        assert started.playback(GARAGE).state is PlaybackStatus.PLAYING
+
+    def test_a_failed_renewal_leaves_the_other_rooms_as_they_are(
+        self, started, household
+    ):
+        reached = []
+        household.before_call = reached.append
+
+        household.fail_renewals(GARAGE)
+
+        # Four subscriptions and the four reads of a room, and no more.
+        eventually(lambda: len(reached) == 8)
+        assert reached == [GARAGE] * 8
+        assert household.subscription_count(LOUNGE) == 4
+
+    def test_a_speaker_that_restarted_is_subscribed_to_again_and_read_again(
+        self, started, household, connect
+    ):
+        household.play(GARAGE)
+        household.settle()
+        stream = connect()
+        stream.events()
+        # A restarted device plays nothing, and reports nothing: it has
+        # forgotten its subscriptions.
+        household.before_call = once(lambda: household.stop(GARAGE))
+
+        household.restart_room(GARAGE)
+        household.settle()
+
+        assert started.playback(GARAGE).state is PlaybackStatus.STOPPED
+        assert household.subscription_count(GARAGE) == 4
+        assert stream.events() == [playback_changed(GARAGE)]
+
+        household.play(GARAGE)
+        household.settle()
+        assert started.playback(GARAGE).state is PlaybackStatus.PLAYING
+
+    def test_a_speaker_with_a_new_address_is_subscribed_to_again(
+        self, started, household
+    ):
+        address = household.move_room(GARAGE)
+        household.settle()
+
+        assert household.subscribed_addresses(GARAGE) == {address}
+        assert household.subscription_count(GARAGE) == 4
+
+        household.set_volume(GARAGE, 21)
+        household.settle()
+        assert started.speaker(GARAGE).volume == 21
+
+    def test_a_coordinator_read_again_changes_what_its_group_plays(
+        self, started, household, connect
+    ):
+        household.join(LOUNGE, GARAGE)
+        household.play(GARAGE)
+        household.settle()
+        stream = connect()
+        stream.events()
+        household.before_call = once(lambda: household.stop(GARAGE))
+
+        household.restart_room(GARAGE)
+        household.settle()
+
+        assert started.playback(LOUNGE).state is PlaybackStatus.STOPPED
+        assert in_any_order(stream.events()) == [
+            playback_changed(GARAGE),
+            playback_changed(LOUNGE),
+        ]
+
+    def test_a_change_made_while_a_room_is_read_again_is_kept(
+        self, started, household
+    ):
+        # A room's playback is read last, as the eighth call to it. A change
+        # of volume made then, after the volume was read, arrives as an event
+        # of the new subscriptions before the mirror holds what it read.
+        calls = []
+
+        def change_the_volume_once_it_is_read(speaker_id):
+            calls.append(speaker_id)
+            if len(calls) == 8:
+                household.set_volume(GARAGE, 33)
+                household.settle()
+
+        household.before_call = change_the_volume_once_it_is_read
+        household.fail_renewals(GARAGE)
+
+        eventually(lambda: started.speaker(GARAGE).volume == 33)
+        assert started.speaker(GARAGE).group.volume == 33
+
+    def test_a_restarted_speaker_that_does_not_answer_keeps_what_is_held(
+        self, started, household, connect, caplog
+    ):
+        stream = connect()
+        household.silence_room(GARAGE)
+
+        with caplog.at_level(logging.WARNING, "app.services.household_mirror"):
+            household.restart_room(GARAGE)
+            household.settle()
+
+        assert started.speaker(GARAGE).volume == 20
+        assert started.playback(GARAGE).queue_length == 3
+        assert household.subscription_count(GARAGE) == 0
+        assert stream.events() == []
+        assert logged(caplog) == [
+            (
+                "WARNING",
+                "The household is not mirrored in full; the layout is read again "
+                "every 10.0 s: Cannot subscribe to AVTransport events of speaker "
+                f"{GARAGE} because external service failed: timed out",
+            )
+        ]
+        # The mirror's stop() ends the subscriptions it holds at the room.
+        household.answer_again(GARAGE)
+
+    def test_the_rest_of_a_layout_is_applied_when_a_held_room_does_not_answer(
+        self, started, household
+    ):
+        household.silence_room(GARAGE)
+        household.restart_room(GARAGE)
+        household.rename_room(LOUNGE, "Living Room")
+        household.settle()
+
+        assert started.speaker(LOUNGE).name == "Living Room"
+        assert started.speaker(GARAGE).volume == 20
+        # The mirror's stop() ends the subscriptions it holds at the room.
+        household.answer_again(GARAGE)
+
+    def test_a_lost_subscription_of_a_room_that_went_is_not_healed(
+        self, started, household
+    ):
+        household.fail_renewals(GARAGE)
+        household.remove_room(GARAGE)
+        household.settle()
+
+        eventually(lambda: [speaker.id for speaker in started.speakers()] == [LOUNGE])
+        assert household.subscription_count(GARAGE) == 0
+
+
+class TestHouseholdMirrorChecks:
+    """What the mirror's own reads of the layout heal, read here every 50 ms."""
+
+    @pytest.fixture
+    def check_seconds(self) -> float:
+        return 0.05
+
+    def test_a_household_that_does_not_answer_at_start_is_mirrored_once_it_does(
+        self, household, mirror, connect
+    ):
+        household.reachable = False
+        mirror.start()
+        stream = connect()
+        assert mirror.speakers() == []
+        assert stream.events() == []
+
+        household.reachable = True
+        eventually(lambda: len(mirror.speakers()) == 2)
+
+        assert mirror.playback(GARAGE).queue_length == 3
+        assert household.subscription_count(GARAGE) == 4
+        assert household.subscription_count(LOUNGE) == 4
+        assert stream.events() == [speakers_changed()]
+
+        household.set_volume(LOUNGE, 41)
+        household.settle()
+        assert mirror.speaker(LOUNGE).volume == 41
+
+    def test_the_app_starts_when_no_speaker_answers(self, app, household):
+        household.reachable = False
+        coordinator = LifecycleCoordinator(graceful_shutdown_timeout=1)
+        mirror = HouseholdMirror(
+            sonos_client=household,
+            event_sender=app.container.event_sender(),
+            lifecycle_coordinator=coordinator,
+            check_seconds=0.05,
+        )
+
+        coordinator.fire_startup()
+        assert mirror.speakers() == []
+
+        household.reachable = True
+        eventually(lambda: len(mirror.speakers()) == 2)
+
+        coordinator.shutdown()
+        assert mirror.speakers() == []
+        assert household.subscription_count(GARAGE) == 0
+
+    def test_a_room_that_does_not_answer_at_start_is_mirrored_once_it_does(
+        self, household, mirror
+    ):
+        household.silence_room(LOUNGE)
+        mirror.start()
+        assert mirror.speakers() == []
+
+        household.answer_again(LOUNGE)
+        eventually(lambda: len(mirror.speakers()) == 2)
+
+        assert household.subscription_count(GARAGE) == 4
+        assert household.subscription_count(LOUNGE) == 4
+
+    def test_a_new_room_that_does_not_answer_is_mirrored_once_it_does(
+        self, started, household
+    ):
+        household.silence_room(KITCHEN)
+        household.add_room(KITCHEN, "Kitchen")
+        household.settle()
+        assert len(started.speakers()) == 2
+
+        household.answer_again(KITCHEN)
+        eventually(lambda: len(started.speakers()) == 3)
+
+        assert household.subscription_count(KITCHEN) == 4
+
+    def test_a_speaker_that_restarted_without_a_word_is_read_again(
+        self, sonos, mirror, connect
+    ):
+        # A room alone in its household: no other room reports its restart.
+        sonos.add_room(GARAGE, "Garage")
+        sonos.load_queue(GARAGE, [queue_track(1), queue_track(2)])
+        sonos.play(GARAGE)
+        mirror.start()
+        sonos.settle()
+        stream = connect()
+        stream.events()
+        sonos.before_call = once(lambda: sonos.stop(GARAGE))
+
+        sonos.restart_room(GARAGE)
+        eventually(lambda: mirror.playback(GARAGE).state is PlaybackStatus.STOPPED)
+
+        assert sonos.subscription_count(GARAGE) == 4
+        assert stream.events() == [playback_changed(GARAGE)]
+
+        sonos.play(GARAGE)
+        sonos.settle()
+        assert mirror.playback(GARAGE).state is PlaybackStatus.PLAYING
+
+    def test_a_restarted_speaker_that_does_not_answer_is_read_again_once_it_does(
+        self, started, household
+    ):
+        household.play(GARAGE)
+        household.settle()
+        household.silence_room(GARAGE)
+        household.restart_room(GARAGE)
+        household.settle()
+        assert started.playback(GARAGE).state is PlaybackStatus.PLAYING
+
+        household.answer_again(GARAGE)
+        household.stop(GARAGE)
+        eventually(lambda: started.playback(GARAGE).state is PlaybackStatus.STOPPED)
+
+        assert household.subscription_count(GARAGE) == 4
+        household.set_volume(GARAGE, 21)
+        household.settle()
+        assert started.speaker(GARAGE).volume == 21
+
+    def test_a_room_that_does_not_answer_does_not_keep_another_from_healing(
+        self, started, household
+    ):
+        household.silence_room(LOUNGE)
+        household.restart_room(LOUNGE)
+        household.restart_room(GARAGE)
+
+        eventually(lambda: household.subscription_count(GARAGE) == 4)
+        household.set_volume(GARAGE, 33)
+        eventually(lambda: started.speaker(GARAGE).volume == 33)
+        assert household.subscription_count(LOUNGE) == 0
+
+        household.answer_again(LOUNGE)
+        eventually(lambda: household.subscription_count(LOUNGE) == 4)
+
+    def test_a_failure_is_logged_once_and_its_end_once(
+        self, household, mirror, caplog
+    ):
+        household.reachable = False
+
+        with caplog.at_level(logging.INFO, "app.services.household_mirror"):
+            mirror.start()
+            time.sleep(0.3)
+            household.reachable = True
+            eventually(lambda: len(mirror.speakers()) == 2)
+            time.sleep(0.3)
+
+        assert logged(caplog) == [
+            (
+                "WARNING",
+                "The household is not mirrored in full; the layout is read again "
+                "every 0.05 s: Cannot read the household's layout because "
+                "external service failed: none of the seed speakers answered",
+            ),
+            ("INFO", "The household is mirrored in full again"),
+        ]
+
+    def test_nothing_is_read_after_stop(self, household, mirror):
+        household.reachable = False
+        mirror.start()
+        mirror.stop()
+
+        household.reachable = True
+        time.sleep(0.3)
+
+        assert mirror.speakers() == []
+        assert household.subscription_count(GARAGE) == 0
