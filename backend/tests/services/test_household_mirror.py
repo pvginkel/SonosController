@@ -1007,9 +1007,14 @@ class TestHouseholdMirrorHealing:
     def test_a_speaker_with_a_new_address_is_subscribed_to_again(
         self, started, household
     ):
+        # Made before the room is subscribed to at its new address: only the
+        # read that follows the new subscriptions reports it.
+        household.before_call = once(lambda: household.set_volume(GARAGE, 33))
+
         address = household.move_room(GARAGE)
         household.settle()
 
+        assert started.speaker(GARAGE).volume == 33
         assert household.subscribed_addresses(GARAGE) == {address}
         assert household.subscription_count(GARAGE) == 4
 
