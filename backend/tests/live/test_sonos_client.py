@@ -1,5 +1,6 @@
 """The SoCo client against the real speakers: what the fake cannot prove."""
 
+import re
 import threading
 import time
 from collections.abc import Callable, Generator
@@ -232,6 +233,47 @@ class TestLiveTransport:
         )
         assert left.track == found.track
         assert left.shuffle == found.shuffle
+
+    def test_a_command_the_speaker_refuses_fails_in_the_clients_words(
+        self, sonos, garage
+    ):
+        found = sonos.read_playback(garage)
+        refused = [
+            command
+            for action, command in (
+                (TransportAction.PREVIOUS, sonos.previous),
+                (TransportAction.NEXT, sonos.next),
+            )
+            if action not in found.actions
+        ]
+        assert refused, (
+            "The Garage allows both next and previous, so it refuses neither: "
+            "put its queue at the first or the last track and stop it."
+        )
+
+        with pytest.raises(ExternalServiceException) as raised:
+            refused[0](garage)
+
+        # The words are the client's: SoCo's own name the speaker's address.
+        # A previous at a queue's first track is answered 711 (Illegal seek
+        # target), a next on a radio stream 701 (docs/api-design.md 1.7).
+        assert re.fullmatch(
+            r"the speaker answered UPnP error 7\d\d \([A-Za-z ]+\)",
+            raised.value.cause,
+        )
+        assert sonos.read_playback(garage) == found
+
+    def test_a_picture_the_speaker_does_not_serve_fails_in_the_clients_words(
+        self, sonos, garage
+    ):
+        with pytest.raises(ExternalServiceException) as raised:
+            sonos.read_picture(garage, "/no-such-picture")
+
+        # The words are the client's: requests' own name the speaker's address.
+        assert raised.value.message == (
+            f"Cannot read the picture speaker {garage} serves because external "
+            "service failed: the speaker answered 404"
+        )
 
     def test_the_speaker_serves_the_tracks_picture(self, sonos, garage):
         picture = sonos.read_playback(garage).track.picture

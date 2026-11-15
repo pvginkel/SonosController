@@ -140,7 +140,7 @@ class _FakeSubscription(SonosSubscription):
             raise ExternalServiceException(
                 f"renew the subscription to {self.service} events of speaker "
                 f"{self.speaker_id}",
-                "412 Client Error: Precondition Failed",
+                "the speaker answered 412",
             )
 
     def unsubscribe(self) -> None:
@@ -543,7 +543,7 @@ class FakeSonosClient(SonosClient):
         if address.path != "/getaa" or "u" not in parse_qs(address.query):
             raise ExternalServiceException(
                 f"read the picture speaker {speaker_id} serves",
-                "404 Client Error: Not Found",
+                "the speaker answered 404",
             )
         return self.picture_of(picture)
 
@@ -574,7 +574,9 @@ class FakeSonosClient(SonosClient):
 
     def _require_answer(self, speaker_id: str, operation: str) -> None:
         if speaker_id in self._silent:
-            raise ExternalServiceException(operation, "timed out")
+            raise ExternalServiceException(
+                operation, "the speaker did not answer (ConnectTimeout)"
+            )
 
     def _room(self, speaker_id: str, operation: str = "reach") -> _Room:
         before_call = self.before_call
@@ -603,7 +605,7 @@ class FakeSonosClient(SonosClient):
         if action not in self._actions(room):
             raise ExternalServiceException(
                 f"{operation} speaker {speaker_id}",
-                "UPnP Error 701 received: Transition not available",
+                "the speaker answered UPnP error 701 (Transition not available)",
             )
         return room
 

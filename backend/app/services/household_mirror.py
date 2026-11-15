@@ -359,6 +359,19 @@ class HouseholdMirror:
             playback = self._states[coordinator_id].playback
         return _playback(playback, self._artwork_id(coordinator_id, playback.track))
 
+    def transport_actions(self, speaker_id: str) -> frozenset[TransportAction]:
+        """The commands the room's group allows now, in the speaker's words.
+
+        ``playback()``'s ``actions`` do not tell a pause from a stop. This
+        asks neither a speaker nor Plex.
+
+        Raises:
+            SpeakerNotFoundException: The household has no such room.
+        """
+        with self._lock:
+            coordinator_id = self._groups[self._room(speaker_id).id].coordinator_id
+            return self._states[coordinator_id].playback.actions
+
     def speaker_picture(self, speaker_id: str, artwork_id: str) -> str | None:
         """The address at which a room serves the picture an artwork id names,
         for ``SonosClient.read_picture()``.

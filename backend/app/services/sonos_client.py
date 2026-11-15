@@ -31,7 +31,7 @@ from soco import SoCo
 from soco.core import PLAY_MODES
 from soco.data_structures import DidlObject
 from soco.data_structures_entry import from_didl_string
-from soco.exceptions import SoCoException
+from soco.exceptions import SoCoException, SoCoUPnPException
 
 from app.app_config import AppSettings
 from app.core_exceptions import ExternalServiceException
@@ -221,7 +221,8 @@ class SonosClient(ABC):
     """What the backend asks of the speakers.
 
     Every method that reaches a speaker raises ``ExternalServiceException``
-    when the speaker fails, does not answer, or is not in the household.
+    when the speaker fails, does not answer, or is not in the household. Its
+    message names no address: a ``502`` carries it to the API's clients.
     Playback is a group's: a transport read or command for a room goes to the
     coordinator of the room's group.
     """
@@ -646,7 +647,8 @@ class SoCoSonosClient(SonosClient):
             self._entry = device
             return device
         raise _HouseholdError(
-            f"none of the {len(self._seed_hosts)} seed speakers answered ({error})"
+            f"none of the {len(self._seed_hosts)} seed speakers answered"
+            + (f" ({_cause(error)})" if error is not None else "")
         ) from error
 
     def _room(self, speaker_id: str) -> Any:
@@ -694,7 +696,22 @@ def _speaker_call(operation: str) -> Iterator[None]:
     try:
         yield
     except _SPEAKER_ERRORS as exc:
-        raise ExternalServiceException(operation, str(exc)) from exc
+        raise ExternalServiceException(operation, _cause(exc)) from exc
+
+
+def _cause(exc: Exception) -> str:
+    """What went wrong, in words of this module's own: SoCo's and requests'
+    messages name the speaker's address."""
+    if isinstance(exc, _HouseholdError):
+        return str(exc)
+    if isinstance(exc, SoCoUPnPException):
+        description = f" ({exc.error_description})" if exc.error_description else ""
+        return f"the speaker answered UPnP error {exc.error_code}{description}"
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        return f"the speaker answered {exc.response.status_code}"
+    if isinstance(exc, (requests.RequestException, OSError)):
+        return f"the speaker did not answer ({type(exc).__name__})"
+    return f"the speaker gave an answer the backend cannot use ({type(exc).__name__})"
 
 
 def _household(device: Any) -> Household:

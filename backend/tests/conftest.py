@@ -121,17 +121,22 @@ def sonos(app: Flask) -> Generator[FakeSonosClient]:
 
 
 @pytest.fixture(autouse=True)
-def plex(app: Flask) -> FakePlexClient:
+def plex(app: Flask) -> Generator[FakePlexClient]:
     """The Plex every test runs against: the in-memory fake, its library
     empty.
 
     It overrides the container's Plex client for every test, so that no test
-    reaches Plex; ``session_app_isolation`` undoes the override. The live
-    suite replaces this fixture with the real client.
+    reaches Plex, and undoes the override itself: pytest sets the autouse
+    fixtures of this file up by name, this one before
+    ``session_app_isolation``, which therefore takes the override for what
+    it is to keep. The live suite replaces this fixture with the real client.
     """
     fake = FakePlexClient(health_service=app.container.health_service())
     app.container.plex_client.override(fake)
-    return fake
+    try:
+        yield fake
+    finally:
+        app.container.plex_client.reset_last_overriding()
 
 
 @pytest.fixture
@@ -156,11 +161,18 @@ def mirror(
     container.event_sender.reset()
     container.household_mirror.reset()
     mirror = container.household_mirror(check_seconds=check_seconds)
+    sender = container.event_sender()
     try:
         yield mirror
     finally:
         mirror.stop()
-        container.event_sender().stop()
+        sender.stop()
+        # The app's lifecycle coordinator, which outlives the test, holds
+        # what registered with it: the test's mirror and sender, and through
+        # them its household and its library with their pictures.
+        coordinator = container.lifecycle_coordinator()
+        coordinator.unregister_lifecycle_notification(mirror._on_lifecycle_event)
+        coordinator.unregister_lifecycle_notification(sender._on_lifecycle_event)
         container.household_mirror.reset()
         container.event_sender.reset()
 

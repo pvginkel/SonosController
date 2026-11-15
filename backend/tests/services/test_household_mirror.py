@@ -23,7 +23,7 @@ from app.services.household_mirror import (
     Speaker,
     SpeakerGroup,
 )
-from app.services.sonos_client import SonosService, Track
+from app.services.sonos_client import SonosService, Track, TransportAction
 from app.utils.artwork_id import (
     PlexPicture,
     SpeakerPicture,
@@ -383,6 +383,58 @@ class TestHouseholdMirrorPlayback:
         assert mirror.playback(LOUNGE) == mirror.playback(GARAGE)
         assert mirror.playback(LOUNGE).state is PlaybackStatus.PLAYING
         assert mirror.playback(LOUNGE).track.title == "Track 1"
+
+
+class TestHouseholdMirrorTransportActions:
+    def test_they_are_the_speakers_own(self, started, household):
+        assert started.transport_actions(GARAGE) == {
+            TransportAction.PLAY,
+            TransportAction.PAUSE,
+            TransportAction.STOP,
+            TransportAction.NEXT,
+        }
+        assert started.transport_actions(LOUNGE) == frozenset()
+
+        household.next(GARAGE)
+        household.settle()
+
+        assert TransportAction.PREVIOUS in started.transport_actions(GARAGE)
+
+    def test_a_radio_stream_allows_a_stop_and_no_pause(self, started, household):
+        household.start_stream(GARAGE, "Radio One")
+        household.settle()
+
+        assert started.transport_actions(GARAGE) == {
+            TransportAction.PLAY,
+            TransportAction.STOP,
+        }
+        assert started.playback(GARAGE).actions == (PLAY, PAUSE)
+
+    def test_a_room_that_follows_has_its_coordinators(self, started, household):
+        household.join(LOUNGE, GARAGE)
+        household.settle()
+
+        assert started.transport_actions(LOUNGE) == started.transport_actions(GARAGE)
+        assert TransportAction.NEXT in started.transport_actions(LOUNGE)
+
+    def test_an_unknown_speaker_is_not_found(self, started):
+        with pytest.raises(SpeakerNotFoundException) as raised:
+            started.transport_actions(KITCHEN)
+
+        assert raised.value.error_code == "SPEAKER_NOT_FOUND"
+
+    def test_they_are_read_without_plex_and_without_a_speaker(
+        self, started, household, plex, caplog
+    ):
+        plex.reachable = False
+        household.reachable = False
+
+        with caplog.at_level(logging.WARNING):
+            actions = started.transport_actions(GARAGE)
+
+        household.reachable = True
+        assert TransportAction.PLAY in actions
+        assert logged(caplog) == []
 
 
 class TestHouseholdMirrorArtwork:
@@ -1023,7 +1075,8 @@ class TestHouseholdMirrorHealing:
                 "WARNING",
                 "The household is not mirrored in full; the layout is read again "
                 "every 10.0 s: Cannot subscribe to AVTransport events of speaker "
-                f"{GARAGE} because external service failed: timed out",
+                f"{GARAGE} because external service failed: the speaker did not "
+                "answer (ConnectTimeout)",
             )
         ]
         # The mirror's stop() ends the subscriptions it holds at the room.

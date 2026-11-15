@@ -87,3 +87,16 @@ class SpeakerNotFoundException(RecordNotFoundException):
     def __init__(self, speaker_id: str) -> None:
         super().__init__("Speaker", speaker_id)
         self.error_code = "SPEAKER_NOT_FOUND"
+
+
+class ActionNotAvailableException(InvalidOperationException):
+    """Exception raised for a playback command the speaker does not allow now.
+
+    Args:
+        operation: The command, phrased to follow "Cannot" ("pause speaker
+            RINCON_…").
+    """
+
+    def __init__(self, operation: str) -> None:
+        super().__init__(operation, "the speaker does not allow it now")
+        self.error_code = "ACTION_NOT_AVAILABLE"

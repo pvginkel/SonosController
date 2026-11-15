@@ -212,7 +212,15 @@ class TestGetArtwork:
             household.answer_again(LOUNGE)
 
         assert response.status_code == 502
-        assert response.get_json()["code"] == "EXTERNAL_SERVICE_ERROR"
+        assert without_correlation_id(response.get_json()) == {
+            "error": (
+                f"Cannot read the picture served by speaker {LOUNGE} because "
+                "external service failed: the speaker did not answer "
+                "(ConnectTimeout)"
+            ),
+            "details": {"message": "External service request failed"},
+            "code": "EXTERNAL_SERVICE_ERROR",
+        }
 
     def test_while_plex_is_down_the_playback_state_is_served_without_artwork(
         self, household, plex, mirror

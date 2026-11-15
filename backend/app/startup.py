@@ -32,11 +32,15 @@ def register_blueprints(api_bp: Blueprint, app: Flask) -> None:
     # load, which create_app() has done for this app before it calls this.
     from app.api.artwork import artwork_bp
     from app.api.openapi_docs import complete_openapi_document
+    from app.api.playback import playback_bp
+    from app.api.speakers import speakers_bp
 
     # api_bp is one object for every app a process creates, and Flask refuses
     # a change to a blueprint that an app has registered.
     if not api_bp._got_registered_once:
         api_bp.register_blueprint(artwork_bp)
+        api_bp.register_blueprint(speakers_bp)
+        api_bp.register_blueprint(playback_bp)
     complete_openapi_document(app, spectree_config.api)
 
 

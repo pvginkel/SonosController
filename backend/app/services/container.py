@@ -16,6 +16,7 @@ from app.services.household_mirror import HouseholdMirror
 from app.services.metrics_service import MetricsService
 from app.services.plex_client import PlexapiPlexClient
 from app.services.sonos_client import SoCoSonosClient
+from app.services.speaker_service import SpeakerService
 from app.services.sse_connection_manager import SSEConnectionManager
 from app.services.task_service import TaskService
 from app.services.testing_service import TestingService
@@ -143,6 +144,13 @@ class ServiceContainer(containers.DeclarativeContainer):
         household_mirror=household_mirror,
         sonos_client=sonos_client,
         plex_client=plex_client,
+    )
+
+    # Speaker service - playback and volume commands to the speakers
+    speaker_service = providers.Factory(
+        SpeakerService,
+        household_mirror=household_mirror,
+        sonos_client=sonos_client,
     )
 
 

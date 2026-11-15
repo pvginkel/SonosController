@@ -168,6 +168,27 @@ class TestSonosClientHousehold:
         assert raised.value.operation == "read the household's layout"
         assert raised.value.cause == "none of the seed speakers answered"
 
+    def test_the_soco_client_fails_in_its_own_words_without_an_address(self, app):
+        client = SoCoSonosClient(
+            settings=AppSettings(
+                sonos_seed_hosts=["192.0.2.4"],
+                sonos_event_advertise_host="sonos-events.invalid",
+                plex_url="http://192.0.2.1:32400",
+                plex_token="the-suites-plex-token",
+            ),
+            health_service=app.container.health_service(),
+        )
+
+        with pytest.raises(ExternalServiceException) as raised:
+            client.play(GARAGE)
+
+        # SoCo's and requests' own messages name the address that was asked.
+        assert raised.value.message.startswith(
+            f"Cannot play on speaker {GARAGE} because external service failed: "
+            "none of the 1 seed speakers answered (the speaker did not answer ("
+        )
+        assert "192.0.2" not in raised.value.message
+
     def test_the_soco_client_asks_a_speaker_while_soco_holds_a_topology_subscription(
         self, app
     ):
@@ -251,7 +272,7 @@ class TestSonosClientPlayback:
         assert household.read_playback(GARAGE).queue_position == 2
 
     def test_a_command_the_speaker_does_not_allow_fails(self, household):
-        with pytest.raises(ExternalServiceException, match="UPnP Error 701"):
+        with pytest.raises(ExternalServiceException, match="UPnP error 701"):
             household.previous(GARAGE)
 
         assert household.read_playback(GARAGE).queue_position == 1
@@ -282,9 +303,9 @@ class TestSonosClientPlayback:
         assert playback.track.duration_seconds == 0
         assert playback.track.picture == ""
 
-        with pytest.raises(ExternalServiceException, match="UPnP Error 701"):
+        with pytest.raises(ExternalServiceException, match="UPnP error 701"):
             household.pause(GARAGE)
-        with pytest.raises(ExternalServiceException, match="UPnP Error 701"):
+        with pytest.raises(ExternalServiceException, match="UPnP error 701"):
             household.next(GARAGE)
 
         household.stop(GARAGE)
@@ -736,13 +757,13 @@ class TestSonosClientSubscriptions:
         )
         household.silence_room(GARAGE)
 
-        with pytest.raises(ExternalServiceException, match="timed out"):
+        with pytest.raises(ExternalServiceException, match="did not answer"):
             household.read_volume(GARAGE)
-        with pytest.raises(ExternalServiceException, match="timed out"):
+        with pytest.raises(ExternalServiceException, match="did not answer"):
             household.subscribe(
                 GARAGE, SonosService.AV_TRANSPORT, lambda event: None, lambda: None
             )
-        with pytest.raises(ExternalServiceException, match="timed out"):
+        with pytest.raises(ExternalServiceException, match="did not answer"):
             subscription.unsubscribe()
         assert household.subscription_count(GARAGE) == 0
         # The household still lists it, and the other rooms answer.
