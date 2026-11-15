@@ -85,12 +85,16 @@ class SpeakerService:
             ExternalServiceException: The speaker failed.
         """
         self._mirror.speaker(speaker_id)
+        # A mute goes before the volume and an unmute after it: the speaker
+        # never plays louder than where the change starts or ends.
+        if muted is True:
+            self._sonos.set_muted(speaker_id, True)
         if volume is not None:
             self._sonos.set_volume(speaker_id, volume)
         if delta is not None:
             self._sonos.change_volume(speaker_id, delta)
-        if muted is not None:
-            self._sonos.set_muted(speaker_id, muted)
+        if muted is False:
+            self._sonos.set_muted(speaker_id, False)
         return self._sonos.read_volume(speaker_id)
 
     def change_group_volume(
@@ -117,10 +121,13 @@ class SpeakerService:
             ExternalServiceException: The speaker failed.
         """
         self._mirror.speaker(speaker_id)
+        # As for a speaker's own volume: a mute first, an unmute last.
+        if muted is True:
+            self._sonos.set_group_muted(speaker_id, True)
         if volume is not None:
             self._sonos.set_group_volume(speaker_id, volume)
         if delta is not None:
             self._sonos.change_group_volume(speaker_id, delta)
-        if muted is not None:
-            self._sonos.set_group_muted(speaker_id, muted)
+        if muted is False:
+            self._sonos.set_group_muted(speaker_id, False)
         return self._sonos.read_group_volume(speaker_id)

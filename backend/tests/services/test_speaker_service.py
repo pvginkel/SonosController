@@ -28,6 +28,11 @@ PREVIOUS = PlaybackAction.PREVIOUS
 DID_NOT_ANSWER = "the speaker did not answer (ConnectTimeout)"
 
 
+def _audible(volume: Volume) -> int:
+    """How loud a speaker plays at a volume and mute: muted, not at all."""
+    return 0 if volume.muted else volume.volume
+
+
 @pytest.fixture
 def household(sonos: FakeSonosClient, mirror: HouseholdMirror) -> FakeSonosClient:
     """The Garage with three tracks queued and the Lounge with nothing,
@@ -180,6 +185,32 @@ class TestSpeakerServiceVolume:
 
         assert household.read_volume(GARAGE) == Volume(10, False)
 
+    @pytest.mark.parametrize(
+        ("start", "change"),
+        [
+            (Volume(10, False), {"volume": 80, "muted": True}),
+            (Volume(10, False), {"delta": 70, "muted": True}),
+            (Volume(80, True), {"volume": 10, "muted": False}),
+        ],
+    )
+    def test_it_never_plays_louder_than_where_it_starts_or_ends(
+        self, speakers, household, start, change
+    ):
+        household.set_volume(GARAGE, start.volume)
+        household.set_muted(GARAGE, start.muted)
+        # The speaker's volume and mute before each call the service makes.
+        heard: list[Volume] = []
+        household.before_call = lambda speaker_id: heard.append(
+            household.read_volume(GARAGE)
+        )
+
+        end = speakers.change_volume(GARAGE, **change)
+
+        loudest = max(_audible(start), _audible(end))
+        assert [
+            _audible(volume) for volume in heard if _audible(volume) > loudest
+        ] == []
+
     def test_it_moves_the_speaker_alone_in_a_group(self, speakers, household):
         household.join(LOUNGE, GARAGE)
         household.settle()
@@ -246,6 +277,31 @@ class TestSpeakerServiceGroupVolume:
         assert speakers.change_group_volume(LOUNGE, delta=0, muted=False) == Volume(
             30, False
         )
+
+    @pytest.mark.parametrize(
+        ("start", "change"),
+        [
+            (Volume(10, False), {"volume": 80, "muted": True}),
+            (Volume(10, False), {"delta": 70, "muted": True}),
+            (Volume(80, True), {"volume": 10, "muted": False}),
+        ],
+    )
+    def test_it_never_plays_louder_than_where_it_starts_or_ends(
+        self, speakers, household, start, change
+    ):
+        household.set_group_volume(GARAGE, start.volume)
+        household.set_group_muted(GARAGE, start.muted)
+        heard: list[Volume] = []
+        household.before_call = lambda speaker_id: heard.append(
+            household.read_group_volume(GARAGE)
+        )
+
+        end = speakers.change_group_volume(GARAGE, **change)
+
+        loudest = max(_audible(start), _audible(end))
+        assert [
+            _audible(volume) for volume in heard if _audible(volume) > loudest
+        ] == []
 
     def test_an_unknown_speaker_is_not_found(self, speakers):
         with pytest.raises(SpeakerNotFoundException):
