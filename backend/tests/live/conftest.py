@@ -31,7 +31,11 @@ from app.core_exceptions import ExternalServiceException
 from app.exceptions import ConfigurationError
 from app.services.health_service import CheckStatus
 from app.services.plex_client import PlexapiPlexClient
-from app.services.sonos_client import SoCoSonosClient, TransportState
+from app.services.sonos_client import (
+    SoCoSonosClient,
+    TransportAction,
+    TransportState,
+)
 
 _ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
@@ -132,6 +136,15 @@ def garage(live_client: SoCoSonosClient) -> str:
             f"The {GARAGE} needs a queue of two tracks or more as its source "
             "for the transport round trip. Queue an album from the Sonos app "
             "and stop it.",
+            returncode=1,
+        )
+    # The test of the client's words for a refused command needs one: a
+    # previous at the queue's first track, or a next at its last.
+    if {TransportAction.PREVIOUS, TransportAction.NEXT} <= playback.actions:
+        pytest.exit(
+            f"The {GARAGE} allows both next and previous, and the live suite "
+            "needs a command it refuses. Put its queue at the first or the last "
+            "track in the Sonos app and stop it.",
             returncode=1,
         )
     return speaker_id
