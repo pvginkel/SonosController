@@ -84,6 +84,13 @@ class TestAppSettings:
         with pytest.raises(ConfigurationError, match=f"{name} is empty"):
             AppSettings.load(_environment(**{name: value}))
 
+    @pytest.mark.parametrize("value", ["", " "])
+    def test_an_empty_advertise_host_stops_the_app(self, value):
+        with pytest.raises(
+            ConfigurationError, match="SONOS_EVENT_ADVERTISE_HOST is empty"
+        ):
+            AppSettings.load(_environment(SONOS_EVENT_ADVERTISE_HOST=value))
+
     @pytest.mark.parametrize("hosts", ["", " , "])
     def test_seed_hosts_must_name_a_speaker(self, hosts):
         with pytest.raises(ConfigurationError, match="names no speaker"):

@@ -76,14 +76,19 @@ class AppSettings(BaseModel):
 
         Raises:
             ConfigurationError: If SONOS_SEED_HOSTS names no speaker, or holds
-                anything but IPv4 addresses; if PLEX_URL or PLEX_TOKEN is empty.
+                anything but IPv4 addresses; if SONOS_EVENT_ADVERTISE_HOST,
+                PLEX_URL or PLEX_TOKEN is empty.
         """
         if env is None:
             # pydantic-settings fills the fields from the environment and .env.
             env = AppEnvironment()  # type: ignore[call-arg]
         return cls(
             sonos_seed_hosts=_seed_hosts(env.SONOS_SEED_HOSTS),
-            sonos_event_advertise_host=env.SONOS_EVENT_ADVERTISE_HOST,
+            # SoCo advertises the pod's own address in place of an empty one,
+            # which the speakers cannot reach (docs/api-design.md section 1.1).
+            sonos_event_advertise_host=_not_empty(
+                "SONOS_EVENT_ADVERTISE_HOST", env.SONOS_EVENT_ADVERTISE_HOST
+            ),
             sonos_event_port=env.SONOS_EVENT_PORT,
             plex_url=_not_empty("PLEX_URL", env.PLEX_URL),
             plex_token=_not_empty("PLEX_TOKEN", env.PLEX_TOKEN),
