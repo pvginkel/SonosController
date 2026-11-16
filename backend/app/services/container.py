@@ -16,6 +16,7 @@ from app.services.household_mirror import HouseholdMirror
 from app.services.library_service import LibraryService
 from app.services.metrics_service import MetricsService
 from app.services.plex_client import PlexapiPlexClient
+from app.services.queue_service import QueueService
 from app.services.sonos_client import SoCoSonosClient
 from app.services.speaker_service import SpeakerService
 from app.services.sse_connection_manager import SSEConnectionManager
@@ -159,6 +160,14 @@ class ServiceContainer(containers.DeclarativeContainer):
         SpeakerService,
         household_mirror=household_mirror,
         sonos_client=sonos_client,
+    )
+
+    # Queue service - a group's queue, read from and changed on the speaker
+    queue_service = providers.Factory(
+        QueueService,
+        household_mirror=household_mirror,
+        sonos_client=sonos_client,
+        plex_client=plex_client,
     )
 
 

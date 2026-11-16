@@ -481,6 +481,55 @@ class TestHouseholdMirrorTransportActions:
         assert logged(caplog) == []
 
 
+class TestHouseholdMirrorQueuePosition:
+    def test_it_is_the_place_of_the_track_that_is_loaded(self, started, household):
+        assert started.queue_position(GARAGE) == 1
+
+        household.next(GARAGE)
+        household.settle()
+
+        assert started.queue_position(GARAGE) == 2
+        assert started.queue_position(GARAGE) == started.playback(GARAGE).queue_position
+
+    def test_a_room_that_follows_has_its_coordinators(self, started, household):
+        household.next(GARAGE)
+        household.join(LOUNGE, GARAGE)
+        household.settle()
+
+        assert started.queue_position(LOUNGE) == 2
+
+    def test_there_is_none_while_a_stream_plays(self, started, household):
+        household.start_stream(GARAGE, "Radio One")
+        household.settle()
+
+        assert started.queue_position(GARAGE) is None
+
+    def test_there_is_none_for_an_empty_queue(self, started, household):
+        assert started.queue_position(LOUNGE) is None
+
+        household.clear_queue(GARAGE)
+        household.settle()
+
+        assert started.queue_position(GARAGE) is None
+
+    def test_an_unknown_speaker_is_not_found(self, started):
+        with pytest.raises(SpeakerNotFoundException):
+            started.queue_position(KITCHEN)
+
+    def test_it_is_read_without_plex_and_without_a_speaker(
+        self, started, household, plex, caplog
+    ):
+        plex.reachable = False
+        household.reachable = False
+
+        with caplog.at_level(logging.WARNING):
+            position = started.queue_position(GARAGE)
+
+        household.reachable = True
+        assert position == 1
+        assert logged(caplog) == []
+
+
 class TestHouseholdMirrorArtwork:
     """``queue_track(n)`` is Plex's track ``1000 + n``."""
 

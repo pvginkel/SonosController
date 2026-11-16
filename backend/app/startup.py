@@ -34,6 +34,7 @@ def register_blueprints(api_bp: Blueprint, app: Flask) -> None:
     from app.api.library import library_bp
     from app.api.openapi_docs import complete_openapi_document
     from app.api.playback import playback_bp
+    from app.api.queue import queue_bp
     from app.api.speakers import speakers_bp
 
     # api_bp is one object for every app a process creates, and Flask refuses
@@ -42,6 +43,7 @@ def register_blueprints(api_bp: Blueprint, app: Flask) -> None:
         api_bp.register_blueprint(artwork_bp)
         api_bp.register_blueprint(speakers_bp)
         api_bp.register_blueprint(playback_bp)
+        api_bp.register_blueprint(queue_bp)
         api_bp.register_blueprint(library_bp)
     complete_openapi_document(app, spectree_config.api)
 

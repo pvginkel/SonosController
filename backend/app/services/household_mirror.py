@@ -408,6 +408,19 @@ class HouseholdMirror:
             coordinator_id = self._groups[self._room(speaker_id).id].coordinator_id
             return self._states[coordinator_id].playback.actions
 
+    def queue_position(self, speaker_id: str) -> int | None:
+        """The place in the room's group's queue of the track that is loaded,
+        from 1, as ``playback()`` gives it: None when the group plays from
+        elsewhere than its queue, and for an empty queue. This asks neither a
+        speaker nor Plex.
+
+        Raises:
+            SpeakerNotFoundException: The household has no such room.
+        """
+        with self._lock:
+            coordinator_id = self._groups[self._room(speaker_id).id].coordinator_id
+            return _queue_position(self._states[coordinator_id].playback)
+
     def speaker_picture(self, speaker_id: str, artwork_id: str) -> str | None:
         """The address at which a room serves the picture an artwork id names,
         for ``SonosClient.read_picture()``.
@@ -925,7 +938,6 @@ def _playback(
     playback: Playback, track_id: str | None, artwork_id: str | None
 ) -> SpeakerPlayback:
     source = _source(playback.transport_uri)
-    queued = source is PlaybackSource.QUEUE
     return SpeakerPlayback(
         state=_STATES[playback.transport_state],
         source=source,
@@ -933,10 +945,18 @@ def _playback(
             action for action, commands in _ACTIONS if commands & playback.actions
         ),
         shuffle=playback.shuffle,
-        queue_position=(playback.queue_position or None) if queued else None,
-        queue_length=playback.queue_length if queued else None,
+        queue_position=_queue_position(playback),
+        queue_length=(
+            playback.queue_length if source is PlaybackSource.QUEUE else None
+        ),
         track=_track(playback, source, track_id, artwork_id),
     )
+
+
+def _queue_position(playback: Playback) -> int | None:
+    if _source(playback.transport_uri) is not PlaybackSource.QUEUE:
+        return None
+    return playback.queue_position or None
 
 
 def _source(transport_uri: str) -> PlaybackSource:
