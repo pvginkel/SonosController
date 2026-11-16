@@ -21,6 +21,7 @@ from app.utils.plex_library import (
     parse_playlist,
     parse_rating_key,
     parse_track,
+    track_picture,
 )
 
 ARTIST = (
@@ -37,7 +38,8 @@ TRACK = (
     '<Track ratingKey="3201" parentRatingKey="3101" type="track" '
     'title="Taxman" grandparentTitle="The Beatles" parentTitle="Revolver" '
     'parentIndex="1" index="1" duration="159000" '
-    'thumb="/library/metadata/3101/thumb/1700000002" />'
+    'thumb="/library/metadata/3101/thumb/1700000002" '
+    'grandparentThumb="/library/metadata/3001/thumb/1700000001" />'
 )
 PLAYLIST = (
     '<Playlist ratingKey="3301" type="playlist" title="Mix" smart="0" '
@@ -163,7 +165,10 @@ class TestParseTrack:
 
     def test_a_track_without_a_disc_a_number_a_duration_or_a_picture_has_none(self):
         track = parse_track(
-            _item(TRACK, without=("parentIndex", "index", "duration", "thumb"))
+            _item(
+                TRACK,
+                without=("parentIndex", "index", "duration", "thumb", "grandparentThumb"),
+            )
         )
 
         assert (track.disc, track.number, track.duration_ms, track.picture) == (
@@ -188,6 +193,27 @@ class TestParseTrack:
         assert str(raised.value) == (
             f"Plex's answer has a Track whose {name} is not a number"
         )
+
+
+class TestTrackPicture:
+    def test_it_is_the_cover_of_the_tracks_album(self):
+        assert track_picture(_item(TRACK)) == "/library/metadata/3101/thumb/1700000002"
+
+    def test_a_track_of_an_album_without_a_cover_has_its_artists_picture(self):
+        # Plex gives such a track no thumb, and its album its artist's picture.
+        picture = track_picture(_item(TRACK, without=("thumb",)))
+
+        assert picture == "/library/metadata/3001/thumb/1700000001"
+
+    @pytest.mark.parametrize(
+        "item",
+        [
+            _item(TRACK, without=("thumb", "grandparentThumb")),
+            _item(TRACK, thumb="", grandparentThumb=""),
+        ],
+    )
+    def test_a_track_whose_album_and_artist_have_no_picture_has_none(self, item):
+        assert track_picture(item) is None
 
 
 class TestParsePlaylist:

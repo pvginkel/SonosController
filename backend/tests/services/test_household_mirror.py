@@ -574,6 +574,14 @@ class TestHouseholdMirrorArtwork:
 
         assert started.playback(GARAGE).track.artwork_id is None
 
+    def test_an_album_without_a_cover_has_its_artists_artwork(self, started, plex):
+        plex.add_artist("2101", "An Artist", size=(100, 100))
+        plex.add_album("2001", ["1001"], size=None, artist="2101")
+
+        assert started.playback(GARAGE).track.artwork_id == plex_artwork_id(
+            plex.read_artist("2101").picture
+        )
+
     def test_a_track_plex_does_not_have_has_no_artwork(self, started):
         assert started.playback(GARAGE).track.track_id == "1001"
         assert started.playback(GARAGE).track.artwork_id is None

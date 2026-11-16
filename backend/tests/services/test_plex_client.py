@@ -565,10 +565,20 @@ class TestPlexClientTracks:
 
         assert (track.disc, track.number, track.duration_ms) == (None, None, None)
 
-    def test_a_track_of_an_album_without_a_picture_has_none(self, music):
+    def test_a_track_of_an_album_without_a_cover_has_its_artists_picture(self, music):
         [track] = music.read_album_tracks(BOOTLEG)
 
+        assert track.picture == music.read_artist(BEATLES).picture
+        assert track.picture == music.read_album(BOOTLEG).picture
+        assert music.read_track(track.rating_key) == track
+
+    def test_a_track_of_an_album_and_an_artist_without_a_picture_has_none(
+        self, library
+    ):
+        [track] = library.read_album_tracks(BARE_ALBUM)
+
         assert track.picture is None
+        assert library.read_track(BARE_TRACK) == track
 
     def test_one_track_is_the_one_listed(self, music):
         for track in music.read_album_tracks(ANTHOLOGY):
@@ -673,8 +683,15 @@ class TestPlexClientTrackPictures:
         assert list(pictures) == [first]
 
     def test_a_track_without_a_picture_is_left_out(self, music):
-        assert music.read_track_pictures(["3231", "3241"]) == {
+        music.add_album("3107", ["3261"], size=None, artist=BARE_ARTIST)
+
+        assert music.read_track_pictures(["3261", "3241"]) == {
             "3241": music.read_track_picture("3241")
+        }
+
+    def test_a_track_of_an_album_without_a_cover_has_its_artists_picture(self, music):
+        assert music.read_track_pictures(["3231"]) == {
+            "3231": music.read_artist(BEATLES).picture
         }
 
     def test_a_track_asked_twice_is_there_once(self, music):
@@ -717,7 +734,20 @@ class TestPlexClientTrackPicture:
     def test_a_track_plex_does_not_have_has_no_picture(self, library):
         assert library.read_track_picture("9999") is None
 
-    def test_a_track_of_an_album_without_a_picture_has_none(self, library):
+    def test_a_track_of_an_album_without_a_cover_has_its_artists_picture(
+        self, library
+    ):
+        library.add_artist("2301", "An Artist", size=(100, 100))
+        library.add_album("2302", ["2303"], size=None, artist="2301")
+
+        picture = library.read_track_picture("2303")
+
+        assert picture == library.read_artist("2301").picture
+        assert picture.startswith("/library/metadata/2301/thumb/")
+
+    def test_a_track_of_an_album_and_an_artist_without_a_picture_has_none(
+        self, library
+    ):
         assert library.read_track_picture(BARE_TRACK) is None
 
     def test_an_album_is_not_a_track(self, library):

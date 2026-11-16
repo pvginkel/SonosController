@@ -452,9 +452,15 @@ class TestListAlbumTracks:
             album["artwork_id"]
         }
 
-    def test_a_track_with_its_own_artist_and_nothing_else(self, client, library):
+    def test_a_track_with_its_own_artist_on_an_album_without_a_cover(
+        self, client, library
+    ):
         response = client.get(f"/api/library/albums/{DEMOS}/tracks")
 
+        # Its picture is the one its album carries: its artist's.
+        demos = client.get(f"/api/library/albums/{DEMOS}").get_json()
+        beatles = client.get(f"/api/library/artists/{BEATLES}").get_json()
+        assert demos["artwork_id"] == beatles["artwork_id"] is not None
         assert response.get_json()["data"] == [
             {
                 "id": DEMOS_TRACK,
@@ -463,9 +469,18 @@ class TestListAlbumTracks:
                 "disc": None,
                 "number": None,
                 "duration_ms": None,
-                "artwork_id": None,
+                "artwork_id": beatles["artwork_id"],
             }
         ]
+
+    def test_a_track_whose_album_and_artist_have_no_picture_has_none(
+        self, client, library
+    ):
+        library.add_album("3104", ["3205"], artist=ABBA, size=None)
+
+        response = client.get("/api/library/albums/3104/tracks")
+
+        assert [track["artwork_id"] for track in response.get_json()["data"]] == [None]
 
     def test_a_page_and_a_direction(self, client, library):
         response = client.get(

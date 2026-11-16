@@ -60,8 +60,9 @@ class PlexTrack:
     disc: int | None
     number: int | None
     duration_ms: int | None
-    # The path of its album's cover: a track has no picture of its own, and
-    # none where its album has no cover.
+    # The path of its album's picture, which the album's tracks share: its
+    # cover, or its artist's picture where it has no cover; None where it has
+    # neither. A track has no picture of its own.
     picture: str | None
 
 
@@ -108,8 +109,18 @@ def parse_track(item: Element) -> PlexTrack:
         disc=_number(item, "parentIndex"),
         number=_number(item, "index"),
         duration_ms=_number(item, "duration"),
-        picture=item.attrib.get("thumb") or None,
+        picture=track_picture(item),
     )
+
+
+def track_picture(item: Element) -> str | None:
+    """The path of the picture of a track in Plex's answer: its album's.
+
+    Plex gives a track of an album with a cover the cover's path as its
+    ``thumb``. It gives a track of an album without one no ``thumb``, and
+    names its artist's picture, which it gives that album, ``grandparentThumb``.
+    """
+    return item.attrib.get("thumb") or item.attrib.get("grandparentThumb") or None
 
 
 def parse_playlist(item: Element) -> PlexPlaylist:

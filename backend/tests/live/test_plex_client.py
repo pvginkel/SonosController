@@ -55,6 +55,21 @@ def artist(live_plex: PlexapiPlexClient, album: str) -> str:
 
 
 @pytest.fixture(scope="module")
+def coverless(live_plex: PlexapiPlexClient, artists: list[PlexArtist]) -> PlexAlbum:
+    """The first album, by artist, without a cover of its own, by an artist
+    with a picture, and with tracks: Plex gives it its artist's picture, and
+    its tracks no ``thumb`` but that picture as ``grandparentThumb``."""
+    for found in artists:
+        if found.picture is None:
+            continue
+        albums = live_plex.read_artist_albums(found.rating_key, newest_first=False)
+        for album in albums or []:
+            if album.picture == found.picture and album.track_count:
+                return album
+    pytest.fail("the music library has no album without a cover with tracks")
+
+
+@pytest.fixture(scope="module")
 def playlists(live_plex: PlexapiPlexClient) -> list[PlexPlaylist]:
     found = live_plex.read_playlists()
     assert any(playlist.track_count for playlist in found), (
@@ -185,11 +200,10 @@ class TestPlexClientLibrary:
             tracks = plex.read_album_tracks(first.rating_key)
             assert len(tracks) == first.track_count
             # An album without a cover carries its artist's picture, and its
-            # tracks none.
+            # tracks the picture it carries.
             cover = first.picture
             if cover and _PICTURE.fullmatch(cover).group(1) != first.rating_key:
                 assert cover == found.picture
-                cover = None
             assert all(track.picture == cover for track in tracks)
             albums += of_artist
 
@@ -317,6 +331,17 @@ class TestPlexClientTracks:
         assert found.picture == picture
         assert found.title and found.artist and found.duration_ms
 
+    def test_the_tracks_of_an_album_without_a_cover_have_its_artists_picture(
+        self, plex, coverless
+    ):
+        tracks = plex.read_album_tracks(coverless.rating_key)
+
+        assert len(tracks) == coverless.track_count
+        assert all(track.picture == coverless.picture for track in tracks)
+        assert plex.read_track(tracks[0].rating_key) == tracks[0]
+        artist = plex.read_artist(coverless.artist_rating_key)
+        assert _PICTURE.fullmatch(coverless.picture).group(1) == artist.rating_key
+
     def test_the_tracks_of_an_album_plex_does_not_have_are_none(
         self, plex, artist, plex_track, playlists
     ):
@@ -396,6 +421,13 @@ class TestPlexClientTrackPictures:
 
         assert plex.read_track_pictures(keys) == dict.fromkeys(keys, picture)
 
+    def test_the_tracks_of_an_album_without_a_cover_have_its_artists_picture(
+        self, plex, coverless
+    ):
+        keys = [track.rating_key for track in plex.read_album_tracks(coverless.rating_key)]
+
+        assert plex.read_track_pictures(keys) == dict.fromkeys(keys, coverless.picture)
+
     def test_what_is_no_track_is_left_out(
         self, plex, artist, album, plex_track, picture, playlists
     ):
@@ -415,6 +447,13 @@ class TestPlexClientTrackPicture:
         assert path is not None
         # The album's rating key, not the track's.
         assert path.group(1) != plex_track
+
+    def test_a_track_of_an_album_without_a_cover_has_its_artists_picture(
+        self, plex, coverless
+    ):
+        [track, *_] = plex.read_album_tracks(coverless.rating_key)
+
+        assert plex.read_track_picture(track.rating_key) == coverless.picture
 
     def test_a_track_plex_does_not_have_has_no_picture(self, plex):
         assert plex.read_track_picture(NO_ITEM) is None

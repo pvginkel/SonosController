@@ -611,10 +611,21 @@ class TestLibraryServiceListAlbumTracks:
             library.album(REVOLVER).artwork_id
         }
 
-    def test_the_tracks_of_an_album_without_a_cover_have_no_artwork_id(
+    def test_the_tracks_of_an_album_without_a_cover_have_its_artists_artwork_id(
         self, library, beatles
     ):
         ((track,), _) = library.list_album_tracks(DEMOS, TrackListQuerySchema())
+
+        artists = plex_artwork_id(beatles.read_artist(BEATLES).picture)
+        assert track.artwork_id == artists == library.album(DEMOS).artwork_id
+
+    def test_the_tracks_of_an_album_and_an_artist_without_a_picture_have_none(
+        self, library, plex
+    ):
+        plex.add_artist(BJORK, "Björk", size=None)
+        plex.add_album("3130", ["3131"], artist=BJORK, size=None)
+
+        ((track,), _) = library.list_album_tracks("3130", TrackListQuerySchema())
 
         assert track.artwork_id is None
 

@@ -39,6 +39,7 @@ from app.utils.plex_library import (
     parse_playlist,
     parse_rating_key,
     parse_track,
+    track_picture,
 )
 
 _REQUEST_TIMEOUT_SECONDS = 5.0
@@ -150,10 +151,11 @@ class PlexClient(ABC):
     def read_track_picture(self, rating_key: str) -> str | None:
         """The path of the picture Plex gives a track.
 
-        It is the track's ``thumb``: the path of its album's picture, with the
-        picture's stamp, so the tracks of an album share one path and a new
-        picture has a new one. None when Plex has no track with this rating
-        key, or the track has no picture.
+        It is the path of the picture its album carries: the album's cover,
+        or its artist's picture where the album has no cover. The path has
+        the picture's stamp, so the tracks of an album share one path and a
+        new picture has a new one. None when Plex has no track with this
+        rating key, or neither its album nor its artist has a picture.
         """
 
     @abstractmethod
@@ -318,8 +320,7 @@ class PlexapiPlexClient(PlexClient):
         track = item.find("Track")
         if track is None:
             return None
-        thumb: str | None = track.attrib.get("thumb")
-        return thumb
+        return track_picture(track)
 
     def read_track_pictures(self, rating_keys: Iterable[str]) -> dict[str, str]:
         keys = list(
@@ -329,9 +330,9 @@ class PlexapiPlexClient(PlexClient):
             return {}
         with _plex_call(f"read the pictures of {len(keys)} Plex tracks"):
             return {
-                parse_rating_key(item, "ratingKey"): item.attrib["thumb"]
+                parse_rating_key(item, "ratingKey"): picture
                 for item in _items(self._several(keys), "track")
-                if item.attrib.get("thumb")
+                if (picture := track_picture(item)) is not None
             }
 
     def read_picture(self, picture: str, size: int) -> bytes | None:

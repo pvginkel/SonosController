@@ -4,13 +4,14 @@
 albums with their tracks, and playlists. It answers ``PlexClient``'s calls
 from it the way the real Plex was seen to (``docs/api-design.md`` sections
 1.4, 1.6 and 1.9, and the live suite): an artist without a sort title files
-under its title; an album's tracks come in disc and track order; a track's
-picture is its album's, at a path that carries the album's rating key and
-the picture's stamp; a playlist's picture is at a path of its own, which
-gets a new stamp whenever the playlist is read on its own, and a playlist
-without tracks has no picture and no duration; a picture comes back
-as a JPEG that covers the square asked for and keeps its shape; a path with
-another stamp answers the picture as it is now. Like plexapi, it holds which
+under its title; an album's tracks come in disc and track order; an album
+without a cover carries its artist's picture; a track's picture is the one
+its album carries, at a path that carries the rating key of the album, or of
+its artist, and the picture's stamp; a playlist's picture is at a path of
+its own, which gets a new stamp whenever the playlist is read on its own,
+and a playlist without tracks has no picture and no duration; a picture
+comes back as a JPEG that covers the square asked for and keeps its shape;
+a path with another stamp answers the picture as it is now. Like plexapi, it holds which
 server it is from Plex's first answer.
 
 A test builds its library with ``add_artist()``, ``add_album()``,
@@ -398,7 +399,7 @@ class FakePlexClient(PlexClient):
     def read_track_picture(self, rating_key: str) -> str | None:
         self._asked(f"read the picture of Plex track {rating_key}")
         track = self._tracks.get(rating_key)
-        return self._picture_path(track.album) if track is not None else None
+        return self._track_picture(track) if track is not None else None
 
     def read_track_pictures(self, rating_keys: Iterable[str]) -> dict[str, str]:
         keys = list(dict.fromkeys(rating_keys))
@@ -408,7 +409,7 @@ class FakePlexClient(PlexClient):
         pictures = {}
         for key in keys:
             track = self._tracks.get(key)
-            picture = self._picture_path(track.album) if track is not None else None
+            picture = self._track_picture(track) if track is not None else None
             if picture is not None:
                 pictures[key] = picture
         return pictures
@@ -473,13 +474,17 @@ class FakePlexClient(PlexClient):
             track_count=sum(
                 1 for track in self._tracks.values() if track.album == album.rating_key
             ),
-            # Plex gives an album without a cover its artist's picture, and
-            # leaves its tracks without one.
-            picture=(
-                self._picture_path(album.rating_key)
-                or self._picture_path(album.artist)
-            ),
+            picture=self._album_picture(album),
         )
+
+    def _album_picture(self, album: _Album) -> str | None:
+        # Plex gives an album without a cover its artist's picture.
+        return self._picture_path(album.rating_key) or self._picture_path(
+            album.artist
+        )
+
+    def _track_picture(self, track: _Track) -> str | None:
+        return self._album_picture(self._albums[track.album])
 
     def _track(self, track: _Track) -> PlexTrack:
         album = self._albums[track.album]
@@ -490,7 +495,7 @@ class FakePlexClient(PlexClient):
             disc=track.disc,
             number=track.number,
             duration_ms=track.duration_ms,
-            picture=self._picture_path(track.album),
+            picture=self._track_picture(track),
         )
 
     def _playlist(self, playlist: _Playlist) -> PlexPlaylist:

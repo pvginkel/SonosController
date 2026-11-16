@@ -107,9 +107,10 @@ class TrackSchema(BaseModel):
     )
     artwork_id: str | None = Field(
         description=(
-            f"The id of the track's picture, {_ARTWORK} It is the cover of "
-            "its album, which the album's tracks share; `null` when the album "
-            "has no cover."
+            f"The id of the track's picture, {_ARTWORK} It is its album's "
+            "picture, which the album's tracks share: the album's cover, or "
+            "its artist's picture where the album has no cover; `null` when "
+            "the album has neither."
         )
     )
 

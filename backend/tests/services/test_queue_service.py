@@ -301,12 +301,23 @@ class TestQueueServiceListQueue:
 
         entries = queue.list_queue(GARAGE, query()).entries
 
-        # 1101 is on an album without a cover, 1102 is a track Plex does not
-        # have.
+        # 1101 is on an album without a cover, by an artist without a
+        # picture; 1102 is a track Plex does not have.
         assert [(entry.track_id, entry.artwork_id) for entry in entries] == [
             ("1101", None),
             ("1102", None),
         ]
+
+    def test_a_plex_track_of_an_album_without_a_cover_has_its_artists_artwork(
+        self, queue, household, plex
+    ):
+        plex.add_artist("2101", "An Artist", size=(100, 100))
+        plex.add_album("2002", ["1101"], size=None, artist="2101")
+        household.load_queue(GARAGE, [queue_track(101)])
+
+        (entry,) = queue.list_queue(GARAGE, query()).entries
+
+        assert entry.artwork_id == plex_artwork_id(plex.read_artist("2101").picture)
 
     def test_what_an_entry_does_not_give_is_none(self, queue, household):
         household.load_queue(
