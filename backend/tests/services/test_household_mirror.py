@@ -1599,6 +1599,42 @@ class TestHouseholdMirrorHealingThread:
         assert started.speaker(GARAGE).volume == 33
         assert started.speaker(GARAGE).group.volume == 33
 
+    def test_a_change_made_while_a_room_that_leaves_is_read_again_is_kept(
+        self, household, mirror
+    ):
+        household.join(LOUNGE, GARAGE)
+        mirror.start()
+        household.settle()
+        # The healing thread reads a room that leaves its group again: its
+        # playback, then its group volume. A stream started in between, after
+        # the playback was read, arrives as an event while the mirror still
+        # holds the room as following the Garage.
+        playback_read, stream_started = threading.Event(), threading.Event()
+        asked = []
+
+        def hold_the_read_of_the_group_volume(speaker_id):
+            if threading.current_thread() is threading.main_thread():
+                return
+            asked.append(speaker_id)
+            if len(asked) == 2:
+                playback_read.set()
+                assert stream_started.wait(5.0), "the read was not released"
+
+        household.before_call = hold_the_read_of_the_group_volume
+        household.unjoin(LOUNGE)
+        try:
+            assert playback_read.wait(5.0), "the room was not read again"
+            household.start_stream(LOUNGE, "Radio One")
+            household.settle()
+        finally:
+            stream_started.set()
+
+        apply(household, mirror)
+        assert asked[:2] == [LOUNGE, LOUNGE]
+        assert mirror.speaker(LOUNGE).group.member_ids == (LOUNGE,)
+        assert mirror.playback(LOUNGE).state is PlaybackStatus.PLAYING
+        assert mirror.playback(LOUNGE).source is PlaybackSource.RADIO
+
     def test_stop_does_not_wait_for_the_healing_threads_next_read_of_the_layout(
         self, started, household
     ):

@@ -219,7 +219,8 @@ class _Feed:
     """A room's subscriptions.
 
     ``early`` holds the room's events that arrived before it was read in
-    full, and is None once they are merged into what was read. ``stale`` is
+    full, or while it was read again, and is None once they are merged into
+    what was read. ``stale`` is
     set when a renewal failed, or when the room could not be subscribed to
     again: the next layout that is applied replaces the feed. ``ended`` is
     set once the mirror no longer uses the feed: its handlers do nothing
@@ -557,7 +558,8 @@ class HouseholdMirror:
         over, or their renewal fails, and what it reported since is unknown.
         A room that now coordinates a group and followed another room before
         is read again: while it followed, its own device's events were not
-        the group's. A room the layout no longer has is dropped.
+        the group's. The events that arrive while it is read wait in its
+        feed, as a new room's do. A room the layout no longer has is dropped.
 
         A room that is not held and fails is left out, and so is a held room
         that now coordinates and cannot be read again: the layout is applied
@@ -637,6 +639,10 @@ class HouseholdMirror:
                         and room.id not in read
                         and coordinator_id == room.id
                     ):
+                        with self._lock:
+                            # The room follows until this layout is held, and
+                            # a follower's events are dropped.
+                            self._feeds[room.id].early = []
                         try:
                             read_again[room.id] = (
                                 self._client.read_playback(room.id),
@@ -681,13 +687,12 @@ class HouseholdMirror:
                         if room_id in held:
                             ended.append(self._feeds[room_id])
                         self._states[room_id] = state
-                        self._feeds[room_id] = feed = feeds[room_id]
-                        early, feed.early = feed.early or [], None
-                        for event in early:
-                            self._merge(room_id, event)
+                        self._feeds[room_id] = feeds[room_id]
+                        self._merge_early(room_id)
                     for room_id, (playback, group_volume) in read_again.items():
                         self._states[room_id].playback = playback
                         self._states[room_id].group_volume = group_volume
+                        self._merge_early(room_id)
                     for feed in ended:
                         feed.ended = True
                     events = _layout_events(before, self._served())
@@ -717,6 +722,14 @@ class HouseholdMirror:
                 playback=coordinator.playback,
             )
         return served
+
+    def _merge_early(self, room_id: str) -> None:
+        """Merge the events that waited in the room's feed into what was read
+        of the room. What they change is in the layout's events."""
+        feed = self._feeds[room_id]
+        early, feed.early = feed.early or [], None
+        for event in early:
+            self._merge(room_id, event)
 
     def _subscribe_and_read(self, room: Room, feed: _Feed) -> _RoomState:
         """Subscribe the feed to the room's four services, then read the room
