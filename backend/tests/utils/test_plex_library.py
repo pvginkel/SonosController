@@ -180,6 +180,12 @@ class TestParseTrack:
 
         assert track.artist == "Tony Sheridan"
 
+    def test_a_track_of_an_album_without_a_cover_has_its_artists_picture(self):
+        # Plex gives such a track no thumb, and its album its artist's picture.
+        track = parse_track(_item(TRACK, without=("thumb",)))
+
+        assert track.picture == "/library/metadata/3001/thumb/1700000001"
+
     def test_a_track_without_a_disc_a_number_a_duration_or_a_picture_has_none(self):
         track = parse_track(
             _item(
