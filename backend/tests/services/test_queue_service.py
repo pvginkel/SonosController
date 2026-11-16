@@ -7,7 +7,7 @@ household mirror.
 import logging
 import threading
 import unicodedata
-from collections.abc import Iterable
+from collections.abc import Callable, Generator, Iterable
 from dataclasses import replace
 from datetime import date
 
@@ -30,8 +30,6 @@ from app.services.sonos_client import (
     SoCoSonosClient,
     TransportState,
 )
-from app.services.sse_connection_manager import LOCAL_ADMIN_TARGET
-from app.services.task_service import TaskProgressHandle
 from app.utils.artwork_id import plex_artwork_id
 from app.utils.plex_queue_entry import parse_plex_queue_entry
 from tests.fakes.plex_client import FakePlexClient
@@ -482,12 +480,8 @@ MIX_TRACKS = ["121", "111", "131"]
 def library(plex: FakePlexClient) -> FakePlexClient:
     """Without pictures, which queueing does not read."""
     plex.add_artist(BAND, "The Band", size=None)
-    plex.add_album(
-        OLD_ALBUM, OLD_TRACKS, None, artist=BAND, released=date(2001, 5, 1)
-    )
-    plex.add_album(
-        NEW_ALBUM, NEW_TRACKS, None, artist=BAND, released=date(2010, 1, 1)
-    )
+    plex.add_album(OLD_ALBUM, OLD_TRACKS, None, artist=BAND, released=date(2001, 5, 1))
+    plex.add_album(NEW_ALBUM, NEW_TRACKS, None, artist=BAND, released=date(2010, 1, 1))
     plex.add_album(UNDATED_ALBUM, UNDATED_TRACKS, None, artist=BAND)
     plex.add_artist(PROLIFIC, "The Prolific", size=None)
     for n, album in enumerate(PROLIFIC_ALBUMS):
@@ -552,17 +546,19 @@ def queue_calls(
     return calls
 
 
-def replaced(shuffle: bool, *containers: tuple[object, ...]) -> list[tuple]:
-    """The calls of a play or shuffle on the Garage: the queue replaced, the
-    first container queued and played, the rest added."""
+def replaced(
+    shuffle: bool, *containers: tuple[object, ...], speaker_id: str = GARAGE
+) -> list[tuple]:
+    """The calls of a play or shuffle on a room, the Garage unless named: the
+    queue replaced, the first container queued and played, the rest added."""
     first, *rest = containers
     return [
-        ("clear_queue", GARAGE),
-        ("select_queue", GARAGE),
-        ("set_shuffle", GARAGE, shuffle),
-        ("add_to_queue", GARAGE, *first),
-        ("play_from_start", GARAGE),
-        *(("add_many_to_queue", GARAGE, list(more)) for more in rest),
+        ("clear_queue", speaker_id),
+        ("select_queue", speaker_id),
+        ("set_shuffle", speaker_id, shuffle),
+        ("add_to_queue", speaker_id, *first),
+        ("play_from_start", speaker_id),
+        *(("add_many_to_queue", speaker_id, list(more)) for more in rest),
     ]
 
 
@@ -685,7 +681,10 @@ class TestQueueServiceQueue:
         calls = queue_calls(household, monkeypatch)
 
         self.run(
-            queue, tasks, GARAGE, asked("artist", PROLIFIC, "play", order="oldest_first")
+            queue,
+            tasks,
+            GARAGE,
+            asked("artist", PROLIFIC, "play", order="oldest_first"),
         )
 
         assert calls == replaced(
@@ -790,6 +789,239 @@ class TestQueueServiceQueue:
         assert mirror.queue_position(GARAGE) == 1
 
 
+class Held:
+    """Holds the first call of one name the household gets until
+    ``release()``, as a speaker that takes its time to answer holds the task
+    that asks it; ``fail()`` releases it as a failure of the speaker."""
+
+    def __init__(
+        self, household: FakeSonosClient, monkeypatch: pytest.MonkeyPatch, name: str
+    ) -> None:
+        self._first = threading.Lock()
+        self._reached = threading.Event()
+        self._released = threading.Event()
+        self._failure: Exception | None = None
+        original = getattr(household, name)
+
+        def held(speaker_id: str, *args: object) -> None:
+            if self._first.acquire(blocking=False):
+                self._reached.set()
+                assert self._released.wait(5.0), "the call was not released"
+                if self._failure is not None:
+                    raise self._failure
+            original(speaker_id, *args)
+
+        monkeypatch.setattr(household, name, held)
+
+    def wait(self) -> None:
+        """Wait until the call is held."""
+        assert self._reached.wait(5.0), "no such call came to the household"
+
+    def release(self) -> None:
+        self._released.set()
+
+    def fail(self, failure: Exception) -> None:
+        self._failure = failure
+        self._released.set()
+
+
+@pytest.fixture
+def hold(
+    household: FakeSonosClient, monkeypatch: pytest.MonkeyPatch
+) -> Generator[Callable[[str], Held]]:
+    """Hold the first call of a name; whatever is still held is released
+    after the test, before the household closes."""
+    holds: list[Held] = []
+
+    def hold(name: str) -> Held:
+        holds.append(Held(household, monkeypatch, name))
+        return holds[-1]
+
+    try:
+        yield hold
+    finally:
+        for held in holds:
+            held.release()
+
+
+def completed(events: list[dict]) -> None:
+    """The task's events are those of a task that is done, as one a later
+    Play or Shuffle ended is: nothing failed."""
+    assert [(event["event_type"], event["data"]) for event in events] == [
+        ("task_started", None),
+        ("task_completed", {}),
+    ], events[-1]["data"]
+
+
+# The calls of an artist played, oldest first, up to the first sixteen of
+# its other albums: the call the tests hold.
+PROLIFIC_TO_THE_HELD_CALL = replaced(
+    False, ("album", PROLIFIC_ALBUMS[0]), PROLIFIC_ALBUMS[1:17]
+)
+PROLIFIC_TRACKS = [f"3{n:02}0" for n in range(18)]
+
+
+class TestQueueServiceQueueingInTurn:
+    """A group's queueing tasks run one at a time, in the order asked, and a
+    Play or a Shuffle ends what the tasks asked before it still had to
+    queue. Each test holds an artist that is still being queued at its
+    first call of sixteen albums."""
+
+    @pytest.fixture(autouse=True)
+    def items(self, library: FakePlexClient) -> FakePlexClient:
+        return library
+
+    @pytest.fixture
+    def artist(self, queue, hold, calls) -> tuple[str, Held]:
+        """The id of the task that queues the artist, held."""
+        held = hold("add_many_to_queue")
+        started = queue.queue(
+            GARAGE, asked("artist", PROLIFIC, "play", order="oldest_first")
+        )
+        held.wait()
+        return started.task_id, held
+
+    @pytest.fixture
+    def calls(self, household, monkeypatch) -> list[tuple[object, ...]]:
+        """Recorded before the artist is held, so in the order they land."""
+        return queue_calls(household, monkeypatch)
+
+    @pytest.mark.parametrize("action", ["play", "shuffle"])
+    def test_a_later_play_ends_what_the_running_task_still_had_to_queue(
+        self, queue, household, tasks, calls, artist, action
+    ):
+        artist_task, held = artist
+
+        later = queue.queue(GARAGE, asked("album", OLD_ALBUM, action))
+        tasks.started(later.task_id)
+        held.release()
+
+        completed(tasks.finish(artist_task))
+        completed(tasks.finish(later.task_id))
+        # The call that was under way lands, before the Play clears the
+        # queue; the artist's last album is never queued.
+        assert calls == [
+            *PROLIFIC_TO_THE_HELD_CALL,
+            *replaced(action == "shuffle", ("album", OLD_ALBUM)),
+        ]
+        assert sorted(keys(household, GARAGE)) == OLD_TRACKS
+        playback = household.read_playback(GARAGE)
+        assert playback.transport_state is TransportState.PLAYING
+        assert playback.shuffle is (action == "shuffle")
+
+    def test_adds_land_after_what_was_asked_before_them_in_that_order(
+        self, queue, household, tasks, calls, artist
+    ):
+        artist_task, held = artist
+
+        adds = [
+            queue.queue(GARAGE, asked(kind, item_id, "add"))
+            for kind, item_id in [
+                ("album", NEW_ALBUM),
+                ("track", "112"),
+                ("album", UNDATED_ALBUM),
+            ]
+        ]
+        for add in adds:
+            tasks.started(add.task_id)
+        held.release()
+
+        for task_id in [artist_task, *(add.task_id for add in adds)]:
+            completed(tasks.finish(task_id))
+        assert calls == [
+            *PROLIFIC_TO_THE_HELD_CALL,
+            ("add_many_to_queue", GARAGE, PROLIFIC_ALBUMS[17:]),
+            ("add_to_queue", GARAGE, "album", NEW_ALBUM),
+            ("add_to_queue", GARAGE, "track", "112"),
+            ("add_to_queue", GARAGE, "album", UNDATED_ALBUM),
+        ]
+        assert keys(household, GARAGE) == [
+            *PROLIFIC_TRACKS,
+            *NEW_TRACKS,
+            "112",
+            *UNDATED_TRACKS,
+        ]
+
+    def test_a_later_play_ends_the_tasks_still_waiting_at_once(
+        self, queue, household, tasks, calls, artist
+    ):
+        artist_task, held = artist
+        waiting = [
+            queue.queue(GARAGE, asked("album", NEW_ALBUM, "add")),
+            queue.queue(GARAGE, asked("track", "112", "play")),
+        ]
+        for task in waiting:
+            tasks.started(task.task_id)
+
+        later = queue.queue(GARAGE, asked("album", OLD_ALBUM, "play"))
+
+        # While the artist still holds its turn.
+        for task in waiting:
+            completed(tasks.finish(task.task_id))
+        held.release()
+        completed(tasks.finish(artist_task))
+        completed(tasks.finish(later.task_id))
+        assert calls == [
+            *PROLIFIC_TO_THE_HELD_CALL,
+            *replaced(False, ("album", OLD_ALBUM)),
+        ]
+        assert keys(household, GARAGE) == OLD_TRACKS
+
+    def test_a_task_that_fails_leaves_its_turn_to_the_next(
+        self, queue, household, tasks, artist
+    ):
+        artist_task, held = artist
+        later = queue.queue(GARAGE, asked("album", OLD_ALBUM, "add"))
+        tasks.started(later.task_id)
+
+        held.fail(
+            ExternalServiceException(
+                f"add 16 Plex items to the queue of speaker {GARAGE}", DID_NOT_ANSWER
+            )
+        )
+
+        assert tasks.finish(artist_task)[-1]["event_type"] == "task_failed"
+        completed(tasks.finish(later.task_id))
+        assert keys(household, GARAGE) == [PROLIFIC_TRACKS[0], *OLD_TRACKS]
+
+    def test_the_rooms_of_a_group_take_turns_on_its_queue(
+        self, queue, household, tasks, calls, hold
+    ):
+        household.join(KITCHEN, GARAGE)
+        household.settle()
+        held = hold("add_many_to_queue")
+        artist = queue.queue(
+            GARAGE, asked("artist", PROLIFIC, "play", order="oldest_first")
+        )
+        held.wait()
+
+        later = queue.queue(KITCHEN, asked("album", OLD_ALBUM, "play"))
+        tasks.started(later.task_id)
+        held.release()
+
+        completed(tasks.finish(artist.task_id))
+        completed(tasks.finish(later.task_id))
+        assert calls == [
+            *PROLIFIC_TO_THE_HELD_CALL,
+            *replaced(False, ("album", OLD_ALBUM), speaker_id=KITCHEN),
+        ]
+        assert keys(household, GARAGE) == OLD_TRACKS
+
+    def test_another_group_queues_while_one_is_still_queueing(
+        self, queue, household, tasks, artist
+    ):
+        artist_task, held = artist
+
+        lounge = queue.queue(LOUNGE, asked("album", OLD_ALBUM, "play"))
+
+        # While the Garage's artist still holds its turn.
+        completed(tasks.finish(lounge.task_id))
+        assert keys(household, LOUNGE) == OLD_TRACKS
+        held.release()
+        completed(tasks.finish(artist_task))
+        assert keys(household, GARAGE) == PROLIFIC_TRACKS
+
+
 class TestQueueServiceQueueRefusals:
     """What is refused before any task starts."""
 
@@ -805,7 +1037,7 @@ class TestQueueServiceQueueRefusals:
             household_mirror=container.household_mirror(),
             sonos_client=household,
             plex_client=container.plex_client(),
-            task_service=container.task_service(),
+            queueing_lanes=container.queueing_lanes(),
             playlist_max_tracks=3,
         )
 
@@ -989,11 +1221,14 @@ class TestQueueServiceQueueFailures:
         assert keys(household, GARAGE) == TRACKS
 
     def test_an_artist_plex_no_longer_has_fails_before_the_queue_changes(
-        self, app, household, plex
+        self, app, household, plex, tasks
     ):
+        lanes = app.container.queueing_lanes()
         task = QueueingTask(
             household,
             plex,
+            lanes,
+            GARAGE,
             GARAGE,
             PlexItemKind.ARTIST,
             "99",
@@ -1001,13 +1236,14 @@ class TestQueueServiceQueueFailures:
             "play",
             newest_first=True,
         )
-        handle = TaskProgressHandle(
-            "a-task", app.container.sse_connection_manager(), LOCAL_ADMIN_TARGET
+
+        started = lanes.start(GARAGE, task, replaces=True)
+        events = tasks.finish(started.task_id)
+
+        assert (events[-1]["event_type"], events[-1]["data"]) == (
+            "task_failed",
+            {"error": "Artist 99 was not found"},
         )
-
-        with pytest.raises(ItemNotFoundException, match="Artist 99 was not found"):
-            task.execute(handle)
-
         assert keys(household, GARAGE) == TRACKS
 
     def test_a_failure_of_the_soco_client_names_no_address(self, app, plex, tasks):
@@ -1022,9 +1258,12 @@ class TestQueueServiceQueueFailures:
             ),
             health_service=app.container.health_service(),
         )
+        lanes = app.container.queueing_lanes()
         task = QueueingTask(
             soco_client,
             plex,
+            lanes,
+            GARAGE,
             GARAGE,
             PlexItemKind.ALBUM,
             OLD_ALBUM,
@@ -1033,7 +1272,7 @@ class TestQueueServiceQueueFailures:
             newest_first=True,
         )
 
-        started = app.container.task_service().start_task(task)
+        started = lanes.start(GARAGE, task, replaces=True)
         (data,) = [
             event["data"]
             for event in tasks.finish(started.task_id, timeout=15.0)

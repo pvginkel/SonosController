@@ -17,6 +17,7 @@ from app.services.library_service import LibraryService
 from app.services.metrics_service import MetricsService
 from app.services.plex_client import PlexapiPlexClient
 from app.services.queue_service import QueueService
+from app.services.queueing_lanes import QueueingLanes
 from app.services.sonos_client import SoCoSonosClient
 from app.services.speaker_service import SpeakerService
 from app.services.sse_connection_manager import SSEConnectionManager
@@ -162,13 +163,16 @@ class ServiceContainer(containers.DeclarativeContainer):
         sonos_client=sonos_client,
     )
 
+    # Queueing lanes - each group's queueing tasks, one at a time in order
+    queueing_lanes = providers.Singleton(QueueingLanes, task_service=task_service)
+
     # Queue service - a group's queue, read from and changed on the speaker
     queue_service = providers.Factory(
         QueueService,
         household_mirror=household_mirror,
         sonos_client=sonos_client,
         plex_client=plex_client,
-        task_service=task_service,
+        queueing_lanes=queueing_lanes,
         playlist_max_tracks=app_config.provided.playlist_max_tracks,
     )
 

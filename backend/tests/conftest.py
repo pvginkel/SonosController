@@ -233,37 +233,50 @@ class EventStream:
 
 class TaskWatch:
     """The events of the tasks a test starts, as a connection to the event
-    stream receives them, which every task's events reach."""
+    stream receives them, which every task's events reach. Each task's are
+    kept apart, so a test can wait for the tasks it runs side by side in any
+    order."""
 
     def __init__(self, connection: SSEConnection, task_service: TaskService) -> None:
         self._connection = connection
         self._task_service = task_service
+        self._events: dict[str, list[dict[str, Any]]] = {}
         self._finished: list[str] = []
+
+    def started(self, task_id: str, timeout: float = 5.0) -> None:
+        """Wait for the task's ``task_started``: a worker runs it."""
+        self._wait(task_id, ("task_started",), timeout)
 
     def finish(self, task_id: str, timeout: float = 5.0) -> list[dict[str, Any]]:
         """Wait for the task's last event, ``task_completed`` or
         ``task_failed``, and answer the task's events up to it, each the
         payload of a ``task_event``; the stream's other events are passed
         over."""
+        events = self._wait(task_id, ("task_completed", "task_failed"), timeout)
+        self._finished.append(task_id)
+        return events
+
+    def _wait(
+        self, task_id: str, event_types: tuple[str, ...], timeout: float
+    ) -> list[dict[str, Any]]:
         deadline = time.perf_counter() + timeout
-        events: list[dict[str, Any]] = []
-        while True:
+        events = self._events.setdefault(task_id, [])
+        while not any(event["event_type"] in event_types for event in events):
             try:
                 frame = self._connection.next_frame(
                     max(0.0, deadline - time.perf_counter())
                 )
             except Empty:
-                pytest.fail(f"Task {task_id} did not end within {timeout} s")
+                pytest.fail(
+                    f"Task {task_id} sent no {' or '.join(event_types)} "
+                    f"within {timeout} s"
+                )
             assert frame is not None, "the connection was closed"
             message = json.loads(frame.removeprefix("data: "))
-            if message["type"] != "task_event":
-                continue
-            if message["payload"]["task_id"] != task_id:
-                continue
-            events.append(message["payload"])
-            if message["payload"]["event_type"] in ("task_completed", "task_failed"):
-                self._finished.append(task_id)
-                return events
+            if message["type"] == "task_event":
+                payload = message["payload"]
+                self._events.setdefault(payload["task_id"], []).append(payload)
+        return events
 
     def remove_finished(self) -> None:
         for task_id in self._finished:
@@ -274,17 +287,21 @@ class TaskWatch:
 def tasks(app: Flask) -> Generator[TaskWatch]:
     """Wait for the tasks a test starts. The connection it watches on is
     opened before the test starts any, and the tasks that ended are removed
-    from the task service, which lives for the whole run."""
-    manager = app.container.sse_connection_manager()
+    from the task service, which lives for the whole run. The container's
+    queueing lanes are reset after the test, so that no task it left takes a
+    turn before the next test's."""
+    container = app.container
+    manager = container.sse_connection_manager()
     connection = manager.on_connect(
         f"tasks-{uuid.uuid4()}", "local-user", local_admin=True
     )
-    watch = TaskWatch(connection, app.container.task_service())
+    watch = TaskWatch(connection, container.task_service())
     try:
         yield watch
     finally:
         manager.on_disconnect(connection)
         watch.remove_finished()
+        container.queueing_lanes.reset()
 
 
 @pytest.fixture

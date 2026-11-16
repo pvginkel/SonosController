@@ -10,13 +10,15 @@ identifier of the configured Plex server: it gets its rating key and Plex's
 picture, and every other entry neither. Every string is Unicode NFC.
 
 An item of the library is queued by a task, as containers of the Plex
-service linked in Sonos (sections 1.3 to 1.5).
+service linked in Sonos (sections 1.3 to 1.5). A group's queueing tasks take
+their turns in its lane (``QueueingLanes``).
 """
 
 import logging
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 from app.core_exceptions import ExternalServiceException
@@ -36,6 +38,7 @@ from app.schemas.task_schema import TaskStartResponse
 from app.services.base_task import BaseTask, ProgressHandle
 from app.services.household_mirror import HouseholdMirror
 from app.services.plex_client import PlexClient
+from app.services.queueing_lanes import QueueingLanes
 from app.services.sonos_client import (
     ADD_MANY_LIMIT,
     PlexItem,
@@ -43,7 +46,6 @@ from app.services.sonos_client import (
     SonosClient,
     Track,
 )
-from app.services.task_service import TaskService
 from app.utils.artwork_id import plex_artwork_id
 from app.utils.plex_library import PlexAlbum, PlexArtist, PlexPlaylist, PlexTrack
 from app.utils.plex_queue_entry import parse_plex_queue_entry
@@ -82,13 +84,13 @@ class QueueService:
         household_mirror: HouseholdMirror,
         sonos_client: SonosClient,
         plex_client: PlexClient,
-        task_service: TaskService,
+        queueing_lanes: QueueingLanes,
         playlist_max_tracks: int,
     ) -> None:
         self._mirror = household_mirror
         self._sonos = sonos_client
         self._plex = plex_client
-        self._tasks = task_service
+        self._lanes = queueing_lanes
         self._playlist_max_tracks = playlist_max_tracks
 
     def list_queue(self, speaker_id: str, query: QueueListQuerySchema) -> QueueListing:
@@ -138,8 +140,10 @@ class QueueService:
         on the room's group.
 
         The room is read from the mirror and the item from Plex, as it is
-        now; nothing is asked of a speaker before the task runs. The task's
-        events go to every connection (``docs/api-design.md`` section 4).
+        now; nothing is asked of a speaker before the task runs. The task
+        takes its turn on the group after every task asked before it, and a
+        Play or a Shuffle ends those. The task's events go to every
+        connection (``docs/api-design.md`` section 4).
 
         Raises:
             SpeakerNotFoundException: The household has no such room.
@@ -148,11 +152,13 @@ class QueueService:
                 more than ``PLAYLIST_MAX_TRACKS``.
             ExternalServiceException: Plex failed.
         """
-        self._mirror.speaker(speaker_id)
+        group_id = self._mirror.speaker(speaker_id).group.coordinator_id
         title = self._title(request.kind, request.item_id)
         task = QueueingTask(
             self._sonos,
             self._plex,
+            self._lanes,
+            group_id,
             speaker_id,
             PlexItemKind(request.kind),
             request.item_id,
@@ -160,9 +166,7 @@ class QueueService:
             request.action,
             newest_first=request.order == "newest_first",
         )
-        # The app has no users: the task's events go to the local admin,
-        # which every connection is (SSE-3).
-        return self._tasks.start_task(task, caller_subject=None)
+        return self._lanes.start(group_id, task, replaces=request.action != "add")
 
     def _title(self, kind: QueueItemKind, item_id: str) -> str:
         """The item's title, once Plex has the item and it can be queued."""
@@ -225,12 +229,17 @@ class QueueingTask(BaseTask):
     added: its albums, in release order, the first alone and the rest
     ``ADD_MANY_LIMIT`` a call. Plex is read before the queue changes. A
     failure ends the task where it is, the queue as far as it got.
+
+    The task runs in its turn in the group's lane. A task a later Play or
+    Shuffle ends stops before its next call to the speaker and returns.
     """
 
     def __init__(
         self,
         sonos_client: SonosClient,
         plex_client: PlexClient,
+        queueing_lanes: QueueingLanes,
+        group_id: str,
         speaker_id: str,
         kind: PlexItemKind,
         rating_key: str,
@@ -241,6 +250,8 @@ class QueueingTask(BaseTask):
         super().__init__()
         self._sonos = sonos_client
         self._plex = plex_client
+        self._lanes = queueing_lanes
+        self._group_id = group_id
         self._speaker_id = speaker_id
         self._kind = kind
         self._rating_key = rating_key
@@ -251,32 +262,67 @@ class QueueingTask(BaseTask):
     def execute(
         self, progress_handle: ProgressHandle, **kwargs: Any
     ) -> QueueTaskResultSchema:
-        """Queue the item.
+        """Queue the item, in the task's turn on the group.
+
+        A task that was ended makes no call from then on, and returns as one
+        that is done.
 
         Raises:
             ItemNotFoundException: Plex no longer has the artist.
             InvalidOperationException: Plex has no albums of the artist.
             ExternalServiceException: Plex or the speaker failed.
         """
-        first, *rest = self._containers()
+        with self._lanes.turn(self._group_id, self):
+            if not self.is_cancelled:
+                self._queue()
+        return QueueTaskResultSchema()
+
+    def _queue(self) -> None:
+        calls = self._calls(self._containers())
+        for done, call in enumerate(calls):
+            if self.is_cancelled:
+                logger.info(
+                    "Queueing %s %s on speaker %s was ended after %d of its %d calls",
+                    self._kind.value,
+                    self._rating_key,
+                    self._speaker_id,
+                    done,
+                    len(calls),
+                )
+                return
+            call()
+
+    def _calls(self, containers: list[PlexItem]) -> list[Callable[[], None]]:
+        """The calls to the speaker that queue the containers, in order."""
+        first, *rest = containers
+        sonos = self._sonos
         speaker_id = self._speaker_id
         replaces = self._action != "add"
+        calls: list[Callable[[], None]] = []
         if replaces:
-            self._sonos.clear_queue(speaker_id)
-            # A speaker refuses shuffle while a stream is its source (UPnP
-            # error 712), and clearing the queue leaves a stream playing.
-            self._sonos.select_queue(speaker_id)
-            # The mode first: the speaker draws what it queues with shuffle
-            # on into the play order (docs/api-design.md section 1.5).
-            self._sonos.set_shuffle(speaker_id, self._action == "shuffle")
-        self._sonos.add_to_queue(speaker_id, first)
+            calls += [
+                partial(sonos.clear_queue, speaker_id),
+                # A speaker refuses shuffle while a stream is its source
+                # (UPnP error 712), and clearing the queue leaves a stream
+                # playing.
+                partial(sonos.select_queue, speaker_id),
+                # The mode first: the speaker draws what it queues with
+                # shuffle on into the play order (docs/api-design.md
+                # section 1.5).
+                partial(sonos.set_shuffle, speaker_id, self._action == "shuffle"),
+            ]
+        calls.append(partial(sonos.add_to_queue, speaker_id, first))
         if replaces:
-            self._sonos.play_from_start(speaker_id)
-        for start in range(0, len(rest), ADD_MANY_LIMIT):
-            self._sonos.add_many_to_queue(
-                speaker_id, rest[start : start + ADD_MANY_LIMIT]
+            calls.append(partial(sonos.play_from_start, speaker_id))
+        calls += [
+            partial(
+                sonos.add_many_to_queue,
+                speaker_id,
+                rest[start : start + ADD_MANY_LIMIT],
             )
-        return QueueTaskResultSchema()
+            for start in range(0, len(rest), ADD_MANY_LIMIT)
+        ]
+        return calls
 
     def _containers(self) -> list[PlexItem]:
         server = self._plex.machine_identifier()
