@@ -1,9 +1,10 @@
-"""Commands to the speakers: playback and volume.
+"""Commands to the speakers: groups, playback and volume.
 
-``docs/api-design.md`` sections 3.2 and 3.3. Whether a speaker exists and
-what it allows now is read from the household mirror; the command itself goes
-through the Sonos client, which sends a playback command to the coordinator
-of the speaker's group. Nothing is changed in the mirror: the speaker's event
+``docs/api-design.md`` sections 3.1 to 3.3. Whether a speaker exists, what
+it allows now and which group it plays in is read from the household mirror;
+the command itself goes through the Sonos client, which sends a playback
+command to the coordinator of the speaker's group, and a join or a leave to
+the speaker that moves. Nothing is changed in the mirror: the speaker's event
 brings the change there.
 """
 
@@ -61,6 +62,40 @@ class SpeakerService:
                 self._send[command](speaker_id)
                 return
         raise ActionNotAvailableException(f"{described} speaker {speaker_id}")
+
+    def join_group(self, speaker_id: str, member_id: str) -> None:
+        """Have the speaker join the group another speaker plays in.
+
+        Nothing is sent when the speaker plays in that group already, by
+        what the mirror holds: ``member_id`` is the speaker itself or a
+        speaker of its group.
+
+        Args:
+            member_id: Any speaker of the group to join.
+
+        Raises:
+            SpeakerNotFoundException: The household has no speaker
+                ``speaker_id``, or none ``member_id``.
+            ExternalServiceException: The speaker failed.
+        """
+        self._mirror.speaker(speaker_id)
+        if speaker_id in self._mirror.speaker(member_id).group.member_ids:
+            return
+        self._sonos.join(speaker_id, member_id)
+
+    def leave_group(self, speaker_id: str) -> None:
+        """Have the speaker leave its group and play alone.
+
+        Nothing is sent when the speaker is alone in its group already, by
+        what the mirror holds.
+
+        Raises:
+            SpeakerNotFoundException: The household has no such speaker.
+            ExternalServiceException: The speaker failed.
+        """
+        if self._mirror.speaker(speaker_id).group.member_ids == (speaker_id,):
+            return
+        self._sonos.unjoin(speaker_id)
 
     def change_volume(
         self,

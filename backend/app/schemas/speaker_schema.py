@@ -1,5 +1,5 @@
-"""The speakers and their volume, as the API answers and takes them
-(``docs/api-design.md`` sections 3.1 and 3.3)."""
+"""The speakers, their groups and their volume, as the API answers and takes
+them (``docs/api-design.md`` sections 3.1 and 3.3)."""
 
 from typing import Self
 
@@ -65,6 +65,22 @@ class SpeakerListSchema(BaseModel):
     data: list[SpeakerSchema] = Field(
         description=(
             "Every speaker, by name. Empty while no speaker answers the backend."
+        )
+    )
+
+
+class GroupJoinSchema(BaseModel):
+    """The group a speaker is to join, named by any speaker that plays in
+    it.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    speaker_id: str = Field(
+        description=(
+            "The `id` of a speaker of the group to join: its coordinator or "
+            "any other speaker of it. A speaker that plays alone is a group "
+            "of one, so this is also how two speakers start a group."
         )
     )
 

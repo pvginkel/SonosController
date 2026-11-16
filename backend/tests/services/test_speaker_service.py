@@ -4,6 +4,8 @@ The service runs on the fake Sonos client and the real household mirror.
 """
 
 import logging
+import threading
+from collections.abc import Callable
 
 import pytest
 from flask import Flask
@@ -11,13 +13,14 @@ from flask import Flask
 from app.core_exceptions import ExternalServiceException
 from app.exceptions import ActionNotAvailableException, SpeakerNotFoundException
 from app.services.household_mirror import HouseholdMirror, PlaybackAction
-from app.services.sonos_client import TransportState, Volume
+from app.services.sonos_client import Group, TransportState, Volume
 from app.services.speaker_service import SpeakerService
 from tests.fakes.plex_client import FakePlexClient
 from tests.fakes.sonos_client import FakeSonosClient, queue_track
 
 GARAGE = "RINCON_FAKE0000000101400"
 LOUNGE = "RINCON_FAKE0000000201400"
+KITCHEN = "RINCON_FAKE0000000301400"
 NOWHERE = "RINCON_FAKE0000000991400"
 
 PLAY = PlaybackAction.PLAY
@@ -31,6 +34,27 @@ DID_NOT_ANSWER = "the speaker did not answer (ConnectTimeout)"
 def _audible(volume: Volume) -> int:
     """How loud a speaker plays at a volume and mute: muted, not at all."""
     return 0 if volume.muted else volume.volume
+
+
+def calls_from_here(
+    household: FakeSonosClient, before_first: Callable[[], None] | None = None
+) -> list[str]:
+    """The room of each call the test's thread makes to a speaker from here
+    on, as they come. The mirror's reads of a room whose group changed are
+    made on its own threads and are not among them. ``before_first`` happens
+    in the household before the first call."""
+    thread = threading.current_thread()
+    reached: list[str] = []
+
+    def before_call(speaker_id: str) -> None:
+        if threading.current_thread() is not thread:
+            return
+        reached.append(speaker_id)
+        if before_first is not None and len(reached) == 1:
+            before_first()
+
+    household.before_call = before_call
+    return reached
 
 
 @pytest.fixture
@@ -316,4 +340,188 @@ class TestSpeakerServiceGroupVolume:
             household.answer_again(GARAGE)
 
         assert raised.value.operation == f"change the group volume of speaker {GARAGE}"
+        assert raised.value.cause == DID_NOT_ANSWER
+
+
+class TestSpeakerServiceGroups:
+    @pytest.fixture
+    def three_rooms(self, household):
+        """The household with a Kitchen, mirrored."""
+        household.add_room(KITCHEN, "Kitchen", model="One", volume=60)
+        household.settle()
+        return household
+
+    def test_a_speaker_joins_the_group_of_another(self, speakers, household):
+        sent = calls_from_here(household)
+
+        speakers.join_group(LOUNGE, GARAGE)
+
+        assert household.read_household().groups == (Group(GARAGE, (GARAGE, LOUNGE)),)
+        assert sent == [LOUNGE]
+
+    def test_the_group_is_named_by_any_speaker_of_it(self, speakers, three_rooms):
+        three_rooms.join(LOUNGE, GARAGE)
+        three_rooms.settle()
+
+        speakers.join_group(KITCHEN, LOUNGE)
+
+        assert three_rooms.read_household().groups == (
+            Group(GARAGE, (GARAGE, LOUNGE, KITCHEN)),
+        )
+
+    def test_a_speaker_moves_from_one_group_to_another(self, speakers, three_rooms):
+        three_rooms.join(LOUNGE, GARAGE)
+        three_rooms.settle()
+
+        speakers.join_group(LOUNGE, KITCHEN)
+
+        assert three_rooms.read_household().groups == (
+            Group(GARAGE, (GARAGE,)),
+            Group(KITCHEN, (LOUNGE, KITCHEN)),
+        )
+
+    def test_a_coordinator_joins_another_group(self, speakers, three_rooms):
+        three_rooms.join(LOUNGE, GARAGE)
+        three_rooms.settle()
+
+        speakers.join_group(GARAGE, KITCHEN)
+
+        assert three_rooms.read_household().groups == (
+            Group(LOUNGE, (LOUNGE,)),
+            Group(KITCHEN, (GARAGE, KITCHEN)),
+        )
+
+    @pytest.mark.parametrize(
+        ("speaker_id", "member_id"),
+        [
+            pytest.param(LOUNGE, LOUNGE, id="the speaker itself"),
+            pytest.param(LOUNGE, GARAGE, id="the coordinator of its group"),
+            pytest.param(GARAGE, LOUNGE, id="a speaker of the group it leads"),
+            pytest.param(GARAGE, GARAGE, id="the coordinator itself"),
+            pytest.param(KITCHEN, KITCHEN, id="a speaker alone, itself"),
+        ],
+    )
+    def test_a_join_to_the_group_the_speaker_plays_in_sends_nothing(
+        self, speakers, three_rooms, speaker_id, member_id
+    ):
+        three_rooms.join(LOUNGE, GARAGE)
+        three_rooms.settle()
+        sent = calls_from_here(three_rooms)
+
+        speakers.join_group(speaker_id, member_id)
+
+        assert sent == []
+
+    def test_the_group_a_speaker_plays_in_is_what_the_mirror_holds(
+        self, speakers, household
+    ):
+        # The Lounge joined the Garage elsewhere, and the event that says so
+        # has not arrived: the join is sent all the same.
+        sent = calls_from_here(household, lambda: household.join(LOUNGE, GARAGE))
+
+        speakers.join_group(LOUNGE, GARAGE)
+
+        assert sent == [LOUNGE]
+
+    @pytest.mark.parametrize(
+        ("speaker_id", "member_id", "unknown"),
+        [
+            pytest.param(NOWHERE, GARAGE, NOWHERE, id="the speaker that joins"),
+            pytest.param(LOUNGE, NOWHERE, NOWHERE, id="the speaker of the group"),
+            pytest.param(NOWHERE, "Garage", NOWHERE, id="both, the first named"),
+        ],
+    )
+    def test_an_unknown_speaker_is_not_found_and_nothing_is_sent(
+        self, speakers, household, speaker_id, member_id, unknown
+    ):
+        sent = calls_from_here(household)
+
+        with pytest.raises(SpeakerNotFoundException) as raised:
+            speakers.join_group(speaker_id, member_id)
+
+        assert raised.value.message == f"Speaker {unknown} was not found"
+        assert sent == []
+
+    def test_a_speaker_that_does_not_answer_fails_the_join(self, speakers, household):
+        household.silence_room(LOUNGE)
+        try:
+            with pytest.raises(ExternalServiceException) as raised:
+                speakers.join_group(LOUNGE, GARAGE)
+        finally:
+            household.answer_again(LOUNGE)
+
+        assert raised.value.operation == (
+            f"join the group of speaker {GARAGE} with speaker {LOUNGE}"
+        )
+        assert raised.value.cause == DID_NOT_ANSWER
+
+    def test_a_speaker_leaves_its_group(self, speakers, household):
+        household.join(LOUNGE, GARAGE)
+        household.settle()
+        sent = calls_from_here(household)
+
+        speakers.leave_group(LOUNGE)
+
+        assert household.read_household().groups == (
+            Group(GARAGE, (GARAGE,)),
+            Group(LOUNGE, (LOUNGE,)),
+        )
+        assert sent == [LOUNGE]
+
+    def test_a_coordinator_leaves_the_group_it_leads(self, speakers, three_rooms):
+        three_rooms.join(LOUNGE, GARAGE)
+        three_rooms.join(KITCHEN, GARAGE)
+        three_rooms.settle()
+
+        speakers.leave_group(GARAGE)
+
+        assert three_rooms.read_household().groups == (
+            Group(GARAGE, (GARAGE,)),
+            Group(LOUNGE, (LOUNGE, KITCHEN)),
+        )
+
+    def test_a_leave_by_a_speaker_alone_sends_nothing(self, speakers, household):
+        sent = calls_from_here(household)
+
+        speakers.leave_group(LOUNGE)
+
+        assert sent == []
+        assert household.read_household().groups == (
+            Group(GARAGE, (GARAGE,)),
+            Group(LOUNGE, (LOUNGE,)),
+        )
+
+    def test_whether_a_speaker_is_alone_is_what_the_mirror_holds(
+        self, speakers, household
+    ):
+        household.join(LOUNGE, GARAGE)
+        household.settle()
+        # The Lounge left the group elsewhere, and the event that says so has
+        # not arrived: the leave is sent all the same.
+        sent = calls_from_here(household, lambda: household.unjoin(LOUNGE))
+
+        speakers.leave_group(LOUNGE)
+
+        assert sent == [LOUNGE]
+
+    def test_a_leave_by_an_unknown_speaker_is_not_found(self, speakers, household):
+        sent = calls_from_here(household)
+
+        with pytest.raises(SpeakerNotFoundException) as raised:
+            speakers.leave_group(NOWHERE)
+
+        assert raised.value.message == f"Speaker {NOWHERE} was not found"
+        assert sent == []
+
+    def test_a_speaker_that_does_not_answer_fails_the_leave(self, speakers, household):
+        household.join(LOUNGE, GARAGE)
+        household.settle()
+        household.silence_room(LOUNGE)
+        try:
+            with pytest.raises(ExternalServiceException) as raised:
+                speakers.leave_group(LOUNGE)
+        finally:
+            household.answer_again(LOUNGE)
+
+        assert raised.value.operation == f"ungroup speaker {LOUNGE}"
         assert raised.value.cause == DID_NOT_ANSWER

@@ -1,5 +1,5 @@
-"""The speakers and their volume (``docs/api-design.md`` sections 3.1 and
-3.3)."""
+"""The speakers, their groups and their volume (``docs/api-design.md``
+sections 3.1 and 3.3)."""
 
 from dependency_injector.wiring import Provide, inject
 from flask import Blueprint, Response, jsonify, request
@@ -7,6 +7,7 @@ from spectree import Response as SpectreeResponse
 
 from app.schemas.common import ApiErrorResponseSchema
 from app.schemas.speaker_schema import (
+    GroupJoinSchema,
     SpeakerListSchema,
     SpeakerSchema,
     VolumeChangeSchema,
@@ -82,6 +83,83 @@ def get_speaker(
     """
     speaker = SpeakerSchema.model_validate(household_mirror.speaker(speaker_id))
     return jsonify(speaker.model_dump(mode="json"))
+
+
+@speakers_bp.route("/<speaker_id>/group", methods=["PUT"])
+@api.validate(
+    json=GroupJoinSchema,
+    resp=SpectreeResponse(
+        HTTP_204=(
+            None,
+            "The speaker took the command, or plays in that group already.",
+        ),
+        HTTP_400=(
+            ApiErrorResponseSchema,
+            "The body is not a JSON object that holds `speaker_id`, a string, "
+            "and nothing else.",
+        ),
+        HTTP_404=(
+            ApiErrorResponseSchema,
+            "No speaker has the id in the path, or none the `speaker_id` of "
+            "the body. The code is `SPEAKER_NOT_FOUND`.",
+        ),
+        HTTP_502=(ApiErrorResponseSchema, SPEAKER_FAILED),
+    ),
+    path_parameter_descriptions=SPEAKER_ID_PARAMETER,
+)
+@inject
+def join_group(
+    speaker_id: str,
+    speaker_service: SpeakerService = Provide[ServiceContainer.speaker_service],
+) -> tuple[str, int]:
+    """Have the speaker join another speaker's group.
+
+    The speaker in the path moves: it leaves the group it plays in and
+    plays what the group of the body's speaker plays, at its own volume.
+    That group keeps its coordinator. A speaker that already plays in that
+    group stays as it is.
+
+    The answer says that the speaker took the command, not that the group
+    has changed: `GET /api/speakers` shows the old groups until the speakers
+    have reported the new ones. The event `speakers_changed` says that they
+    have, with `volume_changed` for every speaker whose group changed and
+    `playback_changed` for every speaker that now plays something else.
+    """
+    join = GroupJoinSchema.model_validate(request.get_json())
+    speaker_service.join_group(speaker_id, join.speaker_id)
+    return "", 204
+
+
+@speakers_bp.route("/<speaker_id>/group", methods=["DELETE"])
+@api.validate(
+    resp=SpectreeResponse(
+        HTTP_204=(
+            None,
+            "The speaker took the command, or plays alone already.",
+        ),
+        HTTP_404=(ApiErrorResponseSchema, SPEAKER_NOT_FOUND),
+        HTTP_502=(ApiErrorResponseSchema, SPEAKER_FAILED),
+    ),
+    path_parameter_descriptions=SPEAKER_ID_PARAMETER,
+)
+@inject
+def leave_group(
+    speaker_id: str,
+    speaker_service: SpeakerService = Provide[ServiceContainer.speaker_service],
+) -> tuple[str, int]:
+    """Have the speaker leave its group and play alone.
+
+    The other speakers of the group go on as a group. A speaker that
+    already plays alone stays as it is.
+
+    The answer says that the speaker took the command, not that the group
+    has changed: `GET /api/speakers` shows the old groups until the speakers
+    have reported the new ones. The event `speakers_changed` says that they
+    have, with `volume_changed` for every speaker whose group changed and
+    `playback_changed` for every speaker that now plays something else.
+    """
+    speaker_service.leave_group(speaker_id)
+    return "", 204
 
 
 @speakers_bp.route("/<speaker_id>/volume", methods=["POST"])
