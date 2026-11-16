@@ -26,14 +26,25 @@ BJORK = "5002"
 AMNESIAC = "5101"
 AMNESIAC_AGAIN = "5102"
 HOMOGENIC = "5103"
+KID_A = "5104"
 TRACK = "5201"
 ROAD_TRIP = "5301"
+# Where Plex has an item it sees as new.
+MOVED = "5901"
 
 AMNESIAC_GUID = "plex://album/5d07amnesiac"
+KID_A_GUID = "local://5104"
+VENTOLIN_GUID = "plex://album/5d07ventolin"
+
+# "Homogénic" as Plex may give it, and in NFC.
+HOMOGENIC_DECOMPOSED = "Homoge\u0301nic"
+HOMOGENIC_COMPOSED = "Homog\u00e9nic"
 
 # "Björk" as Plex may give it: the letter, then its accent.
 BJORK_DECOMPOSED = "Björk"
 BJORK_COMPOSED = "Björk"
+SIGUR_ROS_DECOMPOSED = "Sigur Ro\u0301s"
+SIGUR_ROS_COMPOSED = "Sigur R\u00f3s"
 
 # Small pictures: the fake's default ones are large (card SCTL-14).
 SMALL = (16, 16)
@@ -55,7 +66,7 @@ def library(plex: FakePlexClient) -> FakePlexClient:
             guid=AMNESIAC_GUID,
         )
     plex.add_track(AMNESIAC, TRACK)
-    plex.add_album(HOMOGENIC, [], size=None, artist=BJORK, title="Homogénic")
+    plex.add_album(HOMOGENIC, [], size=None, artist=BJORK, title=HOMOGENIC_DECOMPOSED)
     plex.add_playlist(ROAD_TRIP, "Road trip", 148, size=SMALL)
     return plex
 
@@ -194,10 +205,10 @@ class TestFavouriteService:
         album, _ = service.mark(ItemKind.ALBUM, HOMOGENIC)
 
         assert artist.title == BJORK_COMPOSED
-        assert (album.title, album.subtitle) == ("Homogénic", BJORK_COMPOSED)
+        assert (album.title, album.subtitle) == (HOMOGENIC_COMPOSED, BJORK_COMPOSED)
         assert [row[3:] for row in stored(session)] == [
             (BJORK_DECOMPOSED, None),
-            ("Homogénic", BJORK_DECOMPOSED),
+            (HOMOGENIC_DECOMPOSED, BJORK_DECOMPOSED),
         ]
 
     def test_the_artwork_id_is_the_one_the_library_carries(
@@ -318,7 +329,7 @@ class TestListFavourites:
         assert listed == [served for served, _ in marks]
         assert total == 4
         album = listed[3]
-        assert (album.title, album.subtitle) == ("Homogénic", BJORK_COMPOSED)
+        assert (album.title, album.subtitle) == (HOMOGENIC_COMPOSED, BJORK_COMPOSED)
         assert all(favourite.available for favourite in listed)
 
     def test_a_playlist_carries_the_artwork_id_the_list_of_playlists_carries(
@@ -359,8 +370,8 @@ class TestListFavourites:
         assert service.list_favourites(query(page=2)) == ([], 1)
         assert plex.requests == []
 
-    def test_a_favourite_plex_has_not_at_its_rating_key_is_served_as_stored_and_kept(
-        self, service, session, library
+    def test_a_favourite_plex_has_nowhere_is_served_as_stored_and_kept(
+        self, service, session, library, plex
     ):
         favourites = [
             # Another release is at the album's rating key.
@@ -368,14 +379,14 @@ class TestListFavourites:
                 session,
                 ItemKind.ALBUM,
                 AMNESIAC,
-                "Amnesiac",
-                guid="plex://album/another",
+                "Kid A",
+                guid="plex://album/kid-a",
                 artist_title="Radiohead",
             ),
             # An album is at the artist's rating key, with the artist's guid.
             store(session, ItemKind.ARTIST, AMNESIAC, "Amnesiac", guid=AMNESIAC_GUID),
             # A track is at the playlist's.
-            store(session, ItemKind.PLAYLIST, TRACK, "Road trip"),
+            store(session, ItemKind.PLAYLIST, TRACK, "Long drive"),
             # Nothing is at the album's.
             store(
                 session,
@@ -386,6 +397,7 @@ class TestListFavourites:
             ),
         ]
         before = stored(session)
+        plex.requests.clear()
 
         listed, total = service.list_favourites(query())
 
@@ -397,15 +409,27 @@ class TestListFavourites:
         ]
         assert total == 4
         assert stored(session) == before
+        # Each is looked for by its guid and by its titles.
+        assert plex.requests == [
+            "read 3 Plex items",
+            "find the Plex albums with guid plex://album/kid-a",
+            "find the Plex albums titled 'Kid A'",
+            f"find the Plex artists with guid {AMNESIAC_GUID}",
+            "find the Plex artists titled 'Amnesiac'",
+            f"find the Plex playlists with guid com.plexapp.agents.none://{TRACK}",
+            "find the Plex playlists titled 'Long drive'",
+            "find the Plex albums with guid plex://album/9999",
+            "find the Plex albums titled 'Vespertine'",
+        ]
 
     def test_the_titles_of_a_favourite_not_found_are_served_in_nfc(
         self, service, session, library
     ):
-        store(session, ItemKind.ARTIST, "9998", BJORK_DECOMPOSED)
+        store(session, ItemKind.ARTIST, "9998", SIGUR_ROS_DECOMPOSED)
 
         (listed,), _ = service.list_favourites(query())
 
-        assert listed.title == BJORK_COMPOSED
+        assert listed.title == SIGUR_ROS_COMPOSED
 
     def test_while_plex_fails_the_page_is_served_from_the_store(
         self, service, session, library, caplog
@@ -475,6 +499,330 @@ class TestListFavourites:
         in_order = [abba, album, playlist, bjork, bjorn, echoes, zappa]
         assert [favourite.id for favourite in ascending] == in_order
         assert [favourite.id for favourite in descending] == in_order[::-1]
+
+
+class TestFindingAgain:
+    """A favourite its rating key no longer finds (``docs/api-design.md``
+    section 5, decision 2)."""
+
+    @pytest.mark.parametrize(
+        ("kind", "rating_key", "noun"),
+        [
+            (ItemKind.ARTIST, RADIOHEAD, "artists"),
+            (ItemKind.ALBUM, HOMOGENIC, "albums"),
+            (ItemKind.PLAYLIST, ROAD_TRIP, "playlists"),
+        ],
+    )
+    def test_an_item_plex_moved_is_found_by_its_guid_and_brought_up_to_date(
+        self, service, session, library, kind, rating_key, noun
+    ):
+        service.mark(kind, rating_key)
+        ((_, guid, _, title, artist_title),) = stored(session)
+        library.move(rating_key, MOVED)
+        library.requests.clear()
+
+        (listed,), total = service.list_favourites(query())
+
+        assert library.requests == [
+            "read 1 Plex items",
+            f"find the Plex {noun} with guid {guid}",
+        ]
+        assert (listed.item_id, listed.available, total) == (MOVED, True, 1)
+        assert stored(session) == [(kind, guid, MOVED, title, artist_title)]
+        # The next listing finds it at its rating key.
+        library.requests.clear()
+        assert service.list_favourites(query()) == ([listed], 1)
+        assert library.requests == ["read 1 Plex items"]
+        # As a mark of the item answers it.
+        assert service.mark(kind, MOVED) == (listed, False)
+
+    def test_an_item_plex_moved_and_retitled_has_its_titles_brought_up_to_date(
+        self, service, session, library
+    ):
+        marked, _ = service.mark(ItemKind.ALBUM, HOMOGENIC)
+        library.move(BJORK, "5009", title="Bjork")
+        library.move(HOMOGENIC, MOVED, title="Homogenic")
+
+        (listed,), _ = service.list_favourites(query())
+
+        assert (listed.id, listed.item_id, listed.title, listed.subtitle) == (
+            marked.id,
+            MOVED,
+            "Homogenic",
+            "Bjork",
+        )
+        assert stored(session) == [
+            (ItemKind.ALBUM, f"plex://album/{HOMOGENIC}", MOVED, "Homogenic", "Bjork")
+        ]
+
+    def test_of_the_items_with_its_guid_the_first_with_its_titles_is_found(
+        self, service, session, library
+    ):
+        favourite = store(
+            session,
+            ItemKind.ALBUM,
+            "9999",
+            "Ventolin",
+            guid=VENTOLIN_GUID,
+            artist_title="Radiohead",
+        )
+        for rating_key, title, artist in [
+            ("5911", "Ventolin EP", RADIOHEAD),
+            ("5912", "Ventolin", BJORK),
+            ("5913", "Ventolin", RADIOHEAD),
+            ("5914", "Ventolin", RADIOHEAD),
+        ]:
+            library.add_album(
+                rating_key,
+                [],
+                size=None,
+                artist=artist,
+                title=title,
+                guid=VENTOLIN_GUID,
+            )
+
+        (listed,), _ = service.list_favourites(query())
+
+        assert (listed.id, listed.item_id) == (favourite.id, "5913")
+        assert stored(session) == [
+            (ItemKind.ALBUM, VENTOLIN_GUID, "5913", "Ventolin", "Radiohead")
+        ]
+
+    def test_of_the_items_with_its_guid_and_none_with_its_titles_the_first_is_found(
+        self, service, session, library
+    ):
+        store(
+            session,
+            ItemKind.ALBUM,
+            "9999",
+            "Ventolin",
+            guid=VENTOLIN_GUID,
+            artist_title="Radiohead",
+        )
+        for rating_key, title in [("5911", "Ventolin EP"), ("5912", "Ventolin (Mix)")]:
+            library.add_album(
+                rating_key,
+                [],
+                size=None,
+                artist=RADIOHEAD,
+                title=title,
+                guid=VENTOLIN_GUID,
+            )
+
+        (listed,), _ = service.list_favourites(query())
+
+        assert (listed.item_id, listed.title) == ("5911", "Ventolin EP")
+        assert stored(session) == [
+            (ItemKind.ALBUM, VENTOLIN_GUID, "5911", "Ventolin EP", "Radiohead")
+        ]
+
+    def test_an_item_plex_has_not_matched_is_found_by_its_titles_alone(
+        self, service, session, library
+    ):
+        library.add_album(
+            KID_A, [], size=None, artist=RADIOHEAD, title="Kid A", guid=KID_A_GUID
+        )
+        service.mark(ItemKind.ALBUM, KID_A)
+        library.move(KID_A, MOVED, guid=f"local://{MOVED}")
+        library.requests.clear()
+
+        (listed,), _ = service.list_favourites(query())
+
+        # A local:// guid is the rating key again: it is not looked for.
+        assert library.requests == [
+            "read 1 Plex items",
+            "find the Plex albums titled 'Kid A'",
+        ]
+        assert listed.item_id == MOVED
+        assert stored(session) == [
+            (ItemKind.ALBUM, f"local://{MOVED}", MOVED, "Kid A", "Radiohead")
+        ]
+
+    def test_an_item_plex_matched_anew_is_found_by_its_titles(
+        self, service, session, library
+    ):
+        service.mark(ItemKind.ALBUM, HOMOGENIC)
+        library.move(HOMOGENIC, MOVED, guid="plex://album/homogenic")
+        library.requests.clear()
+
+        (listed,), _ = service.list_favourites(query())
+
+        assert library.requests == [
+            "read 1 Plex items",
+            f"find the Plex albums with guid plex://album/{HOMOGENIC}",
+            f"find the Plex albums titled {HOMOGENIC_DECOMPOSED!r}",
+        ]
+        assert listed.item_id == MOVED
+        assert stored(session) == [
+            (
+                ItemKind.ALBUM,
+                "plex://album/homogenic",
+                MOVED,
+                HOMOGENIC_DECOMPOSED,
+                BJORK_DECOMPOSED,
+            )
+        ]
+
+    def test_an_item_is_found_by_its_kind_and_titles_exactly(
+        self, service, session, library
+    ):
+        def gone(kind: ItemKind, title: str, artist_title: str | None) -> Favourite:
+            number = len(stored(session))
+            return store(
+                session,
+                kind,
+                str(9000 + number),
+                title,
+                artist_title=artist_title,
+            )
+
+        not_found = [
+            gone(ItemKind.ARTIST, HOMOGENIC_DECOMPOSED, None),
+            gone(ItemKind.ALBUM, HOMOGENIC_DECOMPOSED, "Radiohead"),
+            gone(ItemKind.ALBUM, HOMOGENIC_DECOMPOSED.lower(), BJORK_DECOMPOSED),
+            gone(ItemKind.ALBUM, HOMOGENIC_COMPOSED, BJORK_DECOMPOSED),
+            gone(ItemKind.ALBUM, HOMOGENIC_DECOMPOSED, BJORK_COMPOSED),
+        ]
+        found = gone(ItemKind.ALBUM, HOMOGENIC_DECOMPOSED, BJORK_DECOMPOSED)
+
+        listed, _ = service.list_favourites(query())
+
+        assert [(f.id, f.item_id) for f in listed] == [
+            *[(f.id, None) for f in not_found],
+            (found.id, HOMOGENIC),
+        ]
+
+    def test_a_favourite_not_found_is_available_again_once_plex_has_its_item(
+        self, service, session, library
+    ):
+        favourite = store(
+            session,
+            ItemKind.ALBUM,
+            "9999",
+            "Vespertine",
+            guid="plex://album/vespertine",
+            artist_title=BJORK_DECOMPOSED,
+        )
+        (before,), _ = service.list_favourites(query())
+        library.add_album(
+            MOVED,
+            [],
+            size=None,
+            artist=BJORK,
+            title="Vespertine",
+            guid="plex://album/vespertine",
+        )
+
+        (after,), _ = service.list_favourites(query())
+
+        assert (before.id, before.available) == (favourite.id, False)
+        assert (after.id, after.item_id, after.available) == (
+            favourite.id,
+            MOVED,
+            True,
+        )
+
+    def test_while_plex_fails_to_find_a_moved_item_nothing_changes(
+        self, service, session, library, caplog
+    ):
+        artist, _ = service.mark(ItemKind.ARTIST, RADIOHEAD)
+        album, _ = service.mark(ItemKind.ALBUM, HOMOGENIC)
+        library.move(HOMOGENIC, MOVED)
+        before = stored(session)
+        # The read of the items needs no music library, and the find does.
+        library.has_library = False
+
+        with caplog.at_level(logging.WARNING, "app.services.favourite_service"):
+            listed, total = service.list_favourites(query())
+
+        unavailable = {"item_id": None, "artwork_id": None, "available": False}
+        assert [vars(favourite) for favourite in listed] == [
+            vars(favourite) | unavailable for favourite in (artist, album)
+        ]
+        assert total == 2
+        assert stored(session) == before
+        (record,) = caplog.records
+        assert (
+            f"Cannot find the Plex albums with guid plex://album/{HOMOGENIC}"
+            in record.getMessage()
+        )
+
+
+class TestOneMarkPerItemAfterARefresh:
+    """A favourite found again at an item another favourite marks."""
+
+    @pytest.mark.parametrize("sort_dir", ["asc", "desc"])
+    def test_the_one_marked_after_the_other_goes(
+        self, service, session, library, sort_dir
+    ):
+        start = datetime(2026, 11, 15, 10, tzinfo=UTC)
+        # Marked after, its id the lower: when it was marked decides.
+        store(
+            session,
+            ItemKind.ALBUM,
+            HOMOGENIC,
+            HOMOGENIC_DECOMPOSED,
+            artist_title=BJORK_DECOMPOSED,
+            created_at=start + timedelta(days=1),
+        )
+        # Marked before Plex matched the item anew.
+        first = store(
+            session,
+            ItemKind.ALBUM,
+            "9999",
+            HOMOGENIC_DECOMPOSED,
+            guid="local://9999",
+            artist_title=BJORK_DECOMPOSED,
+            created_at=start,
+        )
+
+        listed, total = service.list_favourites(query(sort_dir=sort_dir))
+
+        assert [(f.id, f.item_id) for f in listed] == [(first.id, HOMOGENIC)]
+        assert total == 1
+        assert session.scalars(select(Favourite.id)).all() == [first.id]
+        assert stored(session) == [
+            (
+                ItemKind.ALBUM,
+                f"plex://album/{HOMOGENIC}",
+                HOMOGENIC,
+                HOMOGENIC_DECOMPOSED,
+                BJORK_DECOMPOSED,
+            )
+        ]
+
+    def test_the_one_found_again_goes_when_marked_after_the_other(
+        self, service, session, library
+    ):
+        first, _ = service.mark(ItemKind.ARTIST, RADIOHEAD)
+        # Marked in the same transaction, after it: its id decides.
+        store(session, ItemKind.ARTIST, "9999", "Radiohead", guid="local://9999")
+
+        listed, total = service.list_favourites(query())
+
+        assert listed == [first]
+        assert total == 1
+        assert session.scalars(select(Favourite.id)).all() == [first.id]
+
+    def test_the_one_that_goes_on_another_page_leaves_the_count(
+        self, service, session, library
+    ):
+        start = datetime(2026, 11, 15, 10, tzinfo=UTC)
+        store(
+            session,
+            ItemKind.PLAYLIST,
+            "9999",
+            "Road trip",
+            guid="com.plexapp.agents.none://road-trip",
+            created_at=start,
+        )
+        store(session, ItemKind.PLAYLIST, ROAD_TRIP, "Road trip", created_at=start)
+        store(session, ItemKind.ARTIST, RADIOHEAD, "Radiohead", created_at=start)
+
+        (listed,), total = service.list_favourites(query(per_page=1))
+
+        assert (listed.item_id, total) == (ROAD_TRIP, 2)
+        assert [row[2] for row in stored(session)] == [ROAD_TRIP, RADIOHEAD]
 
 
 class TestMarkingAtOnce:

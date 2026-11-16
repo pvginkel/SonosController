@@ -26,6 +26,8 @@ HOMOGENIC = "5103"
 TRACK = "5201"
 ROAD_TRIP = "5301"
 EMPTY = "5302"
+# Where Plex has an item it sees as new.
+MOVED = "5901"
 
 # "Björk" as Plex may give it: the letter, then its accent.
 BJORK_DECOMPOSED = "Björk"
@@ -411,6 +413,40 @@ class TestListFavourites:
         assert datetime.fromisoformat(body["created_at"]) == gone.created_at
         assert stored(session) == 1
 
+    def test_a_favourite_whose_item_plex_moved_is_listed_where_it_is_now(
+        self, client, session, library
+    ):
+        marked = mark(client, "artist", RADIOHEAD).get_json()
+        library.move(RADIOHEAD, MOVED)
+
+        (body,) = listed(client)
+
+        assert body == marked | {"item_id": MOVED, "artwork_id": body["artwork_id"]}
+        assert body["artwork_id"] != marked["artwork_id"]
+        answer = client.get(f"/api/artwork/{body['artwork_id']}?size=16&format=jpeg")
+        assert answer.status_code == 200
+        assert session.scalars(select(Favourite.rating_key)).all() == [MOVED]
+        assert mark(client, "artist", MOVED).status_code == 200
+
+    def test_of_two_favourites_found_to_mark_one_item_the_later_is_not_listed(
+        self, client, session, library
+    ):
+        first = Favourite(
+            item_kind=ItemKind.ARTIST,
+            guid="local://9999",
+            rating_key="9999",
+            title="Radiohead",
+        )
+        session.add(first)
+        session.flush()
+        mark(client, "artist", RADIOHEAD)
+
+        response = client.get(FAVOURITES)
+
+        assert [body["id"] for body in response.get_json()["data"]] == [first.id]
+        assert response.get_json()["meta"] == meta(1)
+        assert stored(session) == 1
+
     def test_while_plex_does_not_answer_the_favourites_are_listed_from_the_store(
         self, client, session, library
     ):
@@ -528,6 +564,8 @@ class TestFavouritesDocument:
         )
         description = " ".join(operation["description"].split())
         assert "is kept" in description
+        assert "listed where the item is now" in description
+        assert "the one marked later is removed" in description
         assert "While Plex fails" in description
         for parameter in operation["parameters"]:
             assert parameter["description"], parameter["name"]

@@ -39,9 +39,12 @@ def list_favourites(
     """The household's favourites, each with its item as Plex has it now.
 
     A favourite is `available` when Plex has its item. One whose item Plex
-    does not have is listed with its title and subtitle, without `item_id`
-    and `artwork_id`, and is kept. While Plex fails the favourites are
-    still listed, none of them `available`.
+    has moved, as a rescan may, is found again by the item's guid or its
+    titles and listed where the item is now; where another favourite marks
+    that item, the one marked later is removed. One whose item Plex does
+    not have is listed with its title and subtitle, without `item_id` and
+    `artwork_id`, and is kept. While Plex fails the favourites are still
+    listed, none of them `available`.
     """
     query = FavouriteListQuerySchema.model_validate(request.args.to_dict())
     favourites, total = favourite_service.list_favourites(query)

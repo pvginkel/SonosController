@@ -18,6 +18,7 @@ import threading
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
+from urllib.parse import urlencode
 from xml.etree.ElementTree import Element, ParseError
 
 import requests
@@ -53,6 +54,18 @@ _RATING_KEY = re.compile(r"[0-9]+")
 _PICTURE = re.compile(
     r"/library/metadata/[0-9]+/thumb/[0-9]+|/playlists/[0-9]+/composite/[0-9]+"
 )
+
+# The words for the items of a kind, and how the music library's section
+# names that kind: its type, and the number that asks for it.
+_KIND_NOUN: dict[type[PlexArtist | PlexAlbum | PlexPlaylist], str] = {
+    PlexArtist: "artists",
+    PlexAlbum: "albums",
+    PlexPlaylist: "playlists",
+}
+_SECTION_TYPE: dict[type[PlexArtist | PlexAlbum | PlexPlaylist], tuple[str, int]] = {
+    PlexArtist: ("artist", 8),
+    PlexAlbum: ("album", 9),
+}
 
 _PLEX_ERRORS = (
     PlexApiException,
@@ -159,6 +172,28 @@ class PlexClient(ABC):
         playlist on its own, and leaves the stamp on its picture as it is. A
         rating key Plex has no artist, album or audio playlist with is left
         out.
+        """
+
+    @abstractmethod
+    def find_by_guid(
+        self, kind: type[PlexArtist | PlexAlbum | PlexPlaylist], guid: str
+    ) -> list[PlexArtist | PlexAlbum | PlexPlaylist]:
+        """The artists, the albums or the audio playlists, as ``kind`` says,
+        whose guid is this one, in Plex's order.
+
+        Each is what ``read_items()`` gives. A guid is not unique: the same
+        release held twice is two albums with one guid.
+        """
+
+    @abstractmethod
+    def find_by_title(
+        self, kind: type[PlexArtist | PlexAlbum | PlexPlaylist], title: str
+    ) -> list[PlexArtist | PlexAlbum | PlexPlaylist]:
+        """The artists, the albums or the audio playlists, as ``kind`` says,
+        whose title is exactly this one, its case and its accents included,
+        in Plex's order.
+
+        Each is what ``read_items()`` gives.
         """
 
     @abstractmethod
@@ -338,6 +373,18 @@ class PlexapiPlexClient(PlexClient):
             ]
         return {item.rating_key: item for item in items}
 
+    def find_by_guid(
+        self, kind: type[PlexArtist | PlexAlbum | PlexPlaylist], guid: str
+    ) -> list[PlexArtist | PlexAlbum | PlexPlaylist]:
+        with _plex_call(f"find the Plex {_KIND_NOUN[kind]} with guid {guid}"):
+            return self._found(kind, "guid", guid)
+
+    def find_by_title(
+        self, kind: type[PlexArtist | PlexAlbum | PlexPlaylist], title: str
+    ) -> list[PlexArtist | PlexAlbum | PlexPlaylist]:
+        with _plex_call(f"find the Plex {_KIND_NOUN[kind]} titled {title!r}"):
+            return self._found(kind, "title", title)
+
     def read_track_picture(self, rating_key: str) -> str | None:
         if not _RATING_KEY.fullmatch(rating_key):
             return None
@@ -412,6 +459,41 @@ class PlexapiPlexClient(PlexClient):
             if section.attrib.get("title") == self._library:
                 return parse_rating_key(section, "key")
         raise PlexAnswerError(f"Plex has no music library named {self._library!r}")
+
+    def _found(
+        self,
+        kind: type[PlexArtist | PlexAlbum | PlexPlaylist],
+        field: str,
+        value: str,
+    ) -> list[PlexArtist | PlexAlbum | PlexPlaylist]:
+        """The items of a kind whose ``field`` is exactly ``value``."""
+        # A filter's name ending in "=" asks Plex for the items whose field
+        # is the value, compared without case; without it Plex gives those
+        # whose field contains the value.
+        query = urlencode({f"{field}=": value})
+        if kind is PlexPlaylist:
+            answer = self._query(f"/playlists?playlistType=audio&{query}")
+            return [
+                parse_playlist(item)
+                for item in _audio_playlists(answer)
+                if item.attrib.get(field) == value
+            ]
+        plex_type, number = _SECTION_TYPE[kind]
+        section = self._music_section(_REQUEST_TIMEOUT_SECONDS)
+        answer = self._query(f"/library/sections/{section}/all?type={number}&{query}")
+        listed = [
+            item
+            for item in _items(answer, plex_type)
+            if item.attrib.get(field) == value
+        ]
+        if kind is PlexArtist:
+            return [parse_artist(item) for item in listed]
+        if not listed:
+            return []
+        # The list leaves out an album's track count, and the album itself
+        # carries it.
+        keys = [parse_rating_key(item, "ratingKey") for item in listed]
+        return [parse_album(item) for item in _items(self._several(keys), "album")]
 
     def _query(self, path: str) -> Element:
         answer: Element = self._connected(_REQUEST_TIMEOUT_SECONDS).query(

@@ -6,7 +6,9 @@ comparison pytest would print.
 
 import io
 import re
+import unicodedata
 from collections import Counter
+from collections.abc import Iterable
 from unittest import mock
 from urllib.parse import urlsplit
 
@@ -79,6 +81,17 @@ def coverless(live_plex: PlexapiPlexClient, artists: list[PlexArtist]) -> PlexAl
 
 
 @pytest.fixture(scope="module")
+def albums(live_plex: PlexapiPlexClient, artists: list[PlexArtist]) -> list[PlexAlbum]:
+    """Every album of the music library, by artist."""
+    return [
+        found
+        for one in artists
+        for found in live_plex.read_artist_albums(one.rating_key, newest_first=False)
+        or []
+    ]
+
+
+@pytest.fixture(scope="module")
 def playlists(live_plex: PlexapiPlexClient) -> list[PlexPlaylist]:
     found = live_plex.read_playlists()
     assert any(playlist.track_count for playlist in found), (
@@ -92,6 +105,20 @@ def _image(jpeg: bytes | None) -> Image.Image:
     image = Image.open(io.BytesIO(jpeg))
     assert image.format == "JPEG"
     return image
+
+
+def _by_key(
+    items: Iterable[PlexArtist | PlexAlbum | PlexPlaylist],
+) -> list[PlexArtist | PlexAlbum | PlexPlaylist]:
+    return sorted(items, key=lambda item: int(item.rating_key))
+
+
+def _without_accents(title: str) -> str:
+    return "".join(
+        letter
+        for letter in unicodedata.normalize("NFD", title)
+        if not unicodedata.combining(letter)
+    )
 
 
 def _other(app, live_settings: AppSettings, **changed: str | None) -> PlexapiPlexClient:
@@ -483,6 +510,78 @@ class TestPlexClientItems:
     def test_items_plex_does_not_have_are_left_out(self, plex):
         # Plex answers 404 when it has none of the rating keys.
         assert plex.read_items([NO_ITEM, "999999998"]) == {}
+
+
+class TestPlexClientFind:
+    def test_an_artist_an_album_and_a_playlist_are_found_by_guid(
+        self, plex, artist, album
+    ):
+        one_artist = plex.read_artist(artist)
+        one_album = plex.read_album(album)
+        listed = {found.rating_key: found for found in plex.read_playlists()}
+        playlist = next(found for found in listed.values() if found.picture)
+
+        assert one_artist in plex.find_by_guid(PlexArtist, one_artist.guid)
+        assert one_album in plex.find_by_guid(PlexAlbum, one_album.guid)
+        assert plex.find_by_guid(PlexPlaylist, playlist.guid) == [playlist]
+        # Found as the list gives it: the stamp on its picture is kept.
+        assert {found.rating_key: found for found in plex.read_playlists()} == listed
+
+    def test_every_album_with_a_guid_is_found_and_no_other(self, plex, albums):
+        # Section 1.8: a guid is not unique, the same release held twice.
+        guid, count = Counter(found.guid for found in albums).most_common(1)[0]
+        assert count > 1, "the music library holds no release twice"
+
+        found = plex.find_by_guid(PlexAlbum, guid)
+
+        assert _by_key(found) == _by_key(a for a in albums if a.guid == guid)
+        # Plex's filter alone gives the guids that contain the one asked.
+        assert plex.find_by_guid(PlexAlbum, guid[:-1]) == []
+
+    def test_artists_are_found_by_title_exactly_case_and_accents_included(
+        self, plex, artists
+    ):
+        accented = next(
+            (one for one in artists if _without_accents(one.title) != one.title),
+            None,
+        )
+        assert accented is not None, "the music library has no artist with an accent"
+
+        for title in (
+            accented.title,
+            accented.title.swapcase(),
+            accented.title[:-1],
+            _without_accents(accented.title),
+        ):
+            assert _by_key(plex.find_by_title(PlexArtist, title)) == _by_key(
+                one for one in artists if one.title == title
+            ), title
+        assert accented in plex.find_by_title(PlexArtist, accented.title)
+
+    def test_every_album_so_titled_is_found(self, plex, albums):
+        title, count = Counter(found.title for found in albums).most_common(1)[0]
+        assert count > 1, "the music library has no two albums of one title"
+        # A title Plex's address would read otherwise, unless encoded.
+        marked = next(
+            (found.title for found in albums if set(found.title) & set("&?/#+%=")),
+            None,
+        )
+        assert marked is not None, "the music library has no title with & ? / # + % ="
+
+        for asked in (title, marked, title.swapcase()):
+            assert _by_key(plex.find_by_title(PlexAlbum, asked)) == _by_key(
+                found for found in albums if found.title == asked
+            ), asked
+
+    def test_a_playlist_is_found_by_title_as_the_list_gives_it(self, plex):
+        listed = {found.rating_key: found for found in plex.read_playlists()}
+
+        for playlist in listed.values():
+            for asked in (playlist.title, playlist.title.swapcase()):
+                assert _by_key(plex.find_by_title(PlexPlaylist, asked)) == _by_key(
+                    found for found in listed.values() if found.title == asked
+                ), asked
+        assert {found.rating_key: found for found in plex.read_playlists()} == listed
 
 
 class TestPlexClientTrackPictures:

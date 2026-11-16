@@ -8,11 +8,12 @@ NFC, and a picture is the artwork id the library carries for the item.
 
 import logging
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
 from psycopg.errors import UniqueViolation
-from sqlalchemy import Select, delete, func, select
+from sqlalchemy import Select, delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -36,6 +37,10 @@ _PLEX_TYPE: dict[ItemKind, type[PlexArtist | PlexAlbum | PlexPlaylist]] = {
 
 # The store's one mark per item, on kind and guid (app.models.favourite).
 _ONE_MARK_PER_ITEM = "uq_favourites_item_kind_guid"
+
+# The guid of an item Plex has not matched: ``local://<rating key>``, no
+# steadier than the rating key (docs/api-design.md section 1.8).
+_UNMATCHED = "local://"
 
 # The largest id the favourite's key, a PostgreSQL integer, holds.
 _LARGEST_ID = 2**31 - 1
@@ -71,29 +76,49 @@ class FavouriteService:
 
         The page's favourites are looked for together, in one read of Plex:
         each at the rating key it holds, where it is found when the item
-        there is of its kind and has its ``guid``. One that is not found is
-        served as it is stored, not available, and kept. While Plex fails,
-        the page is served from the store alone, none of it available, and
-        the failure is logged. Nothing stored changes.
+        there is of its kind and has its ``guid``. One not found there is
+        looked for on its own: by its ``guid``, unless a ``local://`` one,
+        and of several items with it the first whose titles are the
+        favourite's, else the first; else by its kind and titles, exactly.
+        One found that way is brought up to date with its item's rating key,
+        ``guid`` and titles, so that the next listing finds it at its rating
+        key; and where another favourite marks that item, the one marked
+        first stays and the other is removed, and not listed. One found
+        nowhere is served as it is stored, not available, and kept.
+
+        While Plex fails, the page is served from the store alone, none of it
+        available, nothing stored changes, and the failure is logged.
 
         A title is ordered by the database's collation, ICU's ``und``: by
         its letters first, without accents and in one case.
         """
-        total = self._db.execute(
-            select(func.count()).select_from(Favourite)
-        ).scalar_one()
         page = self._db.scalars(
             apply_sorting(select(Favourite), Favourite, query.sort_by, query.sort_dir)
             .offset(query.offset)
             .limit(query.per_page)
         ).all()
         try:
-            items = self._plex.read_items(favourite.rating_key for favourite in page)
+            found = self._look_for(page)
         except ExternalServiceException as error:
             logger.warning("The favourites are served without their items: %s", error)
-            items = {}
+            found = {}
+        removed: set[int] = set()
+        for favourite in page:
+            item = found.get(favourite.id)
+            if (
+                item is None
+                or favourite.id in removed
+                or _at_its_rating_key(favourite, item)
+            ):
+                continue
+            removed |= self._bring_up_to_date(favourite, item)
+        total = self._db.execute(
+            select(func.count()).select_from(Favourite)
+        ).scalar_one()
         return [
-            _listed(favourite, items.get(favourite.rating_key)) for favourite in page
+            _listed(favourite, found.get(favourite.id))
+            for favourite in page
+            if favourite.id not in removed
         ], total
 
     def mark(self, kind: ItemKind, item_id: str) -> tuple[ServedFavourite, bool]:
@@ -122,7 +147,7 @@ class FavouriteService:
             guid=item.guid,
             rating_key=item.rating_key,
             title=item.title,
-            artist_title=item.artist if isinstance(item, PlexAlbum) else None,
+            artist_title=_artist_title(item),
         )
         try:
             with scoped_savepoint(self._db):
@@ -157,6 +182,75 @@ class FavouriteService:
         ):
             raise RecordNotFoundException("Favourite", favourite_id)
 
+    def _look_for(
+        self, page: Sequence[Favourite]
+    ) -> dict[int, PlexArtist | PlexAlbum | PlexPlaylist]:
+        """The item each favourite of the page marks, by the favourite's id;
+        a favourite Plex has no item for is left out.
+
+        Raises:
+            ExternalServiceException: Plex failed.
+        """
+        at_rating_keys = self._plex.read_items(
+            favourite.rating_key for favourite in page
+        )
+        found: dict[int, PlexArtist | PlexAlbum | PlexPlaylist] = {}
+        for favourite in page:
+            item = at_rating_keys.get(favourite.rating_key)
+            if item is None or not _at_its_rating_key(favourite, item):
+                item = self._found_again(favourite)
+            if item is not None:
+                found[favourite.id] = item
+        return found
+
+    def _found_again(
+        self, favourite: Favourite
+    ) -> PlexArtist | PlexAlbum | PlexPlaylist | None:
+        """The item of a favourite its rating key no longer finds: by its
+        guid, then by its titles (``docs/api-design.md`` section 5,
+        decision 2)."""
+        kind = _PLEX_TYPE[favourite.item_kind]
+        if not favourite.guid.startswith(_UNMATCHED):
+            hits = self._plex.find_by_guid(kind, favourite.guid)
+            if hits:
+                return next((hit for hit in hits if _titled(hit, favourite)), hits[0])
+        hits = self._plex.find_by_title(kind, favourite.title)
+        return next((hit for hit in hits if _titled(hit, favourite)), None)
+
+    def _bring_up_to_date(
+        self, favourite: Favourite, item: PlexArtist | PlexAlbum | PlexPlaylist
+    ) -> set[int]:
+        """Have a favourite found by its guid or its titles hold its item's
+        rating key, guid and titles: the ids of the favourites removed.
+
+        Another favourite that marks the item, by its kind and guid, is
+        removed when this one was marked first, and this one is when it was
+        not, as a second mark of an item is answered with the favourite
+        marked first.
+        """
+        # Statements, not the session's unit of work: a listing at the same
+        # time may have changed or removed these rows, which the unit of work
+        # refuses.
+        other = self._db.scalars(
+            _marking(favourite.item_kind, item.guid).where(Favourite.id != favourite.id)
+        ).one_or_none()
+        if other is not None:
+            marked_later = max(other, favourite, key=_marked_order)
+            self._db.execute(delete(Favourite).where(Favourite.id == marked_later.id))
+            if marked_later is favourite:
+                return {favourite.id}
+        self._db.execute(
+            update(Favourite)
+            .where(Favourite.id == favourite.id)
+            .values(
+                guid=item.guid,
+                rating_key=item.rating_key,
+                title=item.title,
+                artist_title=_artist_title(item),
+            )
+        )
+        return {other.id} if other is not None else set()
+
 
 def _marking(kind: ItemKind, guid: str) -> Select[Favourite]:
     """The favourite that marks the items of this kind and guid."""
@@ -182,14 +276,39 @@ def _served(
 def _listed(
     favourite: Favourite, item: PlexArtist | PlexAlbum | PlexPlaylist | None
 ) -> ServedFavourite:
-    """A favourite with what Plex has at the rating key it holds: its item
-    when that is of the favourite's kind and has its guid."""
-    if (
+    """A favourite with its item, or as it is stored where Plex has none."""
+    return _served(favourite, item) if item is not None else _unavailable(favourite)
+
+
+def _at_its_rating_key(
+    favourite: Favourite, item: PlexArtist | PlexAlbum | PlexPlaylist
+) -> bool:
+    """Whether the item Plex has at the favourite's rating key is its item:
+    of its kind, with its guid."""
+    return (
         isinstance(item, _PLEX_TYPE[favourite.item_kind])
+        and item.rating_key == favourite.rating_key
         and item.guid == favourite.guid
-    ):
-        return _served(favourite, item)
-    return _unavailable(favourite)
+    )
+
+
+def _titled(item: PlexArtist | PlexAlbum | PlexPlaylist, favourite: Favourite) -> bool:
+    """Whether an item has the favourite's title and, for an album, its
+    artist's title, exactly as Plex gave them."""
+    return (item.title, _artist_title(item)) == (
+        favourite.title,
+        favourite.artist_title,
+    )
+
+
+def _artist_title(item: PlexArtist | PlexAlbum | PlexPlaylist) -> str | None:
+    """The title of an album's artist; None for an artist and a playlist."""
+    return item.artist if isinstance(item, PlexAlbum) else None
+
+
+def _marked_order(favourite: Favourite) -> tuple[datetime, int]:
+    """When a favourite was marked, its id ordering marks made at once."""
+    return favourite.created_at, favourite.id
 
 
 def _unavailable(favourite: Favourite) -> ServedFavourite:

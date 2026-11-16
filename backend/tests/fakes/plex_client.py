@@ -14,12 +14,14 @@ comes back as a JPEG that covers the square asked for and keeps its shape;
 a path with another stamp answers the picture as it is now. Every artist,
 album and playlist has a guid of its own unless a test gives it one: two
 albums may share one, as the same release held twice does, and an item Plex
-has not matched has ``local://<rating key>``. The read of several items reads
-a playlist as the list does, its picture's stamp left as it is. Like plexapi,
-it holds which server it is from Plex's first answer.
+has not matched has ``local://<rating key>``. The read of several items, and
+the finds by guid and by title, read a playlist as the list does, its
+picture's stamp left as it is. Like plexapi, it holds which server it is from
+Plex's first answer.
 
 A test builds its library with ``add_artist()``, ``add_album()``,
-``add_track()`` and ``add_playlist()``. ``served_tracks()`` is what the Plex
+``add_track()`` and ``add_playlist()``, and with ``move()`` has Plex see an
+item as new, as after a rescan found its files moved. ``served_tracks()`` is what the Plex
 service linked in Sonos gives the fake household for a container of it.
 """
 
@@ -43,6 +45,12 @@ from app.utils.plex_library import (
     PlexTrack,
     in_release_order,
 )
+
+_KIND_NOUN: dict[type[PlexArtist | PlexAlbum | PlexPlaylist], str] = {
+    PlexArtist: "artists",
+    PlexAlbum: "albums",
+    PlexPlaylist: "playlists",
+}
 
 _THUMB = re.compile(r"/library/metadata/([0-9]+)/thumb/[0-9]+")
 _COMPOSITE = re.compile(r"/playlists/([0-9]+)/composite/[0-9]+")
@@ -257,6 +265,44 @@ class FakePlexClient(PlexClient):
         if track_count:
             self.set_picture(rating_key, size, colour)
 
+    def move(
+        self,
+        rating_key: str,
+        to: str,
+        *,
+        guid: str | None = None,
+        title: str | None = None,
+    ) -> None:
+        """Have Plex see an artist, an album or a playlist as new: it is at
+        the rating key ``to``, with its guid and its title, or ``guid`` and
+        ``title`` where Plex gives it others (``local://<to>`` for an item
+        Plex has not matched). An artist's albums and an album's tracks go
+        with it, and its picture, with a new stamp."""
+        if to in self._artists or to in self._albums or to in self._playlists:
+            raise KeyError(f"The fake Plex has an item {to} already")
+        item: _Artist | _Album | _Playlist
+        if rating_key in self._artists:
+            item = self._artists.pop(rating_key)
+            self._artists[to] = item
+            for album in self._albums.values():
+                if album.artist == rating_key:
+                    album.artist = to
+        elif rating_key in self._albums:
+            item = self._albums.pop(rating_key)
+            self._albums[to] = item
+            for track in self._tracks.values():
+                if track.album == rating_key:
+                    track.album = to
+        else:
+            item = self._playlists.pop(rating_key)
+            self._playlists[to] = item
+        item.rating_key = to
+        item.guid = guid or item.guid
+        item.title = title or item.title
+        held = self._pictures.pop(rating_key, None)
+        if held is not None:
+            self.set_image(to, held.image)
+
     def set_picture(
         self,
         rating_key: str,
@@ -440,6 +486,24 @@ class FakePlexClient(PlexClient):
                 items[key] = self._playlist(self._playlists[key])
         return items
 
+    def find_by_guid(
+        self, kind: type[PlexArtist | PlexAlbum | PlexPlaylist], guid: str
+    ) -> list[PlexArtist | PlexAlbum | PlexPlaylist]:
+        self._asked(
+            f"find the Plex {_KIND_NOUN[kind]} with guid {guid}",
+            library=kind is not PlexPlaylist,
+        )
+        return [item for item in self._all(kind) if item.guid == guid]
+
+    def find_by_title(
+        self, kind: type[PlexArtist | PlexAlbum | PlexPlaylist], title: str
+    ) -> list[PlexArtist | PlexAlbum | PlexPlaylist]:
+        self._asked(
+            f"find the Plex {_KIND_NOUN[kind]} titled {title!r}",
+            library=kind is not PlexPlaylist,
+        )
+        return [item for item in self._all(kind) if item.title == title]
+
     def read_track_picture(self, rating_key: str) -> str | None:
         self._asked(f"read the picture of Plex track {rating_key}")
         track = self._tracks.get(rating_key)
@@ -493,6 +557,16 @@ class FakePlexClient(PlexClient):
         self.requests.append(operation)
         if not self.reachable:
             raise ExternalServiceException(operation, _UNREACHABLE)
+
+    def _all(
+        self, kind: type[PlexArtist | PlexAlbum | PlexPlaylist]
+    ) -> list[PlexArtist | PlexAlbum | PlexPlaylist]:
+        """Every item of a kind, in the order they were added."""
+        if kind is PlexArtist:
+            return [self._artist(artist) for artist in self._artists.values()]
+        if kind is PlexAlbum:
+            return [self._album(album) for album in self._albums.values()]
+        return [self._playlist(playlist) for playlist in self._playlists.values()]
 
     def _picture_path(self, rating_key: str) -> str | None:
         held = self._pictures.get(rating_key)

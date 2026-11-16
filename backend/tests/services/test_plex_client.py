@@ -8,6 +8,7 @@ what it refuses to ask, and a Plex that does not answer.
 
 import io
 import socket
+from dataclasses import replace
 from datetime import date
 
 import pytest
@@ -54,6 +55,8 @@ EVERYTHING = "3303"
 RED = (200, 60, 30)
 BLUE = (20, 40, 200)
 GREEN = (30, 160, 60)
+
+SMALL = (16, 16)
 
 TOKEN = "a-token-no-failure-may-carry"
 
@@ -113,6 +116,21 @@ READS = [
         "read_items",
         lambda plex: plex.read_items([BEATLES, REVOLVER, MIX]),
         "read 3 Plex items",
+    ),
+    (
+        "find_by_guid",
+        lambda plex: plex.find_by_guid(PlexAlbum, "plex://album/3101"),
+        "find the Plex albums with guid plex://album/3101",
+    ),
+    (
+        "find_by_title",
+        lambda plex: plex.find_by_title(PlexArtist, "ABBA"),
+        "find the Plex artists titled 'ABBA'",
+    ),
+    (
+        "find_by_title_a_playlist",
+        lambda plex: plex.find_by_title(PlexPlaylist, "Mix"),
+        "find the Plex playlists titled 'Mix'",
     ),
 ]
 
@@ -346,8 +364,17 @@ class TestPlexClientLibrary:
 
     @pytest.mark.parametrize(
         ("read", "operation"),
-        [(read, operation) for _, read, operation in READS[:2] + READS[3:4]],
-        ids=["section_id", "read_artists", "read_artist_albums"],
+        [
+            (read, operation)
+            for _, read, operation in READS[:2] + READS[3:4] + READS[-3:-1]
+        ],
+        ids=[
+            "section_id",
+            "read_artists",
+            "read_artist_albums",
+            "find_by_guid",
+            "find_by_title",
+        ],
     )
     def test_a_plex_without_the_music_library_fails(self, music, read, operation):
         music.has_library = False
@@ -762,6 +789,135 @@ class TestPlexClientItems:
         music.reachable = False
 
         assert music.read_items([]) == {}
+
+
+@pytest.fixture
+def few(plex: FakePlexClient) -> FakePlexClient:
+    """Two artists, three albums with tracks and two playlists, their
+    pictures small (the fake's default ones are large, card SCTL-14)."""
+    plex.add_artist(BEATLES, "The Beatles", sort_title="Beatles", size=SMALL)
+    plex.add_artist(BJORK, "Björk", size=None)
+    plex.add_album(
+        REVOLVER, REVOLVER_TRACKS, size=SMALL, artist=BEATLES, title="Revolver"
+    )
+    plex.add_album(HELP, ["3221"], size=None, artist=BEATLES, title="Help!")
+    plex.add_album(ARRIVAL, ["3251"], size=SMALL, artist=BJORK, title="Arrival")
+    plex.add_playlist(MIX, "Mix", 2, size=SMALL)
+    plex.add_playlist(EMPTY, "Recently Added", 0)
+    return plex
+
+
+class TestPlexClientFind:
+    def test_an_artist_an_album_and_a_playlist_are_found_by_guid(self, few):
+        beatles = few.read_artist(BEATLES)
+        revolver = few.read_album(REVOLVER)
+        [mix] = [p for p in few.read_playlists() if p.rating_key == MIX]
+
+        assert few.find_by_guid(PlexArtist, beatles.guid) == [beatles]
+        assert few.find_by_guid(PlexAlbum, revolver.guid) == [revolver]
+        assert few.find_by_guid(PlexPlaylist, mix.guid) == [mix]
+
+    def test_every_album_of_a_release_held_twice_is_found(self, few):
+        arrival = few.read_album(ARRIVAL)
+        few.add_album("3108", ["3252"], size=None, artist=BJORK, guid=arrival.guid)
+
+        found = few.find_by_guid(PlexAlbum, arrival.guid)
+
+        assert found == [arrival, few.read_album("3108")]
+
+    def test_a_guid_finds_the_items_of_its_kind_only(self, few):
+        beatles = few.read_artist(BEATLES)
+        few.add_album("3109", [], size=None, artist=BJORK, guid=beatles.guid)
+
+        assert few.find_by_guid(PlexArtist, beatles.guid) == [beatles]
+        assert few.find_by_guid(PlexPlaylist, beatles.guid) == []
+        assert few.find_by_guid(PlexArtist, "plex://artist/none") == []
+
+    def test_an_artist_an_album_and_a_playlist_are_found_by_title(self, few):
+        [mix] = [p for p in few.read_playlists() if p.rating_key == MIX]
+
+        assert few.find_by_title(PlexArtist, "The Beatles") == [
+            few.read_artist(BEATLES)
+        ]
+        assert few.find_by_title(PlexAlbum, "Revolver") == [few.read_album(REVOLVER)]
+        assert few.find_by_title(PlexPlaylist, "Mix") == [mix]
+
+    def test_every_item_so_titled_is_found(self, few):
+        few.add_album("3108", [], size=None, artist=BEATLES, title="Arrival")
+
+        found = few.find_by_title(PlexAlbum, "Arrival")
+
+        assert found == [few.read_album(ARRIVAL), few.read_album("3108")]
+
+    @pytest.mark.parametrize(
+        "title", ["the beatles", "Beatles", "The Beatle", "Bjork", "Revolver"]
+    )
+    def test_a_title_is_found_exactly_its_case_and_accents_included(self, few, title):
+        # "Revolver" is an album's: an artist so titled is none.
+        assert few.find_by_title(PlexArtist, title) == []
+
+    def test_a_playlist_found_keeps_the_stamp_on_its_picture(self, few):
+        listed = {p.rating_key: p for p in few.read_playlists()}
+
+        assert few.find_by_guid(PlexPlaylist, listed[MIX].guid) == [listed[MIX]]
+        assert few.find_by_title(PlexPlaylist, "Mix") == [listed[MIX]]
+        assert {p.rating_key: p for p in few.read_playlists()} == listed
+
+    def test_a_playlist_is_found_without_the_music_library(self, few):
+        few.has_library = False
+
+        found = few.find_by_title(PlexPlaylist, "Mix")
+
+        assert [p.rating_key for p in found] == [MIX]
+
+
+class TestPlexClientMovedItems:
+    """The fake's ``move()``: Plex sees an item as new."""
+
+    def test_an_album_moved_is_at_its_new_rating_key_with_its_tracks(self, few):
+        before = few.read_album(REVOLVER)
+        tracks = few.read_album_tracks(REVOLVER)
+
+        few.move(REVOLVER, "3109")
+
+        assert few.read_album(REVOLVER) is None
+        moved = few.read_album("3109")
+        assert moved.picture != before.picture
+        assert moved == replace(before, rating_key="3109", picture=moved.picture)
+        assert few.read_album_tracks("3109") == [
+            replace(track, picture=moved.picture) for track in tracks
+        ]
+        assert few.read_picture(moved.picture, 16) is not None
+
+    def test_an_artist_moved_takes_its_albums(self, few):
+        albums = few.read_artist_albums(BEATLES, newest_first=True)
+
+        few.move(BEATLES, "3009")
+
+        assert few.read_artist(BEATLES) is None
+        assert few.read_artist("3009").guid == f"plex://artist/{BEATLES}"
+        moved = few.read_artist_albums("3009", newest_first=True)
+        assert [a.rating_key for a in moved] == [a.rating_key for a in albums]
+        assert {a.artist_rating_key for a in moved} == {"3009"}
+
+    def test_a_playlist_moved_is_at_its_new_rating_key(self, few):
+        before = few.read_playlist(MIX)
+
+        few.move(MIX, "3309")
+
+        assert few.read_playlist(MIX) is None
+        moved = few.read_playlist("3309")
+        assert moved == replace(before, rating_key="3309", picture=moved.picture)
+
+    def test_an_item_moved_has_the_guid_and_the_title_given(self, few):
+        few.move(ARRIVAL, "3109", guid="local://3109", title="Arrival (Deluxe)")
+
+        moved = few.read_album("3109")
+        assert (moved.guid, moved.title) == ("local://3109", "Arrival (Deluxe)")
+
+    def test_an_item_is_not_moved_onto_another(self, few):
+        with pytest.raises(KeyError):
+            few.move(ARRIVAL, REVOLVER)
 
 
 class TestPlexClientTrackPictures:
