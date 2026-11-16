@@ -1026,8 +1026,11 @@ def _household(device: Any) -> Household:
 
 
 def _plex_service_id(device: Any) -> str:
-    """The id of the Plex service among those the speaker lists."""
-    answer = device.musicServices.ListAvailableServices()
+    """The id of the Plex service among those the speaker lists.
+
+    The arguments are given as in ``_probe()``.
+    """
+    answer = device.musicServices.ListAvailableServices([])
     services = ElementTree.fromstring(answer["AvailableServiceDescriptorList"])
     for service in services.iter("Service"):
         if service.get("Name") == _PLEX_SERVICE:
