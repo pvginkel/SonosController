@@ -18,7 +18,7 @@ from app.services.household_mirror import (
     PlaybackStatus,
 )
 from app.services.sonos_client import TransportState
-from app.utils.artwork_id import plex_artwork_id
+from app.utils.artwork_id import plex_artwork_id, speaker_artwork_id
 from tests.api.documents import json_schema, undescribed
 from tests.fakes.plex_client import FakePlexClient
 from tests.fakes.sonos_client import FakeSonosClient, app_track, queue_track
@@ -99,6 +99,29 @@ class TestGetPlayback:
                 "track_id": "1001",
             },
         }
+
+    def test_a_track_of_another_plex_server_is_not_from_plex(
+        self, client, household, plex, artwork
+    ):
+        # The other server's track has a rating key the library has too.
+        theirs = queue_track(1, machine_identifier="anotherserver")
+        household.load_queue(GARAGE, [theirs])
+        household.settle()
+
+        track = playback(client, GARAGE)["track"]
+
+        assert track == {
+            "title": "Track 1",
+            "artist": "An Artist",
+            "album": "An Album",
+            "duration_ms": 181000,
+            "artwork_id": speaker_artwork_id(GARAGE, theirs.uri, theirs.picture),
+            "track_id": None,
+        }
+        assert track["artwork_id"] != plex_artwork_id(plex.read_track_picture("1001"))
+        response = client.get(f"/api/artwork/{track['artwork_id']}?size=100")
+        assert response.status_code == 200
+        assert response.mimetype == "image/jpeg"
 
     def test_the_artwork_id_is_answered_by_the_artwork_endpoint(
         self, client, household, artwork

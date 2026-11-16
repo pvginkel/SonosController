@@ -47,6 +47,7 @@ from app.services.sonos_client import (
     Volume,
     VolumeChanged,
 )
+from tests.fakes.plex_client import MACHINE_IDENTIFIER
 
 # What a speaker allows on a stream that cannot pause (section 1.7).
 _STREAM_ACTIONS = frozenset({TransportAction.PLAY, TransportAction.STOP})
@@ -55,9 +56,18 @@ _STREAM_ACTIONS = frozenset({TransportAction.PLAY, TransportAction.STOP})
 _PICTURE_SIZE = 300
 
 
-def queue_track(number: int, album: str = "An Album", artist: str = "An Artist") -> Track:
-    """A track as the speaker reports one queued from the Plex service."""
-    uri = f"x-sonos-http:fakeserver%3a1%3a{1000 + number}%3atrack.mp3?sid=212&flags=8300&sn=1"
+def queue_track(
+    number: int,
+    album: str = "An Album",
+    artist: str = "An Artist",
+    machine_identifier: str = MACHINE_IDENTIFIER,
+) -> Track:
+    """A track as the speaker reports one queued from the Plex service: of
+    the fake Plex, or of the Plex server ``machine_identifier`` names."""
+    uri = (
+        f"x-sonos-http:{machine_identifier}%3a1%3a{1000 + number}%3atrack.mp3"
+        "?sid=212&flags=8300&sn=1"
+    )
     return Track(
         title=f"Track {number}",
         artist=artist,

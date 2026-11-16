@@ -231,6 +231,37 @@ class TestArtworkServiceSpeaker:
         with pytest.raises(RecordNotFoundException):
             service.read(artwork_id, 100, JPEG)
 
+    def test_another_plex_servers_track_has_the_picture_the_speaker_serves(
+        self, service, started, household
+    ):
+        theirs = queue_track(1, machine_identifier="anotherserver")
+        household.load_queue(GARAGE, [theirs])
+        household.settle()
+        artwork_id = started.playback(GARAGE).track.artwork_id
+        assert artwork_id == speaker_artwork_id(GARAGE, theirs.uri, theirs.picture)
+
+        image = from_jpeg(service.read(artwork_id, 100, JPEG))
+
+        assert image.size == (100, 100)
+        assert_colour(image, picture_colour(theirs.picture))
+
+    def test_a_plex_services_picture_fails_while_plex_has_never_answered(
+        self, artwork, household, plex, mirror
+    ):
+        plex.reachable = False
+        mirror.start()
+        household.settle()
+        track = queue_track(1)
+        artwork_id = speaker_artwork_id(GARAGE, track.uri, track.picture)
+
+        with pytest.raises(ExternalServiceException) as raised:
+            artwork.read(artwork_id, 100, JPEG)
+
+        assert raised.value.message == (
+            "Cannot read which server Plex is because external service "
+            "failed: Plex did not answer (ConnectionError)"
+        )
+
     def test_a_speaker_the_household_does_not_have_is_not_found(self, service):
         track = app_track(1)
         artwork_id = speaker_artwork_id("RINCON_NONE", track.uri, track.picture)

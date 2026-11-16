@@ -26,11 +26,13 @@ they join it once they answer a read of the layout.
 
 A track's ``artwork_id`` names its picture (section 3.7): Plex's for a track
 queued from Plex, which Plex is asked for whenever the playback is read, and
-otherwise the picture the group's coordinator serves.
+otherwise the picture the group's coordinator serves. A track is queued from
+Plex when its queue entry carries the machine identifier of the Plex server
+the backend is configured for; an entry of another Plex server is a track
+like any other that is not from Plex.
 """
 
 import logging
-import re
 import threading
 import unicodedata
 from collections.abc import Callable
@@ -70,6 +72,7 @@ from app.services.sonos_client import (
 )
 from app.utils.artwork_id import plex_artwork_id, speaker_artwork_id
 from app.utils.lifecycle_coordinator import LifecycleCoordinatorProtocol, LifecycleEvent
+from app.utils.plex_queue_entry import parse_plex_queue_entry
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +136,7 @@ class PlayingTrack:
 
     ``album``, ``duration_ms`` and ``artwork_id`` are None where the source
     gives none, as a radio stream does; ``track_id`` is the Plex rating key
-    of a track queued from Plex, else None.
+    of a track queued from the configured Plex server, else None.
     """
 
     title: str
@@ -193,13 +196,6 @@ _ACTIONS = (
     (PlaybackAction.PAUSE, {TransportAction.PAUSE, TransportAction.STOP}),
     (PlaybackAction.NEXT, {TransportAction.NEXT}),
     (PlaybackAction.PREVIOUS, {TransportAction.PREVIOUS}),
-)
-
-# A queue entry from the Plex service names its track:
-# x-sonos-http:<machine>%3a<section>%3a<rating key>%3atrack.mp3?…
-# (docs/api-design.md section 1.3).
-_PLEX_TRACK = re.compile(
-    r"x-sonos-http:[^%?]+%3a[^%?]+%3a(\d+)%3atrack\.", re.IGNORECASE
 )
 
 _PLAYBACK_FIELDS = (
@@ -355,7 +351,9 @@ class HouseholdMirror:
 
         For a track queued from Plex this asks Plex for the track's picture.
         While Plex fails the track has no ``artwork_id``, which is logged;
-        the rest is what the mirror holds.
+        the rest is what the mirror holds. While Plex has never answered,
+        which server it is is not known: a track of the Plex service then has
+        no ``track_id`` either.
 
         Raises:
             SpeakerNotFoundException: The household has no such room.
@@ -363,7 +361,8 @@ class HouseholdMirror:
         with self._lock:
             coordinator_id = self._groups[self._room(speaker_id).id].coordinator_id
             playback = self._states[coordinator_id].playback
-        return _playback(playback, self._artwork_id(coordinator_id, playback.track))
+        track_id, artwork_id = self._track_ids(coordinator_id, playback.track)
+        return _playback(playback, track_id, artwork_id)
 
     def transport_actions(self, speaker_id: str) -> frozenset[TransportAction]:
         """The commands the room's group allows now, in the speaker's words.
@@ -384,7 +383,13 @@ class HouseholdMirror:
 
         None unless the id is that of the track the room's group has loaded
         now: a speaker serves a track's picture after the track stopped being
-        current, and section 3.7 has it served only while it is.
+        current, and section 3.7 has it served only while it is. None for a
+        track queued from Plex, whose picture is Plex's.
+
+        Raises:
+            ExternalServiceException: The id is that of the loaded track,
+                which is of the Plex service, and Plex has never answered:
+                which server's it is is not known.
         """
         with self._lock:
             group = self._groups.get(speaker_id)
@@ -393,24 +398,56 @@ class HouseholdMirror:
             track = self._states[speaker_id].playback.track
         if track is None or _speaker_artwork_id(speaker_id, track) != artwork_id:
             return None
+        if self._plex_rating_key(track) is not None:
+            return None
         return track.picture
 
-    def _artwork_id(self, coordinator_id: str, track: Track | None) -> str | None:
+    def _track_ids(
+        self, coordinator_id: str, track: Track | None
+    ) -> tuple[str | None, str | None]:
+        """A track's ``track_id`` and ``artwork_id``."""
         if track is None:
-            return None
-        plex_track = _PLEX_TRACK.match(track.uri)
-        if plex_track is None:
-            return _speaker_artwork_id(coordinator_id, track)
+            return None, None
         try:
-            picture = self._plex.read_track_picture(plex_track.group(1))
+            rating_key = self._plex_rating_key(track)
+        except ExternalServiceException as error:
+            logger.warning(
+                "The track speaker %s plays is served without its track id and "
+                "its artwork: %s",
+                coordinator_id,
+                error,
+            )
+            return None, None
+        if rating_key is None:
+            return None, _speaker_artwork_id(coordinator_id, track)
+        try:
+            picture = self._plex.read_track_picture(rating_key)
         except ExternalServiceException as error:
             logger.warning(
                 "The track speaker %s plays is served without its artwork: %s",
                 coordinator_id,
                 error,
             )
+            return rating_key, None
+        return rating_key, plex_artwork_id(picture) if picture is not None else None
+
+    def _plex_rating_key(self, track: Track) -> str | None:
+        """The rating key of a track queued from the configured Plex server;
+        None for any other track, one of another Plex server included.
+
+        Plex is asked which server it is only for a track of the Plex
+        service.
+
+        Raises:
+            ExternalServiceException: The track is of the Plex service, and
+                Plex has never answered.
+        """
+        entry = parse_plex_queue_entry(track.uri)
+        if entry is None:
             return None
-        return plex_artwork_id(picture) if picture is not None else None
+        if entry.machine_identifier != self._plex.machine_identifier():
+            return None
+        return entry.rating_key
 
     def _room(self, speaker_id: str) -> Room:
         for room in self._household.rooms:
@@ -824,7 +861,9 @@ def _merged_playback(held: Playback, event: PlaybackChanged) -> Playback:
     return replace(held, **reported)
 
 
-def _playback(playback: Playback, artwork_id: str | None) -> SpeakerPlayback:
+def _playback(
+    playback: Playback, track_id: str | None, artwork_id: str | None
+) -> SpeakerPlayback:
     source = _source(playback.transport_uri)
     queued = source is PlaybackSource.QUEUE
     return SpeakerPlayback(
@@ -836,7 +875,7 @@ def _playback(playback: Playback, artwork_id: str | None) -> SpeakerPlayback:
         shuffle=playback.shuffle,
         queue_position=(playback.queue_position or None) if queued else None,
         queue_length=playback.queue_length if queued else None,
-        track=_track(playback, source, artwork_id),
+        track=_track(playback, source, track_id, artwork_id),
     )
 
 
@@ -848,7 +887,10 @@ def _source(transport_uri: str) -> PlaybackSource:
 
 
 def _track(
-    playback: Playback, source: PlaybackSource, artwork_id: str | None
+    playback: Playback,
+    source: PlaybackSource,
+    track_id: str | None,
+    artwork_id: str | None,
 ) -> PlayingTrack | None:
     track = playback.track
     if track is None:
@@ -860,22 +902,20 @@ def _track(
         # reports something, the station is all there is to show.
         title = track.stream_content or playback.transport_title
         artist = playback.transport_title
-    plex_track = _PLEX_TRACK.match(track.uri)
     return PlayingTrack(
         title=_nfc(title),
         artist=_nfc(artist),
         album=_nfc(track.album) or None,
         duration_ms=track.duration_seconds * 1000 or None,
         artwork_id=artwork_id,
-        track_id=plex_track.group(1) if plex_track else None,
+        track_id=track_id,
     )
 
 
 def _speaker_artwork_id(coordinator_id: str, track: Track) -> str | None:
     """The id of the picture a group's coordinator serves for a track: None
-    for a track from Plex, whose picture is Plex's, and for a track without
-    a picture."""
-    if _PLEX_TRACK.match(track.uri) or not track.picture:
+    for a track without a picture."""
+    if not track.picture:
         return None
     return speaker_artwork_id(coordinator_id, track.uri, track.picture)
 

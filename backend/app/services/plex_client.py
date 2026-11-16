@@ -1,8 +1,8 @@
 """The Plex client: the backend's only way to Plex.
 
-``PlexClient`` is what the rest of the backend sees: the picture Plex gives a
-track, and that picture resized by Plex. ``PlexapiPlexClient`` implements it
-on plexapi, and this is the only module that imports plexapi. pytest overrides
+``PlexClient`` is what the rest of the backend sees: which server Plex is,
+the picture Plex gives a track, and that picture resized by Plex.
+``PlexapiPlexClient`` implements it on plexapi, and this is the only module that imports plexapi. pytest overrides
 the container's provider with an in-memory fake of the same base class.
 
 An item is addressed by its rating key, as a string. The token travels in a
@@ -51,6 +51,15 @@ class PlexClient(ABC):
     @abstractmethod
     def check_readiness(self) -> CheckResult:
         """Readiness check: Plex answers, and has the music library."""
+
+    @abstractmethod
+    def machine_identifier(self) -> str:
+        """The server's machine identifier, which the address of every queue
+        entry of one of its tracks carries.
+
+        The client holds it from Plex's first answer: it fails only while
+        Plex has never answered.
+        """
 
     @abstractmethod
     def read_track_picture(self, rating_key: str) -> str | None:
@@ -111,6 +120,18 @@ class PlexapiPlexClient(PlexClient):
                 f"Plex has no music library named {self._library!r}",
             )
         return CheckResult(CheckStatus.OK)
+
+    def machine_identifier(self) -> str:
+        operation = "read which server Plex is"
+        with _plex_call(operation):
+            identifier: str | None = self._connected(
+                _REQUEST_TIMEOUT_SECONDS
+            ).machineIdentifier
+        if not identifier:
+            raise ExternalServiceException(
+                operation, "Plex's answer names no machine identifier"
+            )
+        return identifier
 
     def read_track_picture(self, rating_key: str) -> str | None:
         if not _RATING_KEY.fullmatch(rating_key):

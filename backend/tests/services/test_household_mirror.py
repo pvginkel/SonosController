@@ -488,6 +488,7 @@ class TestHouseholdMirrorArtwork:
     def test_while_plex_is_down_the_rest_is_served(
         self, started, household, library, caplog
     ):
+        assert started.playback(GARAGE).track.track_id == "1001"
         library.reachable = False
         household.play(GARAGE)
         household.settle()
@@ -515,6 +516,105 @@ class TestHouseholdMirrorArtwork:
 
         library.reachable = True
         assert started.playback(GARAGE).track.artwork_id is not None
+
+    def test_while_plex_has_never_answered_a_plex_track_has_no_id(
+        self, started, household, library, caplog
+    ):
+        library.reachable = False
+        household.play(GARAGE)
+        household.settle()
+
+        with caplog.at_level(logging.WARNING):
+            playback = started.playback(GARAGE)
+
+        assert playback.state is PlaybackStatus.PLAYING
+        assert playback.track == PlayingTrack(
+            title="Track 1",
+            artist="An Artist",
+            album="An Album",
+            duration_ms=181000,
+            artwork_id=None,
+            track_id=None,
+        )
+        assert logged(caplog) == [
+            (
+                "WARNING",
+                f"The track speaker {GARAGE} plays is served without its track "
+                "id and its artwork: Cannot read which server Plex is because "
+                "external service failed: Plex did not answer (ConnectionError)",
+            )
+        ]
+
+        library.reachable = True
+        track = started.playback(GARAGE).track
+        assert track.track_id == "1001"
+        assert parse_artwork_id(track.artwork_id) == PlexPicture(
+            path=library.read_track_picture("1001")
+        )
+
+    def test_another_plex_servers_track_is_not_a_plex_track(
+        self, started, household, library
+    ):
+        # The other server's track has a rating key the library has too.
+        theirs = queue_track(1, machine_identifier="anotherserver")
+        household.load_queue(GARAGE, [theirs, queue_track(2)])
+        household.settle()
+
+        track = started.playback(GARAGE).track
+
+        assert track == PlayingTrack(
+            title="Track 1",
+            artist="An Artist",
+            album="An Album",
+            duration_ms=181000,
+            artwork_id=speaker_artwork_id(GARAGE, theirs.uri, theirs.picture),
+            track_id=None,
+        )
+        assert started.speaker_picture(GARAGE, track.artwork_id) == theirs.picture
+
+        household.next(GARAGE)
+        household.settle()
+        ours = started.playback(GARAGE).track
+        assert ours.track_id == "1002"
+        assert parse_artwork_id(ours.artwork_id) == PlexPicture(
+            path=library.read_track_picture("1002")
+        )
+        assert started.speaker_picture(GARAGE, track.artwork_id) is None
+
+    def test_another_plex_servers_track_while_plex_has_never_answered(
+        self, started, household, library, caplog
+    ):
+        theirs = queue_track(1, machine_identifier="anotherserver")
+        household.load_queue(GARAGE, [theirs])
+        household.settle()
+        library.reachable = False
+
+        with caplog.at_level(logging.WARNING):
+            track = started.playback(GARAGE).track
+
+        # Whose track it is is not known: it is not served as the other
+        # server's, with the speaker's picture.
+        assert (track.track_id, track.artwork_id) == (None, None)
+        assert [level for level, _ in logged(caplog)] == ["WARNING"]
+        with pytest.raises(ExternalServiceException) as raised:
+            started.speaker_picture(
+                GARAGE, speaker_artwork_id(GARAGE, theirs.uri, theirs.picture)
+            )
+        assert raised.value.operation == "read which server Plex is"
+
+    def test_a_track_that_is_not_of_the_plex_service_does_not_wait_for_plex(
+        self, started, household, library, caplog
+    ):
+        library.reachable = False
+        household.load_queue(GARAGE, [app_track(1)])
+        household.settle()
+
+        with caplog.at_level(logging.WARNING):
+            artwork_id = started.playback(GARAGE).track.artwork_id
+
+        assert parse_artwork_id(artwork_id) == SpeakerPicture(speaker_id=GARAGE)
+        assert started.speaker_picture(GARAGE, artwork_id) == app_track(1).picture
+        assert logged(caplog) == []
 
     def test_another_tracks_artwork_is_the_speakers_picture(self, started, household):
         household.load_queue(GARAGE, [app_track(1), app_track(2)])
@@ -587,6 +687,19 @@ class TestHouseholdMirrorArtwork:
             speaker_artwork_id(GARAGE, track.uri, track.picture),
         ):
             assert started.speaker_picture(GARAGE, artwork_id) is None
+
+    def test_an_id_of_another_track_does_not_wait_for_plex(
+        self, started, household, library
+    ):
+        library.reachable = False
+        other = queue_track(2)
+
+        assert (
+            started.speaker_picture(
+                GARAGE, speaker_artwork_id(GARAGE, other.uri, other.picture)
+            )
+            is None
+        )
 
     def test_no_speakers_picture_without_a_track_or_a_speaker(self, started, household):
         track = app_track(1)

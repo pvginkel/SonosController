@@ -16,7 +16,7 @@ from app.app_config import AppSettings
 from app.core_exceptions import ExternalServiceException
 from app.services.health_service import CheckStatus
 from app.services.plex_client import PlexapiPlexClient
-from tests.fakes.plex_client import FakePlexClient
+from tests.fakes.plex_client import MACHINE_IDENTIFIER, FakePlexClient
 
 ALBUM = "2001"
 TRACKS = ("2002", "2003", "2004")
@@ -119,6 +119,56 @@ class TestPlexClientReadiness:
 
         assert result.status is CheckStatus.ERROR
         assert result.detail == "Plex did not answer (ConnectionError)"
+
+
+class TestPlexClientMachineIdentifier:
+    def test_it_is_the_servers(self, library):
+        assert library.machine_identifier() == MACHINE_IDENTIFIER
+
+    def test_a_plex_that_has_never_answered_fails(self, library):
+        library.reachable = False
+
+        with pytest.raises(ExternalServiceException) as raised:
+            library.machine_identifier()
+
+        assert raised.value.operation == "read which server Plex is"
+        assert raised.value.cause == "Plex did not answer (ConnectionError)"
+
+        library.reachable = True
+        assert library.machine_identifier() == MACHINE_IDENTIFIER
+
+    @pytest.mark.parametrize(
+        "answered",
+        [
+            lambda plex: plex.machine_identifier(),
+            lambda plex: plex.read_track_picture(TRACKS[0]),
+            lambda plex: plex.check_readiness(),
+        ],
+        ids=["machine_identifier", "read_track_picture", "check_readiness"],
+    )
+    def test_it_is_held_from_plexs_first_answer(self, library, answered):
+        answered(library)
+        library.reachable = False
+
+        assert library.machine_identifier() == MACHINE_IDENTIFIER
+
+    def test_a_picture_is_read_without_reading_the_server(self, library):
+        assert library.read_picture(f"/library/metadata/{ALBUM}/thumb/1", 100)
+        library.reachable = False
+
+        with pytest.raises(ExternalServiceException):
+            library.machine_identifier()
+
+    def test_the_plexapi_client_fails_without_the_token_or_the_address(
+        self, unanswered
+    ):
+        with pytest.raises(ExternalServiceException) as raised:
+            unanswered.machine_identifier()
+
+        assert raised.value.message == (
+            "Cannot read which server Plex is because external service "
+            "failed: Plex did not answer (ConnectionError)"
+        )
 
 
 class TestPlexClientTrackPicture:

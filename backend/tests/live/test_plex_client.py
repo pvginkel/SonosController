@@ -84,6 +84,13 @@ class TestPlexClientReadiness:
         assert result.detail == "Plex refused the token"
 
 
+class TestPlexClientMachineIdentifier:
+    def test_it_is_the_one_the_garages_plex_queue_entries_carry(
+        self, plex, plex_entry
+    ):
+        assert plex.machine_identifier() == plex_entry.machine_identifier
+
+
 class TestPlexClientTrackPicture:
     def test_a_tracks_picture_is_its_albums(self, plex_track, picture):
         path = _PICTURE.fullmatch(picture)

@@ -6,7 +6,8 @@ seen to (``docs/api-design.md`` section 1.9, and the live suite): a track's
 picture is its album's, at a path that carries the album's rating key and
 the picture's stamp; a picture comes back as a JPEG that covers the square
 asked for and keeps its shape; a path with another stamp answers the picture
-as it is now.
+as it is now. Like plexapi, it holds which server it is from Plex's first
+answer.
 
 A test builds its library with ``add_album()``.
 """
@@ -28,6 +29,10 @@ _PICTURE = re.compile(r"/library/metadata/([0-9]+)/thumb/[0-9]+")
 
 _UNREACHABLE = "Plex did not answer (ConnectionError)"
 
+# The server's machine identifier, which the fake household's Plex queue
+# entries carry.
+MACHINE_IDENTIFIER = "fakeserver"
+
 
 @dataclass
 class _Album:
@@ -44,6 +49,9 @@ class FakePlexClient(PlexClient):
         self._next_stamp = 1700000000
         # False: Plex does not answer, as when its pod is down.
         self.reachable = True
+        # plexapi reads the server at the first call that needs it, and
+        # holds it from then on.
+        self._server_read = False
 
     # ------------------------------------------------------------------
     # Building a library
@@ -89,10 +97,18 @@ class FakePlexClient(PlexClient):
     def check_readiness(self) -> CheckResult:
         if not self.reachable:
             return CheckResult(CheckStatus.ERROR, _UNREACHABLE)
+        self._server_read = True
         return CheckResult(CheckStatus.OK)
+
+    def machine_identifier(self) -> str:
+        if not self._server_read:
+            self._require_reachable("read which server Plex is")
+            self._server_read = True
+        return MACHINE_IDENTIFIER
 
     def read_track_picture(self, rating_key: str) -> str | None:
         self._require_reachable(f"read the picture of Plex track {rating_key}")
+        self._server_read = True
         album_key = self._album_of_track.get(rating_key)
         if album_key is None:
             return None

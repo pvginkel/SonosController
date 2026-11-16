@@ -19,7 +19,6 @@ and stops the run with how to fix it where they cannot (TEST-2).
 """
 
 from pathlib import Path
-from urllib.parse import unquote
 
 import pytest
 from dotenv import dotenv_values
@@ -36,6 +35,7 @@ from app.services.sonos_client import (
     TransportAction,
     TransportState,
 )
+from app.utils.plex_queue_entry import PlexQueueEntry, parse_plex_queue_entry
 
 _ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
@@ -151,11 +151,11 @@ def garage(live_client: SoCoSonosClient) -> str:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def plex_track(
+def plex_entry(
     live_client: SoCoSonosClient, live_plex: PlexapiPlexClient, garage: str
-) -> str:
-    """The rating key of the Plex track the Garage's queue is at, once Plex
-    is fit for the suite."""
+) -> PlexQueueEntry:
+    """What the address of the Plex track the Garage's queue is at names,
+    once Plex is fit for the suite."""
     result = live_plex.check_readiness()
     if result.status is not CheckStatus.OK:
         pytest.exit(
@@ -166,23 +166,21 @@ def plex_track(
             returncode=1,
         )
     track = live_client.read_playback(garage).track
-    # A queue entry from the Plex service names its track:
-    # x-sonos-http:<machine>%3a<section>%3a<rating key>%3atrack.mp3?…
-    # (docs/api-design.md section 1.3).
-    entry = unquote(track.uri if track else "").split("?")[0].split(":")
-    if (
-        len(entry) != 5
-        or entry[0] != "x-sonos-http"
-        or not entry[3].isdigit()
-        or not entry[4].startswith("track.")
-    ):
+    entry = parse_plex_queue_entry(track.uri if track else "")
+    if entry is None:
         pytest.exit(
             f"The {GARAGE}'s queue is not at a track from Plex, and the live "
             "suite asks Plex for the picture of that track. Queue an album of "
             "the Plex library from the Sonos app and stop it.",
             returncode=1,
         )
-    return entry[3]
+    return entry
+
+
+@pytest.fixture(scope="session")
+def plex_track(plex_entry: PlexQueueEntry) -> str:
+    """The rating key of the Plex track the Garage's queue is at."""
+    return plex_entry.rating_key
 
 
 @pytest.fixture(autouse=True)
