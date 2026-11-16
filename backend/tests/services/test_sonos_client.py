@@ -1027,6 +1027,57 @@ class TestSonosClientQueue:
         assert playback.transport_state is TransportState.PLAYING
         assert playback.track == queue_track(1)
 
+    def test_select_queue_takes_the_queue_from_a_stream_and_stops(self, household):
+        household.start_stream(GARAGE, "Radio One")
+
+        household.select_queue(GARAGE)
+
+        playback = household.read_playback(GARAGE)
+        assert playback.transport_uri == f"x-rincon-queue:{GARAGE}#0"
+        assert playback.transport_state is TransportState.STOPPED
+        assert (playback.queue_position, playback.track) == (1, queue_track(1))
+        assert household.read_queue(GARAGE, 0, 100).total == 3
+
+    def test_select_queue_of_an_emptied_queue_takes_it_from_a_stream(self, household):
+        household.start_stream(GARAGE, "Radio One")
+        household.clear_queue(GARAGE)
+
+        household.select_queue(GARAGE)
+
+        playback = household.read_playback(GARAGE)
+        assert playback.transport_uri == f"x-rincon-queue:{GARAGE}#0"
+        assert playback.transport_state is TransportState.STOPPED
+        assert (playback.queue_position, playback.queue_length) == (0, 0)
+
+    def test_select_queue_leaves_the_queue_that_is_the_source_as_it_is(
+        self, household
+    ):
+        household.next(GARAGE)
+        household.play(GARAGE)
+        found = household.read_playback(GARAGE)
+
+        household.select_queue(GARAGE)
+
+        assert household.read_playback(GARAGE) == found
+
+    def test_shuffle_is_refused_while_a_stream_is_the_source(self, household):
+        household.start_stream(GARAGE, "Radio One")
+
+        with pytest.raises(ExternalServiceException) as raised:
+            household.set_shuffle(GARAGE, True)
+
+        # As the Garage answered with a radio stream as its source.
+        assert raised.value.operation == f"set the play mode of speaker {GARAGE}"
+        assert raised.value.cause == (
+            "the speaker answered UPnP error 712 (Play mode not supported)"
+        )
+        assert household.read_playback(GARAGE).shuffle is False
+        # Normal, which it already is, is taken.
+        household.set_shuffle(GARAGE, False)
+        household.select_queue(GARAGE)
+        household.set_shuffle(GARAGE, True)
+        assert household.read_playback(GARAGE).shuffle is True
+
     def test_play_from_start_of_an_empty_queue_fails(self, household):
         with pytest.raises(ExternalServiceException) as raised:
             household.play_from_start(LOUNGE)
@@ -1168,12 +1219,17 @@ class TestSonosClientQueue:
             client.read_queue(GARAGE, 0, 100)
         with pytest.raises(ExternalServiceException) as adding:
             client.add_many_to_queue(GARAGE, [_album("10"), _album("20")])
+        with pytest.raises(ExternalServiceException) as selecting:
+            client.select_queue(GARAGE)
 
         assert reading.value.operation == f"read the queue of speaker {GARAGE}"
         assert adding.value.operation == (
             f"add 2 Plex items to the queue of speaker {GARAGE}"
         )
-        for raised in (reading, adding):
+        assert selecting.value.operation == (
+            f"make the queue the source of speaker {GARAGE}"
+        )
+        for raised in (reading, adding, selecting):
             assert raised.value.cause.startswith(
                 "none of the 1 seed speakers answered (the speaker did not answer ("
             )

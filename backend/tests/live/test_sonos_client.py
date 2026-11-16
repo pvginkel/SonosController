@@ -678,6 +678,34 @@ class TestLiveQueue:
         assert sonos.read_queue(garage, 0, 1000) == in_order
         assert sonos.read_playback(garage).shuffle is False
 
+    def test_the_emptied_queue_is_selected_and_shuffled_before_it_is_filled(
+        self, sonos, garage, kept_queue, library
+    ):
+        # What a queueing task's play or shuffle does before it queues: with
+        # a stream as the source, the speaker refuses shuffle (UPnP 712)
+        # until the queue is the source again.
+        sonos.clear_queue(garage)
+
+        sonos.select_queue(garage)
+        sonos.set_shuffle(garage, True)
+
+        selected = sonos.read_playback(garage)
+        assert selected.transport_uri.startswith("x-rincon-queue:")
+        assert (selected.transport_state, selected.queue_length, selected.shuffle) == (
+            TransportState.STOPPED,
+            0,
+            True,
+        )
+        album = library.albums[0]
+        sonos.add_to_queue(garage, library.album(album))
+        filled = sonos.read_playback(garage)
+        assert (filled.transport_state, filled.queue_position, filled.shuffle) == (
+            TransportState.STOPPED,
+            1,
+            True,
+        )
+        assert filled.queue_length == album.track_count
+
     def test_a_queue_change_arrives_as_a_queue_event(
         self, sonos, garage, kept_queue, library
     ):

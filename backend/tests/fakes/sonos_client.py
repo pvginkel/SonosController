@@ -643,8 +643,22 @@ class FakeSonosClient(SonosClient):
         self._send_queue(room)
         self._send_playback(room)
 
+    def select_queue(self, speaker_id: str) -> None:
+        room = self._coordinator(speaker_id, "make the queue the source of")
+        if room.stream:
+            room.stream = None
+            room.state = TransportState.STOPPED
+            self._send_playback(room, full=True)
+
     def set_shuffle(self, speaker_id: str, shuffle: bool) -> None:
-        room = self._coordinator(speaker_id, "set the play mode of")
+        operation = "set the play mode of"
+        room = self._coordinator(speaker_id, operation)
+        if shuffle and room.stream:
+            # As the Garage answered with a radio stream as its source.
+            raise ExternalServiceException(
+                f"{operation} speaker {speaker_id}",
+                "the speaker answered UPnP error 712 (Play mode not supported)",
+            )
         changed = shuffle != room.shuffle
         # A queue that holds tracks is at one of them.
         if changed and room.queue:

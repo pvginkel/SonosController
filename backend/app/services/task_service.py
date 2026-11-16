@@ -358,11 +358,12 @@ class TaskService:
                     task_info.end_time = datetime.now(UTC)
                     task_info.error = error_msg
 
-            # Send failure event
+            # The error's message alone: the traceback, with the causes it
+            # chains, names the addresses the clients' messages leave out.
             failure_event = TaskEvent(
                 event_type=TaskEventType.TASK_FAILED,
                 task_id=task_id,
-                data={"error": error_msg, "traceback": error_trace},
+                data={"error": error_msg},
             )
             self._send_task_event(failure_event, target)
 

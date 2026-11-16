@@ -124,3 +124,17 @@ class CommandRefusedException(InvalidOperationException):
             RINCON_…").
         cause: The speaker's refusal, in the Sonos client's words.
     """
+
+
+class PlaylistNotPlayableException(InvalidOperationException):
+    """Exception raised for a playlist the backend does not queue: one
+    without tracks, or one of more than ``PLAYLIST_MAX_TRACKS``.
+
+    Args:
+        playlist_id: The playlist's rating key.
+        cause: What keeps it from the queue ("it holds no tracks").
+    """
+
+    def __init__(self, playlist_id: str, cause: str) -> None:
+        super().__init__(f"queue playlist {playlist_id}", cause)
+        self.error_code = "PLAYLIST_NOT_PLAYABLE"

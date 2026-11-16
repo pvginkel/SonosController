@@ -2,17 +2,20 @@
 
 Each is an unnamed message of the stream whose data is one JSON object,
 ``{"type": …, "payload": …}`` (``docs/api-design.md`` section 4). These
-models are both what ``EventSender`` sends and what the OpenAPI document
-shows of the stream (``app/api/sse_docs.py``).
+models are both what is sent, ``StreamEvent`` by ``EventSender`` and
+``TaskStreamEvent`` by the template's task service, and what the OpenAPI
+document shows of the stream (``app/api/sse_docs.py``).
 
-An event names what changed and carries no state: a client fetches. The
-models are frozen, so that equal events can be told apart from different
-ones when they are coalesced.
+An event of ``StreamEvent`` names what changed and carries no state: a client
+fetches. Those models are frozen, so that equal events can be told apart
+from different ones when they are coalesced.
 """
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, RootModel
+
+from app.schemas.task_schema import TaskEvent
 
 # Every field is in every message, the ones with a default included.
 _EVENT = ConfigDict(frozen=True, json_schema_serialization_defaults_required=True)
@@ -99,16 +102,50 @@ class QueueChangedEvent(BaseModel):
     payload: SpeakerPayload = Field(description="The speaker whose queue changed.")
 
 
-StreamEvent = Annotated[
-    SpeakersChangedEvent
-    | VolumeChangedEvent
-    | PlaybackChangedEvent
-    | QueueChangedEvent,
-    Field(discriminator="type"),
-]
+class TaskEventPayload(TaskEvent):
+    """What a task reports: that it started, its progress, that it completed
+    or that it failed."""
+
+    model_config = ConfigDict(json_schema_serialization_defaults_required=True)
+
+    data: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "What the event carries, by `event_type`: `null` for "
+            '`task_started`; `{"text": …, "value": …}` for `progress_update`, '
+            "the value from 0 to 1; the task's result for `task_completed`, an "
+            'empty object for a queueing task; `{"error": …}` for '
+            "`task_failed`, the failure in words a client can show."
+        ),
+    )
 
 
-class StreamMessage(RootModel[StreamEvent]):
+class TaskStreamEvent(BaseModel):
+    """A task a client started, such as the queueing of
+    `POST /api/speakers/{speaker_id}/queue`, started, made progress,
+    completed or failed. A client fetches nothing for it: it watches for the
+    `task_id` it was given, and ignores the events of other tasks.
+    """
+
+    model_config = _EVENT
+
+    type: Literal["task_event"] = Field(
+        default="task_event", description="The event's type."
+    )
+    payload: TaskEventPayload = Field(description="The task's event.")
+
+
+_CHANGE_EVENTS = (
+    SpeakersChangedEvent | VolumeChangedEvent | PlaybackChangedEvent | QueueChangedEvent
+)
+
+# What EventSender sends.
+StreamEvent = Annotated[_CHANGE_EVENTS, Field(discriminator="type")]
+
+
+class StreamMessage(
+    RootModel[Annotated[_CHANGE_EVENTS | TaskStreamEvent, Field(discriminator="type")]]
+):
     """One message of the event stream: the JSON object in its data. Its
     `type` tells which event it is.
     """

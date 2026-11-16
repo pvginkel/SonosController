@@ -168,6 +168,8 @@ class ServiceContainer(containers.DeclarativeContainer):
         household_mirror=household_mirror,
         sonos_client=sonos_client,
         plex_client=plex_client,
+        task_service=task_service,
+        playlist_max_tracks=app_config.provided.playlist_max_tracks,
     )
 
 

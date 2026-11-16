@@ -1,5 +1,7 @@
 """Tests for the queue endpoints, on the in-memory household and Plex."""
 
+from datetime import date
+
 import pytest
 
 from app.services.household_mirror import HouseholdMirror
@@ -81,6 +83,35 @@ def failed(operation: str, cause: str) -> dict:
 def values(schema: dict) -> list:
     """The values a schema of a ``Literal`` allows."""
     return schema.get("enum") or [schema["const"]]
+
+
+# The library the queueing tests queue from, without pictures: an artist of
+# two albums, a playlist, an empty playlist and one too large to queue.
+BAND, OLD_ALBUM, NEW_ALBUM = "10", "11", "12"
+MIX, EMPTY, HUGE = "40", "41", "42"
+
+
+@pytest.fixture
+def library(plex: FakePlexClient) -> FakePlexClient:
+    plex.add_artist(BAND, "The Band", size=None)
+    plex.add_album(
+        OLD_ALBUM, ["111", "112"], None, artist=BAND, released=date(2001, 1, 1)
+    )
+    plex.add_album(
+        NEW_ALBUM, ["121", "122"], None, artist=BAND, released=date(2010, 1, 1)
+    )
+    plex.add_playlist(MIX, "A Mix", 2, (1, 1), track_keys=["122", "111"])
+    plex.add_playlist(EMPTY, "Empty", 0)
+    plex.add_playlist(HUGE, "All Music", 12019, (1, 1))
+    return plex
+
+
+def queue_item(client, speaker_id: str, body: object):
+    return client.post(f"/api/speakers/{speaker_id}/queue", json=body)
+
+
+def track_ids(client, speaker_id: str) -> list[str | None]:
+    return [entry["track_id"] for entry in listing(client, speaker_id)["data"]]
 
 
 class TestListQueue:
@@ -336,13 +367,254 @@ class TestClearQueue:
         assert listing(client, GARAGE)["meta"]["total"] == 5
 
 
+class TestQueueItem:
+    @pytest.fixture(autouse=True)
+    def items(self, library: FakePlexClient) -> FakePlexClient:
+        return library
+
+    def test_it_starts_a_task_that_plays_the_item(self, client, household, tasks):
+        response = queue_item(
+            client, GARAGE, {"kind": "album", "item_id": OLD_ALBUM, "action": "play"}
+        )
+
+        assert response.status_code == 202
+        started = response.get_json()
+        assert sorted(started) == ["status", "task_id"]
+        assert started["status"] == "pending"
+        events = tasks.finish(started["task_id"])
+        assert [event["event_type"] for event in events] == [
+            "task_started",
+            "task_completed",
+        ]
+        assert events[-1]["data"] == {}
+        household.settle()
+        assert track_ids(client, GARAGE) == ["111", "112"]
+        playback = client.get(f"/api/speakers/{GARAGE}/playback").get_json()
+        assert (playback["state"], playback["shuffle"]) == ("playing", False)
+        assert playback["queue_position"] == 1
+
+    @pytest.mark.parametrize(
+        ("kind", "item_id", "action", "queued"),
+        [
+            ("artist", BAND, "play", ["121", "122", "111", "112"]),
+            ("artist", BAND, "shuffle", ["111", "112", "121", "122"]),
+            ("artist", BAND, "add", [*(f"100{n}" for n in range(1, 6)), "121", "122", "111", "112"]),
+            ("album", NEW_ALBUM, "play", ["121", "122"]),
+            ("album", NEW_ALBUM, "shuffle", ["121", "122"]),
+            ("album", NEW_ALBUM, "add", [*(f"100{n}" for n in range(1, 6)), "121", "122"]),
+            ("playlist", MIX, "play", ["122", "111"]),
+            ("playlist", MIX, "shuffle", ["111", "122"]),
+            ("playlist", MIX, "add", [*(f"100{n}" for n in range(1, 6)), "122", "111"]),
+            ("track", "112", "play", ["112"]),
+            ("track", "112", "add", [*(f"100{n}" for n in range(1, 6)), "112"]),
+        ],
+    )
+    def test_every_item_takes_its_actions(
+        self, client, household, tasks, kind, item_id, action, queued
+    ):
+        response = queue_item(
+            client, GARAGE, {"kind": kind, "item_id": item_id, "action": action}
+        )
+
+        assert response.status_code == 202
+        events = tasks.finish(response.get_json()["task_id"])
+        assert events[-1]["event_type"] == "task_completed"
+        household.settle()
+        listed = track_ids(client, GARAGE)
+        if action == "shuffle":
+            assert sorted(listed) == queued
+        else:
+            assert listed == queued
+        playback = client.get(f"/api/speakers/{GARAGE}/playback").get_json()
+        assert playback["shuffle"] is (action == "shuffle")
+        assert playback["state"] == ("stopped" if action == "add" else "playing")
+
+    def test_an_artist_plays_oldest_first_on_request(self, client, household, tasks):
+        body = {
+            "kind": "artist",
+            "item_id": BAND,
+            "action": "play",
+            "order": "oldest_first",
+        }
+
+        tasks.finish(queue_item(client, GARAGE, body).get_json()["task_id"])
+
+        household.settle()
+        assert track_ids(client, GARAGE) == ["111", "112", "121", "122"]
+
+    def test_each_step_reaches_every_connection(
+        self, client, household, tasks, connect
+    ):
+        household.join(KITCHEN, GARAGE)
+        household.settle()
+        streams = [connect(), connect()]
+        for stream in streams:
+            stream.events()
+
+        response = queue_item(
+            client, KITCHEN, {"kind": "artist", "item_id": BAND, "action": "play"}
+        )
+        task_id = response.get_json()["task_id"]
+        tasks.finish(task_id)
+        household.settle()
+
+        for stream in streams:
+            events = stream.events()
+            changed = {
+                (event["type"], event["payload"]["speaker_id"])
+                for event in events
+                if event["type"] != "task_event"
+            }
+            assert {
+                ("queue_changed", GARAGE),
+                ("queue_changed", KITCHEN),
+                ("playback_changed", GARAGE),
+                ("playback_changed", KITCHEN),
+            } <= changed
+            reported = [
+                event["payload"]["event_type"]
+                for event in events
+                if event["type"] == "task_event"
+                and event["payload"]["task_id"] == task_id
+            ]
+            assert reported == ["task_started", "task_completed"]
+
+    def test_a_failed_task_reaches_every_connection_in_the_clients_words(
+        self, client, household, tasks, connect
+    ):
+        household.plex_linked = False
+        stream = connect()
+
+        response = queue_item(
+            client, GARAGE, {"kind": "album", "item_id": OLD_ALBUM, "action": "play"}
+        )
+        task_id = response.get_json()["task_id"]
+        failed_event = tasks.finish(task_id)[-1]
+
+        assert response.status_code == 202
+        assert failed_event["event_type"] == "task_failed"
+        assert failed_event["data"] == {
+            "error": (
+                f"Cannot add Plex album {OLD_ALBUM} to the queue of speaker "
+                f"{GARAGE} because external service failed: the speaker lists "
+                "no Plex service"
+            )
+        }
+        (seen,) = [
+            event["payload"]
+            for event in stream.events()
+            if event["type"] == "task_event"
+            and event["payload"]["event_type"] == "task_failed"
+        ]
+        assert seen["data"] == failed_event["data"]
+        # A failed play leaves the queue as far as it got.
+        household.settle()
+        assert listing(client, GARAGE)["meta"]["total"] == 0
+
+    def test_an_unknown_speaker_is_not_found(self, client, household):
+        response = queue_item(
+            client, NOWHERE, {"kind": "album", "item_id": OLD_ALBUM, "action": "play"}
+        )
+
+        assert response.status_code == 404
+        assert without_correlation_id(response.get_json()) == not_found(NOWHERE)
+
+    @pytest.mark.parametrize(
+        ("kind", "item_id", "named"),
+        [
+            ("artist", "99", "Artist"),
+            ("album", BAND, "Album"),
+            ("track", OLD_ALBUM, "Track"),
+            ("playlist", "99", "Playlist"),
+        ],
+    )
+    def test_an_item_plex_does_not_have_is_not_found(
+        self, client, household, kind, item_id, named
+    ):
+        response = queue_item(
+            client, GARAGE, {"kind": kind, "item_id": item_id, "action": "add"}
+        )
+
+        assert response.status_code == 404
+        assert without_correlation_id(response.get_json()) == {
+            "error": f"{named} {item_id} was not found",
+            "details": {"message": "The requested resource could not be found"},
+            "code": "ITEM_NOT_FOUND",
+        }
+        assert listing(client, GARAGE)["meta"]["total"] == 5
+
+    @pytest.mark.parametrize(
+        ("playlist", "cause"),
+        [
+            (EMPTY, "it holds no tracks"),
+            (
+                HUGE,
+                "it holds 12019 tracks, more than the 1000 a playlist may hold "
+                "to be queued",
+            ),
+        ],
+    )
+    def test_a_playlist_that_cannot_be_queued_is_a_conflict(
+        self, client, household, playlist, cause
+    ):
+        response = queue_item(
+            client, GARAGE, {"kind": "playlist", "item_id": playlist, "action": "play"}
+        )
+
+        assert response.status_code == 409
+        body = without_correlation_id(response.get_json())
+        assert body["error"] == f"Cannot queue playlist {playlist} because {cause}"
+        assert body["code"] == "PLAYLIST_NOT_PLAYABLE"
+        assert listing(client, GARAGE)["meta"]["total"] == 5
+
+    def test_plex_that_does_not_answer_is_a_bad_gateway(
+        self, client, household, plex, test_app_settings
+    ):
+        plex.reachable = False
+
+        response = queue_item(
+            client, GARAGE, {"kind": "album", "item_id": OLD_ALBUM, "action": "play"}
+        )
+
+        assert response.status_code == 502
+        assert without_correlation_id(response.get_json()) == failed(
+            f"read Plex album {OLD_ALBUM}", "Plex did not answer (ConnectionError)"
+        )
+        text = response.get_data(as_text=True)
+        assert "192.0.2." not in text
+        assert test_app_settings.plex_token not in text
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            None,
+            [],
+            {},
+            {"item_id": OLD_ALBUM, "action": "play"},
+            {"kind": "album", "action": "play"},
+            {"kind": "album", "item_id": OLD_ALBUM},
+            {"kind": "song", "item_id": OLD_ALBUM, "action": "play"},
+            {"kind": "album", "item_id": 11, "action": "play"},
+            {"kind": "album", "item_id": OLD_ALBUM, "action": "replace"},
+            {"kind": "album", "item_id": OLD_ALBUM, "action": "play", "order": "new"},
+            {"kind": "album", "item_id": OLD_ALBUM, "action": "play", "at": 1},
+            {"kind": "track", "item_id": "112", "action": "shuffle"},
+        ],
+    )
+    def test_a_body_the_route_does_not_take_is_refused(self, client, household, body):
+        response = queue_item(client, GARAGE, body)
+
+        assert response.status_code == 400
+        assert listing(client, GARAGE)["meta"]["total"] == 5
+
+
 class TestQueueDocument:
     @pytest.fixture
     def path(self, openapi_document) -> dict:
         return openapi_document["paths"][QUEUE]
 
-    def test_the_queue_is_read_and_cleared(self, path):
-        assert sorted(path) == ["delete", "get"]
+    def test_the_queue_is_read_queued_on_and_cleared(self, path):
+        assert sorted(path) == ["delete", "get", "post"]
 
     def test_the_listing_says_what_it_serves(self, path):
         operation = path["get"]
@@ -407,7 +679,11 @@ class TestQueueDocument:
 
     @pytest.mark.parametrize(
         ("method", "statuses"),
-        [("get", ["200", "400", "404", "502"]), ("delete", ["204", "404", "502"])],
+        [
+            ("get", ["200", "400", "404", "502"]),
+            ("post", ["202", "400", "404", "409", "502"]),
+            ("delete", ["204", "404", "502"]),
+        ],
     )
     def test_every_error_status_is_documented_with_the_envelope(
         self, path, method, statuses
@@ -430,7 +706,56 @@ class TestQueueDocument:
         for event in ("`queue_changed`", "`playback_changed`"):
             assert event in operation["description"]
 
-    @pytest.mark.parametrize("method", ["get", "delete"])
+    def test_queueing_says_what_it_does(self, path):
+        operation = path["post"]
+
+        assert operation["summary"] == (
+            "Play, shuffle or add an item of the library on the speaker's group."
+        )
+        description = " ".join(operation["description"].split())
+        for part in (
+            "`play` and `shuffle` replace the queue",
+            "`add` appends and changes nothing else",
+            "release order",
+            "`task_id`",
+            "`task_event`",
+            "`task_completed`",
+            "`task_failed`",
+            "`queue_changed`",
+            "as far as it got",
+        ):
+            assert part in description
+        responses = operation["responses"]
+        assert "`ITEM_NOT_FOUND`" in responses["404"]["description"]
+        assert "`PLAYLIST_NOT_PLAYABLE`" in responses["409"]["description"]
+        assert "track" in responses["400"]["description"]
+
+    def test_queueing_takes_a_described_item(self, openapi_document, path):
+        body = path["post"]["requestBody"]
+        schema = json_schema(openapi_document, body)
+
+        assert body["required"] is True
+        assert sorted(schema["properties"]) == ["action", "item_id", "kind", "order"]
+        assert sorted(schema["required"]) == ["action", "item_id", "kind"]
+        assert undescribed(openapi_document, schema) == []
+        fields = {
+            name: schema_of(openapi_document, field)
+            for name, field in schema["properties"].items()
+        }
+        assert values(fields["kind"]) == ["artist", "album", "track", "playlist"]
+        assert values(fields["action"]) == ["play", "shuffle", "add"]
+        assert values(fields["order"]) == ["newest_first", "oldest_first"]
+        assert fields["order"]["default"] == "newest_first"
+        assert fields["item_id"]["type"] == "string"
+
+    def test_queueing_answers_the_started_task(self, openapi_document, path):
+        accepted = path["post"]["responses"]["202"]
+        started = json_schema(openapi_document, accepted)
+
+        assert sorted(started["properties"]) == ["status", "task_id"]
+        assert "`task_event`" in accepted["description"]
+
+    @pytest.mark.parametrize("method", ["get", "post", "delete"])
     def test_the_speaker_is_described(self, path, method):
         (speaker_id,) = [
             parameter

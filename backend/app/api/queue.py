@@ -10,7 +10,9 @@ from app.schemas.queue_schema import (
     QueueEntrySchema,
     QueueListQuerySchema,
     QueuePageSchema,
+    QueueRequestSchema,
 )
+from app.schemas.task_schema import TaskStartResponse
 from app.services.container import ServiceContainer
 from app.services.queue_service import QueueService
 from app.utils.pagination import build_pagination_meta
@@ -88,3 +90,59 @@ def clear_queue(
     """
     queue_service.clear(speaker_id)
     return "", 204
+
+
+@queue_bp.route("", methods=["POST"])
+@api.validate(
+    json=QueueRequestSchema,
+    resp=SpectreeResponse(
+        HTTP_202=(
+            TaskStartResponse,
+            "The task that queues the item started. Its `task_id` names its "
+            "events, `task_event` on the event stream.",
+        ),
+        HTTP_400=(
+            ApiErrorResponseSchema,
+            "The body is not a JSON object, lacks `kind`, `item_id` or "
+            "`action`, holds a value none of them takes or a field that is "
+            "not one of the four, or asks to shuffle a track.",
+        ),
+        HTTP_404=(
+            ApiErrorResponseSchema,
+            "No speaker has this id, the code `SPEAKER_NOT_FOUND`; or Plex has "
+            "no item of this `kind` with this `item_id`, the code "
+            "`ITEM_NOT_FOUND`.",
+        ),
+        HTTP_409=(
+            ApiErrorResponseSchema,
+            "The playlist holds no tracks, or more than the backend queues: "
+            "the code `PLAYLIST_NOT_PLAYABLE`. Or the backend is shutting "
+            "down: `INVALID_OPERATION`.",
+        ),
+        HTTP_502=(ApiErrorResponseSchema, "Plex failed or did not answer."),
+    ),
+    path_parameter_descriptions=SPEAKER_ID_PARAMETER,
+)
+@inject
+def queue_item(
+    speaker_id: str,
+    queue_service: QueueService = Provide[ServiceContainer.queue_service],
+) -> tuple[Response, int]:
+    """Play, shuffle or add an item of the library on the speaker's group.
+
+    `play` and `shuffle` replace the queue and play it from its first track;
+    `add` appends and changes nothing else. An artist with `play` or `add`
+    is its albums in release order, `order` deciding which comes first, each
+    in disc and track order; with `shuffle` it is all its tracks, shuffled.
+
+    The speaker and the item are checked, then a task does the queueing and
+    the answer is its `task_id`. Its events, `task_event`, reach every
+    connection: `task_completed` when it is done, or `task_failed` with
+    `data.error`, the failure in words a client can show. Music starts once
+    the item is queued, or an artist's first album, and the rest of the
+    artist follows; each step reaches the clients as `queue_changed`. A
+    failed task leaves the queue as far as it got.
+    """
+    queueing = QueueRequestSchema.model_validate(request.get_json())
+    started = queue_service.queue(speaker_id, queueing)
+    return jsonify(started.model_dump(mode="json")), 202

@@ -1,9 +1,9 @@
-"""The queue of a speaker's group, as the API answers it, and the query of its
-list (``docs/api-design.md`` section 3.4)."""
+"""The queue of a speaker's group, as the API answers it, the query of its
+list and what a client asks to queue (``docs/api-design.md`` section 3.4)."""
 
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.schemas.common import PaginationMetaSchema, PaginationQuerySchema
 
@@ -80,3 +80,51 @@ class QueuePageSchema(BaseModel):
             "than its queue, and for an empty queue."
         ),
     )
+
+
+QueueItemKind = Literal["artist", "album", "track", "playlist"]
+QueueAction = Literal["play", "shuffle", "add"]
+
+
+class QueueRequestSchema(BaseModel):
+    """An item of the library to play, shuffle or add to the queue of the
+    speaker's group. A track is played or added, never shuffled."""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    kind: QueueItemKind = Field(
+        description="What the item is."
+    )
+    item_id: str = Field(
+        description=(
+            "Plex's rating key of the item: the `id` of an artist, an album, "
+            "a track or a playlist of `/api/library`."
+        )
+    )
+    action: QueueAction = Field(
+        description=(
+            "`play` replaces the queue with the item and plays it in order. "
+            "`shuffle` replaces the queue with the item and plays it "
+            "shuffled. `add` appends the item to the queue and changes "
+            "nothing else: not the play mode, not what plays."
+        )
+    )
+    order: Literal["newest_first", "oldest_first"] = Field(
+        "newest_first",
+        description=(
+            "The order of an artist's albums with `play` or `add`: by release "
+            "date, `newest_first` or `oldest_first`, each album in disc and "
+            "track order. Ignored for every other item and action."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _a_track_is_not_shuffled(self) -> Self:
+        if self.kind == "track" and self.action == "shuffle":
+            raise ValueError("a track is played or added, not shuffled")
+        return self
+
+
+class QueueTaskResultSchema(BaseModel):
+    """What a queueing task that completed reports: nothing but that it
+    completed."""

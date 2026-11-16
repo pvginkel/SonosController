@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import uuid
 from collections.abc import Callable, Generator
 from pathlib import Path
@@ -35,6 +36,7 @@ from app.services.artwork_service import ArtworkService
 from app.services.event_sender import COALESCE_SECONDS
 from app.services.household_mirror import CHECK_SECONDS, HouseholdMirror
 from app.services.sse_connection_manager import SSEConnection
+from app.services.task_service import TaskService
 
 # Import all infrastructure fixtures
 from tests.conftest_infrastructure import *  # noqa: F403
@@ -227,6 +229,62 @@ class EventStream:
             assert frame is not None, "the connection was closed"
             assert frame.startswith("data: ") and frame.endswith("\n\n")
             events.append(json.loads(frame.removeprefix("data: ")))
+
+
+class TaskWatch:
+    """The events of the tasks a test starts, as a connection to the event
+    stream receives them, which every task's events reach."""
+
+    def __init__(self, connection: SSEConnection, task_service: TaskService) -> None:
+        self._connection = connection
+        self._task_service = task_service
+        self._finished: list[str] = []
+
+    def finish(self, task_id: str, timeout: float = 5.0) -> list[dict[str, Any]]:
+        """Wait for the task's last event, ``task_completed`` or
+        ``task_failed``, and answer the task's events up to it, each the
+        payload of a ``task_event``; the stream's other events are passed
+        over."""
+        deadline = time.perf_counter() + timeout
+        events: list[dict[str, Any]] = []
+        while True:
+            try:
+                frame = self._connection.next_frame(
+                    max(0.0, deadline - time.perf_counter())
+                )
+            except Empty:
+                pytest.fail(f"Task {task_id} did not end within {timeout} s")
+            assert frame is not None, "the connection was closed"
+            message = json.loads(frame.removeprefix("data: "))
+            if message["type"] != "task_event":
+                continue
+            if message["payload"]["task_id"] != task_id:
+                continue
+            events.append(message["payload"])
+            if message["payload"]["event_type"] in ("task_completed", "task_failed"):
+                self._finished.append(task_id)
+                return events
+
+    def remove_finished(self) -> None:
+        for task_id in self._finished:
+            self._task_service.remove_completed_task(task_id)
+
+
+@pytest.fixture
+def tasks(app: Flask) -> Generator[TaskWatch]:
+    """Wait for the tasks a test starts. The connection it watches on is
+    opened before the test starts any, and the tasks that ended are removed
+    from the task service, which lives for the whole run."""
+    manager = app.container.sse_connection_manager()
+    connection = manager.on_connect(
+        f"tasks-{uuid.uuid4()}", "local-user", local_admin=True
+    )
+    watch = TaskWatch(connection, app.container.task_service())
+    try:
+        yield watch
+    finally:
+        manager.on_disconnect(connection)
+        watch.remove_finished()
 
 
 @pytest.fixture

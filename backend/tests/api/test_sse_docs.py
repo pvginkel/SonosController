@@ -14,6 +14,7 @@ from app.schemas.stream_event_schema import (
     SpeakerPayload,
     SpeakersChangedEvent,
     StreamMessage,
+    TaskStreamEvent,
     VolumeChangedEvent,
 )
 from tests.fakes.sonos_client import queue_track
@@ -62,11 +63,14 @@ class TestEventStreamDocument:
             "`volume_changed`",
             "`playback_changed`",
             "`queue_changed`",
+            "`task_event`",
         ]
         assert "`GET /api/speakers`" in rows[1]
         assert "`GET /api/speakers/{speaker_id}`" in rows[2]
         assert "`GET /api/speakers/{speaker_id}/playback`" in rows[3]
         assert "`GET /api/speakers/{speaker_id}/queue`" in rows[4]
+        assert "Nothing" in rows[5]
+        assert "`POST /api/speakers/{speaker_id}/queue`" in rows[5]
 
     def test_the_request_id_is_a_required_query_parameter(self, document):
         (parameter,) = document["paths"]["/api/sse/stream"]["get"]["parameters"]
@@ -88,9 +92,10 @@ class TestEventStreamDocument:
             "playback_changed",
             "queue_changed",
             "speakers_changed",
+            "task_event",
             "volume_changed",
         ]
-        assert len(message["oneOf"]) == 4
+        assert len(message["oneOf"]) == 5
 
     @pytest.mark.parametrize(
         ("event_type", "payload_properties"),
@@ -123,6 +128,33 @@ class TestEventStreamDocument:
         for field in payload.get("properties", {}).values():
             assert field["type"] == "string"
             assert field["description"]
+
+    def test_the_task_event_is_the_tasks_event_with_every_field_described(
+        self, document
+    ):
+        responses = document["paths"]["/api/sse/stream"]["get"]["responses"]
+        message = schema(document, responses["200"]["content"]["text/event-stream"]["schema"])
+        event = schema(document, {"$ref": message["discriminator"]["mapping"]["task_event"]})
+
+        assert "`task_id`" in event["description"]
+        assert sorted(event["required"]) == ["payload", "type"]
+        assert event["properties"]["type"]["const"] == "task_event"
+        payload = schema(document, event["properties"]["payload"])
+        fields = ["data", "event_type", "task_id", "timestamp"]
+        assert sorted(payload["properties"]) == fields
+        assert sorted(payload["required"]) == fields
+        for name, field in payload["properties"].items():
+            assert field.get("description"), name
+        event_type = schema(document, payload["properties"]["event_type"])
+        assert sorted(event_type["enum"]) == [
+            "progress_update",
+            "task_completed",
+            "task_failed",
+            "task_started",
+        ]
+        data = payload["properties"]["data"]["description"]
+        for part in ("`task_completed`", "`task_failed`", '`{"error": …}`'):
+            assert part in data
 
     def test_the_document_is_the_same_each_time_it_is_asked_for(self, client, document):
         assert client.get("/api/docs/openapi.json").get_json() == document
@@ -179,6 +211,41 @@ class TestEventStream:
             'data: {"type":"speakers_changed","payload":{}}\n\n',
             'data: {"type":"volume_changed","payload":' + speaker + "}\n\n",
         ]
+
+    def test_a_tasks_events_are_sent_as_the_document_says(
+        self, client, sonos, plex, mirror, tasks
+    ):
+        sonos.add_room(GARAGE, "Garage")
+        plex.add_album("11", ["111"], None)
+        mirror.start()
+        sonos.settle()
+
+        response = client.get("/api/sse/stream?request_id=tasks", buffered=False)
+        try:
+            frames = response.iter_encoded()
+            assert next(frames) == b"event: ready\ndata:\n\n"
+            started = client.post(
+                f"/api/speakers/{GARAGE}/queue",
+                json={"kind": "album", "item_id": "11", "action": "add"},
+            ).get_json()
+            tasks.finish(started["task_id"])
+            reported = []
+            while len(reported) < 2:
+                frame = next(frames).decode()
+                event = StreamMessage.model_validate_json(
+                    frame.removeprefix("data: ")
+                ).root
+                if isinstance(event, TaskStreamEvent):
+                    reported.append(event.payload)
+        finally:
+            response.close()
+
+        assert [payload.task_id for payload in reported] == [started["task_id"]] * 2
+        assert [payload.event_type for payload in reported] == [
+            "task_started",
+            "task_completed",
+        ]
+        assert reported[1].data == {}
 
     def test_a_request_without_a_request_id_is_rejected_as_documented(self, client):
         response = client.get("/api/sse/stream")

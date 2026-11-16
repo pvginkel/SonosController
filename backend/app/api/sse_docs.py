@@ -47,6 +47,9 @@ went, was renamed, or joined or left a group. |
 `GET /api/speakers/{speaker_id}/playback` |
 | `queue_changed` | `{"speaker_id": …}` | \
 `GET /api/speakers/{speaker_id}/queue`, when it shows the queue |
+| `task_event` | the task's `event_type`, `task_id`, `timestamp` and \
+`data` | Nothing: it reports a task the client started, such as \
+`POST /api/speakers/{speaker_id}/queue`'s |
 
 An event about a group, its volume, what it plays or its queue, is sent once \
 for every speaker of the group, so a client follows the one speaker it \

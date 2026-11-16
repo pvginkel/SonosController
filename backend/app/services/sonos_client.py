@@ -407,8 +407,17 @@ class SonosClient(ABC):
         """Empty the group's queue."""
 
     @abstractmethod
+    def select_queue(self, speaker_id: str) -> None:
+        """Make the group's queue the source it plays from, without playing
+        it: a stream or another source that plays stops. A queue that is
+        the source already stays as it is."""
+
+    @abstractmethod
     def set_shuffle(self, speaker_id: str, shuffle: bool) -> None:
-        """Set the group's play mode: shuffle without repeat, or normal."""
+        """Set the group's play mode: shuffle without repeat, or normal.
+
+        While a stream is the source, a speaker refuses shuffle.
+        """
 
     @abstractmethod
     def add_to_queue(self, speaker_id: str, item: PlexItem) -> None:
@@ -708,6 +717,17 @@ class SoCoSonosClient(SonosClient):
     def clear_queue(self, speaker_id: str) -> None:
         with _speaker_call(f"clear the queue of speaker {speaker_id}"):
             self._coordinator(speaker_id).clear_queue()
+
+    def select_queue(self, speaker_id: str) -> None:
+        with _speaker_call(f"make the queue the source of speaker {speaker_id}"):
+            coordinator = self._coordinator(speaker_id)
+            coordinator.avTransport.SetAVTransportURI(
+                [
+                    ("InstanceID", 0),
+                    ("CurrentURI", f"x-rincon-queue:{coordinator.uid}#0"),
+                    ("CurrentURIMetaData", ""),
+                ]
+            )
 
     def set_shuffle(self, speaker_id: str, shuffle: bool) -> None:
         with _speaker_call(f"set the play mode of speaker {speaker_id}"):
