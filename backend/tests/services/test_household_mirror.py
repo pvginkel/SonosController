@@ -6,6 +6,7 @@ display would make it.
 """
 
 import logging
+import threading
 import time
 from collections.abc import Callable
 
@@ -15,6 +16,7 @@ from app.core_exceptions import ExternalServiceException
 from app.exceptions import SpeakerNotFoundException
 from app.services.event_sender import COALESCE_SECONDS
 from app.services.household_mirror import (
+    CHECK_SECONDS,
     HouseholdMirror,
     PlaybackAction,
     PlaybackSource,
@@ -38,6 +40,7 @@ from tests.fakes.sonos_client import FakeSonosClient, app_track, queue_track
 GARAGE = "RINCON_FAKE0000000101400"
 LOUNGE = "RINCON_FAKE0000000201400"
 KITCHEN = "RINCON_FAKE0000000301400"
+ATTIC = "RINCON_FAKE0000000401400"
 LOUNGE_SURROUNDS = ("RINCON_FAKE0000000211400", "RINCON_FAKE0000000221400")
 
 PLAY = PlaybackAction.PLAY
@@ -63,8 +66,9 @@ def in_any_order(events: list[dict]) -> list[dict]:
 
 
 def eventually(condition: Callable[[], bool]) -> None:
-    """Wait for what the mirror's healing thread does: ``settle()`` waits for
-    the household's events alone."""
+    """Wait for what one of the mirror's own reads of the layout finds, which
+    no event of the household sets off: ``settle()`` waits for what the
+    events set off, and cannot know which read finds it."""
     deadline = time.perf_counter() + 5.0
     while not condition():
         assert time.perf_counter() < deadline, "the mirror did not heal in time"
@@ -91,6 +95,42 @@ def once(change: Callable[[], None]) -> Callable[[str], None]:
             change()
 
     return before_call
+
+
+class HeldCall:
+    """A ``before_call`` that holds the first call to a room until
+    ``release()``, as a speaker that takes its time to answer holds the
+    thread that asks it. ``reached`` is the room of each call that came to
+    the household while none was held."""
+
+    def __init__(self, household: FakeSonosClient, speaker_id: str) -> None:
+        self._speaker_id = speaker_id
+        self._held = threading.Event()
+        self._released = threading.Event()
+        self.reached: list[str] = []
+        household.before_call = self._before_call
+
+    def wait(self) -> None:
+        """Wait until the call is held."""
+        assert self._held.wait(5.0), "no call came to the room"
+
+    def release(self) -> None:
+        self._released.set()
+
+    def _before_call(self, speaker_id: str) -> None:
+        self.reached.append(speaker_id)
+        if speaker_id == self._speaker_id and not self._held.is_set():
+            self._held.set()
+            assert self._released.wait(5.0), "the call was not released"
+
+
+def apply(household: FakeSonosClient, mirror: HouseholdMirror) -> None:
+    """Wait until the mirror has applied what the household sent it, for a
+    household that does not deliver its events in step with the mirror."""
+    household.settle()
+    assert mirror.wait_until_applied(5.0), "the mirror did not apply in time"
+    # What the subscriptions the mirror made start with.
+    household.settle()
 
 
 @pytest.fixture
@@ -1291,8 +1331,9 @@ class TestHouseholdMirrorHealing:
         household.before_call = once(lambda: household.set_volume(GARAGE, 33))
 
         household.fail_renewals(GARAGE)
-        eventually(lambda: started.speaker(GARAGE).volume == 33)
+        household.settle()
 
+        assert started.speaker(GARAGE).volume == 33
         assert started.speaker(GARAGE).group.volume == 33
         assert household.subscription_count(GARAGE) == 4
         assert stream.events() == [volume_changed(GARAGE)]
@@ -1310,9 +1351,9 @@ class TestHouseholdMirrorHealing:
         household.before_call = reached.append
 
         household.fail_renewals(GARAGE)
+        household.settle()
 
         # Four subscriptions and the four reads of a room, and no more.
-        eventually(lambda: len(reached) == 8)
         assert reached == [GARAGE] * 8
         assert household.subscription_count(LOUNGE) == 4
 
@@ -1375,26 +1416,6 @@ class TestHouseholdMirrorHealing:
             playback_changed(LOUNGE),
         ]
 
-    def test_a_change_made_while_a_room_is_read_again_is_kept(
-        self, started, household
-    ):
-        # A room's playback is read last, as the eighth call to it. A change
-        # of volume made then, after the volume was read, arrives as an event
-        # of the new subscriptions before the mirror holds what it read.
-        calls = []
-
-        def change_the_volume_once_it_is_read(speaker_id):
-            calls.append(speaker_id)
-            if len(calls) == 8:
-                household.set_volume(GARAGE, 33)
-                household.settle()
-
-        household.before_call = change_the_volume_once_it_is_read
-        household.fail_renewals(GARAGE)
-
-        eventually(lambda: started.speaker(GARAGE).volume == 33)
-        assert started.speaker(GARAGE).group.volume == 33
-
     def test_a_restarted_speaker_that_does_not_answer_keeps_what_is_held(
         self, started, household, connect, caplog
     ):
@@ -1441,8 +1462,220 @@ class TestHouseholdMirrorHealing:
         household.remove_room(GARAGE)
         household.settle()
 
-        eventually(lambda: [speaker.id for speaker in started.speakers()] == [LOUNGE])
+        assert [speaker.id for speaker in started.speakers()] == [LOUNGE]
         assert household.subscription_count(GARAGE) == 0
+
+
+class TestHouseholdMirrorHealingThread:
+    """A layout the speakers send is applied on the mirror's healing thread,
+    not on the thread that delivers the speakers' events: here the household
+    delivers its events whatever that thread does."""
+
+    @pytest.fixture
+    def in_step(self) -> bool:
+        return False
+
+    def test_a_room_that_takes_its_time_holds_back_no_other_rooms_events(
+        self, started, household, connect
+    ):
+        stream = connect()
+        household.silence_room(KITCHEN)
+        call = HeldCall(household, KITCHEN)
+
+        household.add_room(KITCHEN, "Kitchen")
+        try:
+            call.wait()
+            household.set_volume(GARAGE, 33)
+            household.settle()
+
+            assert started.speaker(GARAGE).volume == 33
+            # The room's volume, and its group's.
+            assert stream.events() == [volume_changed(GARAGE)] * 2
+        finally:
+            call.release()
+
+        apply(household, started)
+        assert [speaker.id for speaker in started.speakers()] == [GARAGE, LOUNGE]
+
+    def test_of_the_layouts_sent_while_one_is_applied_the_latest_is_applied(
+        self, started, household
+    ):
+        call = HeldCall(household, KITCHEN)
+
+        household.add_room(KITCHEN, "Kitchen")
+        try:
+            call.wait()
+            # A layout with the Attic, one without it, and one that renames
+            # the Lounge.
+            household.add_room(ATTIC, "Attic")
+            household.remove_room(ATTIC)
+            household.rename_room(LOUNGE, "Living Room")
+            household.settle()
+        finally:
+            call.release()
+
+        apply(household, started)
+        assert [speaker.name for speaker in started.speakers()] == [
+            "Garage",
+            "Kitchen",
+            "Living Room",
+        ]
+        # The layout that had the Attic was never applied: nothing asked it.
+        assert set(call.reached) == {KITCHEN}
+
+    def test_a_room_that_joins_reports_it_before_the_layout_is_applied(
+        self, started, household, connect
+    ):
+        call = HeldCall(household, KITCHEN)
+        household.play(GARAGE)
+        household.settle()
+
+        household.add_room(KITCHEN, "Kitchen")
+        try:
+            call.wait()
+            # The layout waits for the healing thread, and what the rooms
+            # report of the join does not.
+            household.join(LOUNGE, GARAGE)
+            household.settle()
+            assert started.speaker(LOUNGE).group.member_ids == (LOUNGE,)
+        finally:
+            call.release()
+
+        apply(household, started)
+        group = SpeakerGroup(
+            coordinator_id=GARAGE, member_ids=(GARAGE, LOUNGE), volume=30, muted=False
+        )
+        assert started.speaker(GARAGE).group == group
+        assert started.speaker(LOUNGE).group == group
+        assert started.playback(LOUNGE) == started.playback(GARAGE)
+        assert started.playback(LOUNGE).state is PlaybackStatus.PLAYING
+
+    def test_a_room_that_leaves_reports_it_before_the_layout_is_applied(
+        self, household, mirror
+    ):
+        household.join(LOUNGE, GARAGE)
+        mirror.start()
+        household.settle()
+        call = HeldCall(household, KITCHEN)
+
+        household.add_room(KITCHEN, "Kitchen")
+        try:
+            call.wait()
+            household.unjoin(LOUNGE)
+            household.set_volume(LOUNGE, 45)
+            household.settle()
+            assert mirror.speaker(LOUNGE).group.member_ids == (GARAGE, LOUNGE)
+        finally:
+            call.release()
+
+        apply(household, mirror)
+        assert mirror.speaker(GARAGE).group == SpeakerGroup(
+            coordinator_id=GARAGE, member_ids=(GARAGE,), volume=20, muted=False
+        )
+        assert mirror.speaker(LOUNGE).group == SpeakerGroup(
+            coordinator_id=LOUNGE, member_ids=(LOUNGE,), volume=45, muted=False
+        )
+        assert mirror.playback(LOUNGE).track is None
+        assert mirror.playback(GARAGE).queue_length == 3
+
+    def test_a_change_made_while_a_room_is_read_again_is_kept(
+        self, started, household
+    ):
+        # A room's playback is read last, as the eighth call to it. A change
+        # of volume made then, after the volume was read, arrives as an event
+        # of the new subscriptions before the mirror holds what it read.
+        calls = []
+
+        def change_the_volume_once_it_is_read(speaker_id):
+            calls.append(speaker_id)
+            if len(calls) == 8:
+                household.set_volume(GARAGE, 33)
+                household.settle()
+
+        household.before_call = change_the_volume_once_it_is_read
+        household.fail_renewals(GARAGE)
+
+        apply(household, started)
+        assert started.speaker(GARAGE).volume == 33
+        assert started.speaker(GARAGE).group.volume == 33
+
+    def test_stop_does_not_wait_for_the_healing_threads_next_read_of_the_layout(
+        self, started, household
+    ):
+        # The mirror logs that the Kitchen does not answer once it applied
+        # the layout, on its healing thread, which is held there until
+        # stop() was called: wait_until_applied() returns for a mirror that
+        # stopped.
+        logging_it = threading.Event()
+
+        class UntilStopped(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                logging_it.set()
+                assert started.wait_until_applied(5.0)
+
+        logger = logging.getLogger("app.services.household_mirror")
+        handler = UntilStopped(logging.WARNING)
+        logger.addHandler(handler)
+        try:
+            household.silence_room(KITCHEN)
+            household.add_room(KITCHEN, "Kitchen")
+            assert logging_it.wait(5.0)
+
+            before = time.perf_counter()
+            started.stop()
+            took = time.perf_counter() - before
+        finally:
+            logger.removeHandler(handler)
+
+        assert took < CHECK_SECONDS / 2
+
+    def test_wait_until_applied_waits_for_a_layout_that_is_being_applied(
+        self, started, household
+    ):
+        call = HeldCall(household, KITCHEN)
+
+        household.add_room(KITCHEN, "Kitchen")
+        try:
+            call.wait()
+            assert started.wait_until_applied(0.05) is False
+        finally:
+            call.release()
+
+        assert started.wait_until_applied(5.0) is True
+        assert len(started.speakers()) == 3
+
+    def test_wait_until_applied_waits_for_a_lost_subscription(
+        self, started, household
+    ):
+        call = HeldCall(household, GARAGE)
+
+        household.fail_renewals(GARAGE)
+        try:
+            call.wait()
+            assert started.wait_until_applied(0.05) is False
+        finally:
+            call.release()
+
+        assert started.wait_until_applied(5.0) is True
+        assert household.subscription_count(GARAGE) == 4
+
+    def test_wait_until_applied_does_not_wait_when_nothing_was_sent(self, started):
+        assert started.wait_until_applied(0) is True
+
+    def test_wait_until_applied_does_not_wait_for_a_mirror_that_is_not_started(
+        self, mirror
+    ):
+        assert mirror.wait_until_applied(0) is True
+
+    def test_wait_until_applied_does_not_wait_for_a_mirror_that_stopped(
+        self, started, household
+    ):
+        started.stop()
+
+        household.add_room(KITCHEN, "Kitchen")
+        household.settle()
+
+        assert started.wait_until_applied(0) is True
 
 
 class TestHouseholdMirrorChecks:

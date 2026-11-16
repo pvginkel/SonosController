@@ -1015,6 +1015,55 @@ class TestSonosClientSubscriptions:
         with pytest.raises(RuntimeError, match="the handler failed"):
             household.settle()
 
+    def test_an_event_is_delivered_once_what_is_in_step_is_done_with_the_one_before(
+        self, household
+    ):
+        listener, _ = _subscribe(household, GARAGE, SonosService.RENDERING_CONTROL)
+        # What was delivered at each wait for what took the events.
+        delivered = []
+        household.in_step_with(
+            lambda timeout: delivered.append(len(listener.events)) or True
+        )
+
+        household.set_volume(GARAGE, 21)
+        household.set_volume(GARAGE, 22)
+        household.settle()
+
+        assert [event.volume for event in listener.events] == [21, 22]
+        assert delivered == [1, 2]
+
+    def test_what_is_in_step_and_is_not_done_in_time_fails_the_test(self, household):
+        _subscribe(household, GARAGE, SonosService.RENDERING_CONTROL)
+        household.in_step_with(lambda timeout: False)
+
+        household.set_volume(GARAGE, 21)
+
+        with pytest.raises(AssertionError, match="was not done in time"):
+            household.settle()
+
+    def test_unsubscribe_does_not_wait_for_what_is_in_step(self, household):
+        import threading
+
+        listener, subscription = _subscribe(
+            household, GARAGE, SonosService.RENDERING_CONTROL
+        )
+        waiting, go_on = threading.Event(), threading.Event()
+
+        def wait(timeout):
+            waiting.set()
+            return go_on.wait(timeout)
+
+        household.in_step_with(wait)
+        household.set_volume(GARAGE, 21)
+        try:
+            assert waiting.wait(5.0)
+            subscription.unsubscribe()
+        finally:
+            go_on.set()
+        household.settle()
+
+        assert household.subscription_count(GARAGE) == 0
+
     def test_a_subscription_can_start_with_a_group_volume_the_room_has_left(
         self, household
     ):

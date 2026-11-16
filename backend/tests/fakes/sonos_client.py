@@ -12,6 +12,11 @@ made "elsewhere", as the Sonos app makes one, is the same call a display's
 would be (``play()``, ``set_volume()``, ``join()``) or one of the methods
 under "What happens to a household". ``settle()`` waits until every event
 sent so far is delivered.
+
+The household mirror applies the layouts it is sent on a thread of its own.
+``in_step_with()`` has the fake deliver an event only once that thread is
+done with the events before it, so that a test sees the events dealt with in
+the order they were sent, and ``settle()`` then waits for that thread too.
 """
 
 from __future__ import annotations
@@ -157,8 +162,7 @@ class _FakeSubscription(SonosSubscription):
     def unsubscribe(self) -> None:
         self.held = False
         self.unsubscribed = True
-        # A handler that is running finishes before this returns.
-        self._client.settle()
+        self._client._handled()
         self._client._require_answer(
             self.speaker_id,
             f"end the subscription to {self.service} events of speaker "
@@ -191,7 +195,11 @@ class FakeSonosClient(SonosClient):
         self.reachable = True
         self._condition = threading.Condition()
         self._pending: deque[Callable[[], None]] = deque()
+        # True from when a delivery is taken until what in_step_with() named
+        # is done with it; _handling only while its handler runs.
         self._delivering = False
+        self._handling = False
+        self._in_step_with: list[Callable[[float], bool]] = []
         self._closed = False
         self._errors: list[BaseException] = []
         self._delivery = threading.Thread(
@@ -373,8 +381,22 @@ class FakeSonosClient(SonosClient):
     # For a test
     # ------------------------------------------------------------------
 
+    def in_step_with(self, wait: Callable[[float], bool]) -> None:
+        """Deliver an event only once what took the events before it to a
+        thread of its own is done with them.
+
+        ``wait(timeout)`` returns once that thread has nothing left to do:
+        False when ``timeout`` seconds passed first, which fails the test
+        at its next ``settle()``.
+        """
+        self._in_step_with.append(wait)
+
     def settle(self, timeout: float = 5.0) -> None:
-        """Wait until every event sent so far has been delivered.
+        """Wait until every event sent so far has been delivered, and until
+        what ``in_step_with()`` named is done with them.
+
+        Not for a thread ``in_step_with()`` named while it deals with an
+        event: the delivery waits for that thread.
 
         Raises what a handler raised, so that a failing handler fails the test
         that caused it.
@@ -390,6 +412,15 @@ class FakeSonosClient(SonosClient):
                 error = self._errors.pop(0)
                 self._errors.clear()
                 raise error
+
+    def _handled(self) -> None:
+        """Wait until no handler is running: a subscription that is ended
+        runs none afterwards."""
+        if threading.current_thread() is self._delivery:
+            return
+        with self._condition:
+            idle = self._condition.wait_for(lambda: not self._handling, 5.0)
+            assert idle, "a handler of the fake's events did not return in time"
 
     def close(self) -> None:
         """End the delivery thread."""
@@ -879,8 +910,16 @@ class FakeSonosClient(SonosClient):
                     return
                 delivery = self._pending.popleft()
                 self._delivering = True
+                self._handling = True
             try:
-                delivery()
+                try:
+                    delivery()
+                finally:
+                    with self._condition:
+                        self._handling = False
+                        self._condition.notify_all()
+                for wait in self._in_step_with:
+                    assert wait(5.0), "what took the fake's events was not done in time"
             except BaseException as error:
                 self._errors.append(error)
             finally:

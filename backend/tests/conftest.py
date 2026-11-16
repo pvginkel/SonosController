@@ -148,19 +148,38 @@ def check_seconds() -> float:
 
 
 @pytest.fixture
+def in_step() -> bool:
+    """Whether the household delivers its events in step with the test's
+    mirror: each one once the mirror's healing thread has applied what the
+    events before it handed it. A test of what the mirror does while that
+    thread is busy replaces this fixture with False, and waits for the
+    thread itself, with the mirror's ``wait_until_applied()``."""
+    return True
+
+
+@pytest.fixture
 def mirror(
-    app: Flask, sonos: FakeSonosClient, plex: FakePlexClient, check_seconds: float
+    app: Flask,
+    sonos: FakeSonosClient,
+    plex: FakePlexClient,
+    check_seconds: float,
+    in_step: bool,
 ) -> Generator[HouseholdMirror]:
     """The container's household mirror, on the test's household and library.
 
     Not started: a test builds its household and calls ``start()``. The
-    container gives every test a mirror and an event sender of its own, so
-    that neither holds what an earlier test left.
+    household delivers its events in step with this mirror (``in_step``), so
+    its ``settle()`` waits as well for the layouts the speakers sent, which
+    the mirror's healing thread applies. The container gives every test a
+    mirror and an event sender of its own, so that neither holds what an
+    earlier test left.
     """
     container = app.container
     container.event_sender.reset()
     container.household_mirror.reset()
     mirror = container.household_mirror(check_seconds=check_seconds)
+    if in_step:
+        sonos.in_step_with(mirror.wait_until_applied)
     sender = container.event_sender()
     try:
         yield mirror

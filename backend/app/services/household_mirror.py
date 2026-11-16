@@ -10,10 +10,13 @@ when what it holds changes. Nothing of it is stored.
 Its subscriptions live in this process, which is why the app runs as one
 replica. They heal themselves: a room is subscribed to and read again after
 a failed renewal, after its device restarted and after it took another
-address. A layout the speakers send is applied as it arrives, and the mirror
-reads the layout itself every ``CHECK_SECONDS``, which finds what no event
-reported: a device that restarted without a word, a room that did not answer
-before, a household that did not answer when the app started.
+address. Layouts are applied on the mirror's own healing thread, one after
+the other. A layout the speakers send is handed to that thread, which applies
+the latest one it was handed: the thread that delivers the speakers' events
+makes no call to a speaker. The mirror reads the layout itself every
+``CHECK_SECONDS``, which finds what no event reported: a device that
+restarted without a word, a room that did not answer before, a household
+that did not answer when the app started.
 
 Playback and the group volume are a group's: the mirror takes them from the
 events of the group's coordinator and serves them for every member. Every
@@ -284,11 +287,17 @@ class HouseholdMirror:
         self._groups: dict[str, Group] = {}
         self._states: dict[str, _RoomState] = {}
         self._feeds: dict[str, _Feed] = {}
-        # The healing thread reads the layout when it is woken with _due set,
-        # and every _check_seconds.
+        # The healing thread applies a layout when it is woken with _due set,
+        # and every _check_seconds: the layout in _sent, the latest a speaker
+        # sent since it last took one, or else the one it reads itself.
         self._healer: threading.Thread | None = None
         self._wake = threading.Condition(self._lock)
         self._due = False
+        self._sent: Household | None = None
+        # True while the healing thread applies a layout. _applied is
+        # notified when it has none left to apply, and by stop().
+        self._applying = False
+        self._applied = threading.Condition(self._lock)
         # Why the last layout was not applied in full; None when it was.
         self._failure: str | None = None
         lifecycle_coordinator.register_lifecycle_notification(self._on_lifecycle_event)
@@ -325,11 +334,27 @@ class HouseholdMirror:
             self._household = Household(rooms=(), groups=())
             self._failure = None
             self._wake.notify_all()
+            self._applied.notify_all()
         if self._healer is not None:
             self._healer.join()
         failure = self._end(feeds)
         if failure is not None:
             raise failure
+
+    def wait_until_applied(self, timeout: float) -> bool:
+        """Wait until the healing thread has nothing left to apply: no layout
+        a speaker sent, no lost subscription, and no layout it is applying.
+
+        Not for the healing thread itself, which would wait for its own
+        return. A mirror that is stopped has nothing left to apply.
+
+        Returns:
+            False when ``timeout`` seconds passed first.
+        """
+        with self._lock:
+            return self._applied.wait_for(
+                lambda: self._stopped or not (self._due or self._applying), timeout
+            )
 
     def speakers(self) -> list[Speaker]:
         """Every room the mirror holds, by name."""
@@ -474,16 +499,23 @@ class HouseholdMirror:
         )
 
     def _keep_healing(self) -> None:
-        """The healing thread: read the layout when woken, and every
-        ``check_seconds``."""
+        """The healing thread: apply a layout when woken, and every
+        ``check_seconds``. The layout is the latest a speaker sent since the
+        thread last took one, or else the one it reads itself."""
         while True:
             with self._lock:
-                if not self._due:
+                self._applying = False
+                # stop() may have come while a layout was applied: its wake
+                # is not waited for again.
+                if not self._due and not self._stopped:
+                    self._applied.notify_all()
                     self._wake.wait(self._check_seconds)
                 if self._stopped:
                     return
                 self._due = False
-            self._heal()
+                self._applying = True
+                sent, self._sent = self._sent, None
+            self._heal(sent)
 
     def _heal(self, household: Household | None = None) -> None:
         """Apply a layout: the one given, or the one a speaker gives now.
@@ -752,10 +784,13 @@ class HouseholdMirror:
 
     def _on_event(self, speaker_id: str, feed: _Feed, event: SonosEvent) -> None:
         if isinstance(event, HouseholdChanged):
+            # Applying a layout calls the speakers, and this thread delivers
+            # every room's events: the healing thread applies it.
             with self._lock:
-                ended = feed.ended
-            if not ended:
-                self._heal(event.household)
+                if not feed.ended:
+                    self._sent = event.household
+                    self._due = True
+                    self._wake.notify()
             return
         with self._lock:
             if feed.ended:
