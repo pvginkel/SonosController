@@ -39,5 +39,6 @@ and the real Plex. CI never runs it. From `backend/`, with the dev stack stopped
 cexec python uv run pytest -m live tests/live
 ```
 
-Its conftest says what it needs of the Garage and of Plex before the first test, and
+Its conftest stops the run where the speakers or Plex cannot take it, and skips the tests that
+command the Garage, with the state it found, where the Garage is in use or not set up for them;
 `docs/change-discipline.md` has the rules for the real speakers.

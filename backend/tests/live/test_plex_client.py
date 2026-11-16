@@ -29,15 +29,15 @@ REFUSED_TOKEN = "not-the-token"
 
 @pytest.fixture(scope="module")
 def picture(live_plex: PlexapiPlexClient, plex_track: str) -> str:
-    """The path of the picture of the track the Garage's queue is at."""
+    """The path of the picture of that track: its album's cover."""
     path = live_plex.read_track_picture(plex_track)
-    assert path is not None, "the track the Garage's queue is at has no picture"
+    assert path is not None, "the track has no picture"
     return path
 
 
 @pytest.fixture(scope="module")
 def album(picture: str) -> str:
-    """The rating key of the album of the track the Garage's queue is at."""
+    """The rating key of the album of that track."""
     return _PICTURE.fullmatch(picture).group(1)
 
 

@@ -1,8 +1,8 @@
 """The artwork service on the real Plex: what the fake cannot prove.
 
 The fake Plex answers a JPEG Pillow wrote. This shows that what the real
-Plex answers for the album of the track the Garage's queue is at becomes
-each picture a display asks for. Plex is only read, and no speaker is asked
+Plex answers for the album of a track of the library becomes each
+picture a display asks for. Plex is only read, and no speaker is asked
 for anything: the picture of a Plex track is Plex's.
 """
 
@@ -41,9 +41,9 @@ def service(
 
 @pytest.fixture
 def artwork_id(plex: PlexapiPlexClient, plex_track: str) -> str:
-    """The artwork id of the track the Garage's queue is at."""
+    """The artwork id of the cover of the album of that track."""
     picture = plex.read_track_picture(plex_track)
-    assert picture is not None, "the track the Garage's queue is at has no picture"
+    assert picture is not None, "the track has no picture"
     return plex_artwork_id(picture)
 
 

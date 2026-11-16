@@ -15,8 +15,14 @@ read, and so is Plex. A test that changes the Garage's queue takes
 ``kept_queue``, which puts the queue back as it was found. The Plex token is
 never printed: a test asserts on nothing that holds it.
 
-Before the first test it checks that the Garage and Plex can take the suite,
-and stops the run with how to fix it where they cannot (TEST-2).
+Before the first test it checks that the speakers answer, that the household
+has the Garage, and that Plex is fit for the suite, and stops the run with how
+to fix it where they are not (TEST-2). Whether the Garage is fit for the tests
+that command it is the ``garage`` fixture's check, made when the first of
+those tests takes it: where the Garage is in use, or set up so the suite could
+not put it back, those tests are skipped, each with the state found, and the
+rest run whatever the Garage is doing. A speaker in use is not a system down:
+it is somebody's music, which the suite does not interrupt.
 """
 
 import time
@@ -105,8 +111,9 @@ def live_plex(app: Flask, live_settings: AppSettings) -> PlexapiPlexClient:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def garage(live_client: SoCoSonosClient) -> str:
-    """The Garage's speaker id, once the Garage is fit for the suite."""
+def garage_speaker(live_client: SoCoSonosClient) -> str:
+    """The Garage's speaker id, once a speaker answers and the household has
+    the room; whatever the Garage is doing."""
     try:
         household = live_client.read_household()
     except ExternalServiceException as exc:
@@ -125,69 +132,12 @@ def garage(live_client: SoCoSonosClient) -> str:
             "commands that room alone.",
             returncode=1,
         )
-    speaker_id = rooms[0].id
-    group = next(g for g in household.groups if speaker_id in g.member_ids)
-    if group.member_ids != (speaker_id,):
-        pytest.exit(
-            f"The {GARAGE} is grouped with another room, which the live suite "
-            "would command with it. Ungroup it in the Sonos app.",
-            returncode=1,
-        )
-    playback = live_client.read_playback(speaker_id)
-    if playback.transport_state is not TransportState.STOPPED:
-        pytest.exit(
-            f"The {GARAGE} is {playback.transport_state.value}: the live suite "
-            "would interrupt it, and cannot put the elapsed time back. Run it "
-            "when the speaker is stopped.",
-            returncode=1,
-        )
-    if (
-        not playback.transport_uri.startswith("x-rincon-queue:")
-        or playback.queue_length < 2
-    ):
-        pytest.exit(
-            f"The {GARAGE} needs a queue of two tracks or more as its source "
-            "for the transport round trip. Queue an album from the Sonos app "
-            "and stop it.",
-            returncode=1,
-        )
-    # The test of the client's words for a refused command needs one: a
-    # previous at the queue's first track, or a next at its last.
-    if {TransportAction.PREVIOUS, TransportAction.NEXT} <= playback.actions:
-        pytest.exit(
-            f"The {GARAGE} allows both next and previous, and the live suite "
-            "needs a command it refuses. Put its queue at the first or the last "
-            "track in the Sonos app and stop it.",
-            returncode=1,
-        )
-    # The tests that queue put the queue back as it is listed, which shuffle
-    # would draw into another order.
-    if playback.shuffle:
-        pytest.exit(
-            f"The {GARAGE} plays shuffled, and the live suite puts its queue back "
-            "in the order it is listed. Turn shuffle off in the Sonos app.",
-            returncode=1,
-        )
-    queue = live_client.read_queue(speaker_id, 0, QUEUE_LIMIT)
-    if queue.total > QUEUE_LIMIT or any(
-        parse_plex_queue_entry(track.uri) is None for track in queue.tracks
-    ):
-        pytest.exit(
-            f"The live suite puts the {GARAGE}'s queue back one Plex track at a "
-            f"time, and can for a queue of {QUEUE_LIMIT} tracks or fewer, all "
-            f"from Plex; it holds {queue.total}. Queue an album of the Plex "
-            "library from the Sonos app and stop it.",
-            returncode=1,
-        )
-    return speaker_id
+    return rooms[0].id
 
 
 @pytest.fixture(scope="session", autouse=True)
-def plex_entry(
-    live_client: SoCoSonosClient, live_plex: PlexapiPlexClient, garage: str
-) -> PlexQueueEntry:
-    """What the address of the Plex track the Garage's queue is at names,
-    once Plex is fit for the suite."""
+def plex_fit(live_plex: PlexapiPlexClient) -> None:
+    """Plex, once it is fit for the suite."""
     result = live_plex.check_readiness()
     if result.status is not CheckStatus.OK:
         pytest.exit(
@@ -197,16 +147,110 @@ def plex_entry(
             "three lines and run `kc project setup` from the repo root.",
             returncode=1,
         )
-    track = live_client.read_playback(garage).track
-    entry = parse_plex_queue_entry(track.uri if track else "")
-    if entry is None:
-        pytest.exit(
-            f"The {GARAGE}'s queue is not at a track from Plex, and the live "
-            "suite asks Plex for the picture of that track. Queue an album of "
-            "the Plex library from the Sonos app and stop it.",
-            returncode=1,
+
+
+@pytest.fixture(scope="session")
+def garage(live_client: SoCoSonosClient, garage_speaker: str) -> str:
+    """The Garage's speaker id, for the tests that command the Garage: they
+    are skipped, with the state found, where it is not fit for them.
+
+    pytest keeps the skip of a session fixture, so the Garage is read once
+    and every such test is skipped for the same reason.
+    """
+    unfit = _unfit(live_client, garage_speaker)
+    if unfit:
+        pytest.skip(f"The {GARAGE} is not fit for the tests that command it. {unfit}")
+    return garage_speaker
+
+
+def _unfit(sonos: SoCoSonosClient, speaker_id: str) -> str:
+    """What keeps the Garage from the tests that command it, as it stands;
+    empty where nothing does."""
+    household = sonos.read_household()
+    group = next(g for g in household.groups if speaker_id in g.member_ids)
+    if group.member_ids != (speaker_id,):
+        others = sorted(
+            room.name
+            for room in household.rooms
+            if room.id in group.member_ids and room.id != speaker_id
         )
-    return entry
+        return (
+            f"It is grouped with {', '.join(others)}, which they would command "
+            "with it: ungroup it in the Sonos app."
+        )
+    playback = sonos.read_playback(speaker_id)
+    found = []
+    if playback.transport_state is not TransportState.STOPPED:
+        found.append(
+            f"It is {playback.transport_state.value}, which they would "
+            "interrupt, and they cannot put the elapsed time back: stop it."
+        )
+    if not playback.transport_uri.startswith("x-rincon-queue:"):
+        # The title, not the address: the address of a stream on the network
+        # is never printed.
+        source = playback.transport_title or "a source other than its queue"
+        found.append(
+            f"It plays {source}, and the transport round trip needs its queue "
+            "of two tracks or more as the source."
+        )
+    elif playback.queue_length < 2:
+        found.append(
+            f"Its queue holds {playback.queue_length} track(s), and the "
+            "transport round trip needs two or more."
+        )
+    # The test of the client's words for a refused command needs one: a
+    # previous at the queue's first track, or a next at its last.
+    if {TransportAction.PREVIOUS, TransportAction.NEXT} <= playback.actions:
+        found.append(
+            f"It is at track {playback.queue_position} of "
+            f"{playback.queue_length}, where it refuses neither next nor "
+            "previous, and they need a command it refuses: put it at the first "
+            "or the last track."
+        )
+    # The tests that queue put the queue back as it is listed, which shuffle
+    # would draw into another order.
+    if playback.shuffle:
+        found.append(
+            "It plays shuffled, and they put its queue back in the order it is "
+            "listed: turn shuffle off."
+        )
+    queue = sonos.read_queue(speaker_id, 0, QUEUE_LIMIT)
+    if queue.total > QUEUE_LIMIT:
+        found.append(
+            f"Its queue holds {queue.total} tracks, and they put it back one "
+            f"Plex track at a time, for {QUEUE_LIMIT} tracks or fewer."
+        )
+    else:
+        others = sum(
+            parse_plex_queue_entry(track.uri) is None for track in queue.tracks
+        )
+        if others:
+            found.append(
+                f"{others} of its {queue.total} queued tracks are not from Plex, "
+                "and they put the queue back as Plex tracks."
+            )
+    if found:
+        found.append(
+            "Queue an album of the Plex library from the Sonos app, at its first "
+            "track, and stop it."
+        )
+    return " ".join(found)
+
+
+@pytest.fixture(scope="session")
+def plex_entry(live_client: SoCoSonosClient, garage_speaker: str) -> PlexQueueEntry:
+    """What the address of a Plex track of the Garage's queue names, read
+    whatever the Garage is doing."""
+    queue = live_client.read_queue(garage_speaker, 0, QUEUE_LIMIT)
+    for track in queue.tracks:
+        entry = parse_plex_queue_entry(track.uri)
+        if entry is not None:
+            return entry
+    pytest.skip(
+        f"None of the first {len(queue.tracks)} tracks of the {GARAGE}'s queue "
+        "is from Plex, and the test reads what a Plex entry carries. Add an "
+        "album of the Plex library to its queue from the Sonos app."
+    )
 
 
 @pytest.fixture
@@ -263,9 +307,20 @@ def _put_back(
 
 
 @pytest.fixture(scope="session")
-def plex_track(plex_entry: PlexQueueEntry) -> str:
-    """The rating key of the Plex track the Garage's queue is at."""
-    return plex_entry.rating_key
+def plex_track(live_plex: PlexapiPlexClient) -> str:
+    """The rating key of a track Plex has, whatever the Garage plays: the
+    first of the first album, by artist, that has a cover of its own."""
+    for artist in live_plex.read_artists():
+        albums = live_plex.read_artist_albums(artist.rating_key, newest_first=False)
+        for album in albums or []:
+            # An album without a cover carries its artist's picture.
+            own = f"/library/metadata/{album.rating_key}/"
+            if album.picture is None or not album.picture.startswith(own):
+                continue
+            tracks = live_plex.read_album_tracks(album.rating_key)
+            if tracks:
+                return tracks[0].rating_key
+    pytest.fail("the music library has no album with a cover and tracks")
 
 
 @pytest.fixture(autouse=True)

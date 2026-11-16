@@ -75,7 +75,8 @@ What the fakes cannot prove is what the real clients send, so a separate **live 
 `backend/tests/live/`, marked `live` and deselected by default, runs the real clients against the
 Garage speaker and the real Plex from a KubeCoder environment. CI never runs it. Its conftest checks
 both systems at session start and stops with `pytest.exit()` and a message saying how to fix it,
-never a skip (TEST-2). `docs/slice-test-plan.md`, step 3, has how it is run.
+never a skip (TEST-2). The Garage in use is not a system down: the tests that command it are skipped,
+each naming the state found, and the rest run. `docs/slice-test-plan.md`, step 3, has how it is run.
 
 Live rules, standing for every session: use the **Garage** speaker only, at low volume, and leave its
 queue, position, volume and grouping as found. **Zitkuil** (a room of three devices) is a living

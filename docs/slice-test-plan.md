@@ -71,16 +71,22 @@ speakers' events on port 1400. It runs on the settings `kc project setup` wrote 
 
 ```bash
 [ -n "${LIVE_PLEX_TOKEN:+x}" ] && echo token present
-cexec python sh -c 'cd backend && uv run pytest -m live tests/live'
+cexec python sh -c 'cd backend && uv run pytest -m live tests/live -rs'
 ```
 
-The suite's conftest checks both systems at session start and stops with `pytest.exit()` and a
-message on how to fix what is missing (never a skip); follow the message. It wants the Garage alone
-in its group, stopped, not shuffled, on a queue of two to 100 tracks, every one from Plex, at the
-first or the last of them. Queue an album of the Plex library from the Sonos app and stop it, and
-the Garage is fit. The tests that change the queue put back its tracks, its position, its shuffle
-and the stopped transport, and check them. If it cannot run, the criteria that need it are *not
-verified*: say so, never pass them by inspection.
+Before the first test the suite's conftest checks that a speaker answers, that the household has
+the Garage, and that Plex is fit, and stops with `pytest.exit()` and a message on how to fix what is
+missing (never a skip); follow the message. Whether the Garage itself is fit is checked once, when the
+first test that commands it starts: those tests want it alone in its group, stopped, not shuffled, on
+a queue of two to 100 tracks, every one from Plex, at the first or the last of them. Where it is not,
+because it is in use or set up so the suite could not put it back, each of those tests is skipped
+with the state the conftest found (`-rs` prints each reason), and the session goes on: the
+tests that read Plex alone, and those that read the speakers without commanding the Garage, run
+whatever it is doing. Never move the Garage to make it fit: setting it up for those tests (queue an
+album of the Plex library from the Sonos app and stop it) is the operator's to do. The tests that
+change the queue put back its tracks, its position, its shuffle and the stopped transport, and
+check them. A criterion that needs a skipped or stopped test is *not verified*: say so, never pass
+it by inspection.
 
 Standing rules, here and in every check against the real systems: the **Garage** speaker only, at
 low volume, with its queue, position, volume and grouping left as found. **Zitkuil** is never
