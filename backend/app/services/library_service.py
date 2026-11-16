@@ -193,9 +193,9 @@ def _page[T](items: list[T], query: PaginationQuerySchema) -> list[T]:
     return items[query.offset : query.offset + query.per_page]
 
 
-def _artist_order(artist: PlexArtist) -> tuple[bool, str, int]:
+def _artist_order(artist: PlexArtist) -> tuple[str, str, int]:
     return (
-        _index_letter(artist.sort_title) != NO_LETTER,
+        _index_letter(artist.sort_title),
         _letters(artist.sort_title),
         int(artist.rating_key),
     )

@@ -183,6 +183,20 @@ class TestLibraryServiceListArtists:
         letters = [artist.index_letter for artist in artists]
         assert letters == ["#", "#", "A", "A", "A", "A", "Z", "Z", "Z"]
 
+    def test_a_letters_artists_are_together_where_its_folded_title_sorts_after_z(
+        self, library, plex
+    ):
+        # The Turkish dotless ı files under I and sorts after z once folded.
+        plex.add_artist("1", "Zucchero")
+        plex.add_artist("2", "ıncı")
+        plex.add_artist("3", "Ilse DeLange")
+        plex.add_artist("4", "ABBA")
+
+        artists, _ = library.list_artists(ArtistListQuerySchema())
+
+        assert [artist.id for artist in artists] == ["4", "3", "2", "1"]
+        assert [artist.index_letter for artist in artists] == ["A", "I", "I", "Z"]
+
     def test_artists_with_one_sort_title_come_by_rating_key(self, library, plex):
         plex.add_artist("10", "Nirvana")
         plex.add_artist("9", "Nirvana")
