@@ -637,6 +637,53 @@ class TestHouseholdMirrorLayout:
         assert mirror.playback(LOUNGE).queue_length == 0
         assert mirror.speaker(GARAGE).group.member_ids == (GARAGE,)
 
+    def test_a_group_whose_coordinator_leaves_plays_what_its_new_coordinator_plays(
+        self, started, household
+    ):
+        household.add_room(KITCHEN, "Kitchen", model="One", volume=60)
+        household.load_queue(LOUNGE, [queue_track(7)])
+        household.join(LOUNGE, GARAGE)
+        household.join(KITCHEN, GARAGE)
+        household.settle()
+
+        household.unjoin(GARAGE)
+        household.settle()
+
+        went_on = SpeakerGroup(
+            coordinator_id=LOUNGE, member_ids=(LOUNGE, KITCHEN), volume=50, muted=False
+        )
+        assert started.speaker(LOUNGE).group == went_on
+        assert started.speaker(KITCHEN).group == went_on
+        assert started.playback(LOUNGE).track.title == "Track 7"
+        assert started.playback(KITCHEN).track.title == "Track 7"
+        assert started.speaker(GARAGE).group == SpeakerGroup(
+            coordinator_id=GARAGE, member_ids=(GARAGE,), volume=20, muted=False
+        )
+        assert started.playback(GARAGE).track.title == "Track 1"
+
+    def test_a_group_whose_coordinator_joins_another_plays_what_its_new_coordinator_plays(
+        self, started, household
+    ):
+        household.add_room(KITCHEN, "Kitchen", model="One", volume=60)
+        household.load_queue(KITCHEN, [queue_track(9)])
+        household.load_queue(LOUNGE, [queue_track(7)])
+        household.join(LOUNGE, GARAGE)
+        household.settle()
+
+        household.join(GARAGE, KITCHEN)
+        household.settle()
+
+        joined = SpeakerGroup(
+            coordinator_id=KITCHEN, member_ids=(GARAGE, KITCHEN), volume=40, muted=False
+        )
+        assert started.speaker(GARAGE).group == joined
+        assert started.speaker(KITCHEN).group == joined
+        assert started.playback(GARAGE).track.title == "Track 9"
+        assert started.speaker(LOUNGE).group == SpeakerGroup(
+            coordinator_id=LOUNGE, member_ids=(LOUNGE,), volume=40, muted=False
+        )
+        assert started.playback(LOUNGE).track.title == "Track 7"
+
     def test_a_room_that_appears_is_mirrored(self, started, household):
         household.add_room(KITCHEN, "Kitchen", model="One", volume=15)
         household.settle()

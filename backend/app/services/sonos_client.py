@@ -1,9 +1,9 @@
 """The Sonos client: the backend's only way to the speakers.
 
 ``SonosClient`` is what the rest of the backend sees: the household's layout,
-a room's and its group's state, the transport and volume commands, the
-speakers' event subscriptions and the picture a speaker serves for what it
-plays. ``SoCoSonosClient`` implements it on SoCo, and this is the only module
+a room's and its group's state, the transport, volume and group commands,
+the speakers' event subscriptions and the picture a speaker serves for what
+it plays. ``SoCoSonosClient`` implements it on SoCo, and this is the only module
 that imports SoCo. pytest overrides the container's provider with an in-memory
 fake of the same base class.
 
@@ -230,7 +230,8 @@ class SonosClient(ABC):
     when the speaker fails, does not answer, or is not in the household. Its
     message names no address: a ``502`` carries it to the API's clients.
     Playback is a group's: a transport read or command for a room goes to the
-    coordinator of the room's group.
+    coordinator of the room's group. A join or a leave goes to the room that
+    moves.
     """
 
     def __init__(self, health_service: HealthService) -> None:
@@ -312,6 +313,17 @@ class SonosClient(ABC):
     @abstractmethod
     def set_group_muted(self, speaker_id: str, muted: bool) -> None:
         """Mute or unmute every room of the room's group."""
+
+    @abstractmethod
+    def join(self, speaker_id: str, member_id: str) -> None:
+        """Make the room join the group the room ``member_id`` plays in.
+
+        The room's own transport becomes that group's coordinator's.
+        """
+
+    @abstractmethod
+    def unjoin(self, speaker_id: str) -> None:
+        """Make the room leave its group and play alone."""
 
     @abstractmethod
     def read_picture(self, speaker_id: str, picture: str) -> bytes:
@@ -534,6 +546,16 @@ class SoCoSonosClient(SonosClient):
     def set_group_muted(self, speaker_id: str, muted: bool) -> None:
         with _speaker_call(f"mute or unmute the group of speaker {speaker_id}"):
             self._group(speaker_id).mute = muted
+
+    def join(self, speaker_id: str, member_id: str) -> None:
+        with _speaker_call(
+            f"join the group of speaker {member_id} with speaker {speaker_id}"
+        ):
+            self._room(speaker_id).join(self._coordinator(member_id))
+
+    def unjoin(self, speaker_id: str) -> None:
+        with _speaker_call(f"ungroup speaker {speaker_id}"):
+            self._room(speaker_id).unjoin()
 
     def read_picture(self, speaker_id: str, picture: str) -> bytes:
         with _speaker_call(f"read the picture speaker {speaker_id} serves"):

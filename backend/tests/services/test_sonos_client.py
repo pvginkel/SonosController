@@ -31,6 +31,8 @@ from tests.fakes.sonos_client import FakeSonosClient, picture_colour, queue_trac
 GARAGE = "RINCON_FAKE0000000101400"
 LOUNGE = "RINCON_FAKE0000000201400"
 LOUNGE_SURROUNDS = ("RINCON_FAKE0000000211400", "RINCON_FAKE0000000221400")
+KITCHEN = "RINCON_FAKE0000000301400"
+BEDROOM = "RINCON_FAKE0000000401400"
 
 PLAY = TransportAction.PLAY
 PAUSE = TransportAction.PAUSE
@@ -188,6 +190,32 @@ class TestSonosClientHousehold:
             "none of the 1 seed speakers answered (the speaker did not answer ("
         )
         assert "192.0.2" not in raised.value.message
+
+    def test_the_soco_client_fails_a_join_and_a_leave_in_its_own_words(self, app):
+        client = SoCoSonosClient(
+            settings=AppSettings(
+                sonos_seed_hosts=["192.0.2.5"],
+                sonos_event_advertise_host="sonos-events.invalid",
+                plex_url="http://192.0.2.1:32400",
+                plex_token="the-suites-plex-token",
+            ),
+            health_service=app.container.health_service(),
+        )
+
+        with pytest.raises(ExternalServiceException) as joining:
+            client.join(LOUNGE, GARAGE)
+        with pytest.raises(ExternalServiceException) as leaving:
+            client.unjoin(LOUNGE)
+
+        assert joining.value.operation == (
+            f"join the group of speaker {GARAGE} with speaker {LOUNGE}"
+        )
+        assert leaving.value.operation == f"ungroup speaker {LOUNGE}"
+        for raised in (joining, leaving):
+            assert raised.value.cause.startswith(
+                "none of the 1 seed speakers answered (the speaker did not answer ("
+            )
+            assert "192.0.2" not in raised.value.message
 
     def test_the_soco_client_asks_a_speaker_while_soco_holds_a_topology_subscription(
         self, app
@@ -398,6 +426,255 @@ class TestSonosClientVolume:
         ):
             with pytest.raises(ExternalServiceException):
                 call()
+
+
+class TestSonosClientGroups:
+    @pytest.fixture
+    def four_rooms(self, household):
+        """The household with a Kitchen and a Bedroom, each of one device."""
+        household.add_room(KITCHEN, "Kitchen", model="One", volume=60)
+        household.add_room(BEDROOM, "Bedroom", model="One", volume=10)
+        return household
+
+    def test_join_puts_the_room_in_the_group(self, household):
+        household.join(LOUNGE, GARAGE)
+
+        assert household.read_household().groups == (
+            Group(coordinator_id=GARAGE, member_ids=(GARAGE, LOUNGE)),
+        )
+        assert household.read_playback(LOUNGE).track == queue_track(1)
+        assert household.read_group_volume(LOUNGE) == Volume(30, False)
+
+    def test_join_names_any_room_of_the_group(self, four_rooms):
+        four_rooms.join(LOUNGE, GARAGE)
+
+        four_rooms.join(KITCHEN, LOUNGE)
+
+        assert four_rooms.read_household().groups == (
+            Group(GARAGE, (GARAGE, LOUNGE, KITCHEN)),
+            Group(BEDROOM, (BEDROOM,)),
+        )
+
+    def test_a_room_that_joins_reports_its_own_transport_and_the_group_its_volume(
+        self, household
+    ):
+        lounge, _ = _subscribe(household, LOUNGE, SonosService.AV_TRANSPORT)
+        garage, _ = _subscribe(household, GARAGE, SonosService.AV_TRANSPORT)
+        group, _ = _subscribe(household, GARAGE, SonosService.GROUP_RENDERING_CONTROL)
+
+        household.join(LOUNGE, GARAGE)
+        household.settle()
+
+        assert lounge.events == [
+            PlaybackChanged(LOUNGE, transport_uri=f"x-rincon:{GARAGE}")
+        ]
+        assert garage.events == []
+        assert group.events == [GroupVolumeChanged(GARAGE, volume=30, muted=False)]
+
+    def test_a_join_to_the_group_the_room_plays_in_changes_nothing(self, household):
+        household.join(LOUNGE, GARAGE)
+        layout = household.read_household()
+        listeners = [
+            _subscribe(household, speaker_id, service)[0]
+            for speaker_id in (GARAGE, LOUNGE)
+            for service in SonosService
+        ]
+
+        household.join(LOUNGE, GARAGE)
+        household.join(GARAGE, LOUNGE)
+        household.join(GARAGE, GARAGE)
+        household.settle()
+
+        assert household.read_household() == layout
+        assert [listener.events for listener in listeners] == [[]] * 8
+
+    def test_a_room_that_moves_to_another_group_leaves_its_own(self, four_rooms):
+        four_rooms.join(LOUNGE, GARAGE)
+        left, _ = _subscribe(four_rooms, GARAGE, SonosService.GROUP_RENDERING_CONTROL)
+        joined, _ = _subscribe(
+            four_rooms, KITCHEN, SonosService.GROUP_RENDERING_CONTROL
+        )
+
+        four_rooms.join(LOUNGE, KITCHEN)
+        four_rooms.settle()
+
+        assert four_rooms.read_household().groups == (
+            Group(GARAGE, (GARAGE,)),
+            Group(KITCHEN, (LOUNGE, KITCHEN)),
+            Group(BEDROOM, (BEDROOM,)),
+        )
+        assert left.events == [GroupVolumeChanged(GARAGE, volume=20, muted=False)]
+        assert joined.events == [GroupVolumeChanged(KITCHEN, volume=50, muted=False)]
+
+    def test_unjoin_makes_the_room_play_alone_what_it_holds_itself(self, household):
+        household.join(LOUNGE, GARAGE)
+        lounge, _ = _subscribe(household, LOUNGE, SonosService.AV_TRANSPORT)
+        garage, _ = _subscribe(household, GARAGE, SonosService.AV_TRANSPORT)
+        left, _ = _subscribe(household, GARAGE, SonosService.GROUP_RENDERING_CONTROL)
+        alone, _ = _subscribe(household, LOUNGE, SonosService.GROUP_RENDERING_CONTROL)
+
+        household.unjoin(LOUNGE)
+        household.settle()
+
+        assert household.read_household().groups == (
+            Group(GARAGE, (GARAGE,)),
+            Group(LOUNGE, (LOUNGE,)),
+        )
+        assert household.read_playback(LOUNGE).queue_length == 0
+        assert household.read_playback(GARAGE).track == queue_track(1)
+        [event] = lounge.events
+        assert event.transport_uri == f"x-rincon-queue:{LOUNGE}#0"
+        assert event.track is None
+        assert garage.events == []
+        assert left.events == [GroupVolumeChanged(GARAGE, volume=20, muted=False)]
+        assert alone.events == [GroupVolumeChanged(LOUNGE, volume=40, muted=False)]
+
+    def test_an_unjoin_by_a_room_alone_changes_nothing(self, household):
+        household.play(GARAGE)
+        layout = household.read_household()
+        playback = household.read_playback(GARAGE)
+        listeners = [
+            _subscribe(household, GARAGE, service)[0] for service in SonosService
+        ]
+
+        household.unjoin(GARAGE)
+        household.settle()
+
+        assert household.read_household() == layout
+        assert household.read_playback(GARAGE) == playback
+        assert [listener.events for listener in listeners] == [[]] * 4
+
+    def test_a_group_whose_coordinator_leaves_stays_a_group_led_by_one_of_its_rooms(
+        self, four_rooms
+    ):
+        four_rooms.load_queue(LOUNGE, [queue_track(7)])
+        four_rooms.join(LOUNGE, GARAGE)
+        four_rooms.join(KITCHEN, GARAGE)
+        lounge, _ = _subscribe(four_rooms, LOUNGE, SonosService.AV_TRANSPORT)
+        kitchen, _ = _subscribe(four_rooms, KITCHEN, SonosService.AV_TRANSPORT)
+        garage, _ = _subscribe(four_rooms, GARAGE, SonosService.AV_TRANSPORT)
+        left, _ = _subscribe(four_rooms, LOUNGE, SonosService.GROUP_RENDERING_CONTROL)
+        alone, _ = _subscribe(four_rooms, GARAGE, SonosService.GROUP_RENDERING_CONTROL)
+
+        four_rooms.unjoin(GARAGE)
+        four_rooms.settle()
+
+        assert four_rooms.read_household().groups == (
+            Group(GARAGE, (GARAGE,)),
+            Group(LOUNGE, (LOUNGE, KITCHEN)),
+            Group(BEDROOM, (BEDROOM,)),
+        )
+        # The fake's choice: every room keeps its own transport.
+        assert four_rooms.read_playback(GARAGE).track == queue_track(1)
+        assert four_rooms.read_playback(LOUNGE).track == queue_track(7)
+        assert four_rooms.read_playback(KITCHEN).track == queue_track(7)
+        [leading] = lounge.events
+        assert leading.transport_uri == f"x-rincon-queue:{LOUNGE}#0"
+        assert leading.track == queue_track(7)
+        assert kitchen.events == [
+            PlaybackChanged(KITCHEN, transport_uri=f"x-rincon:{LOUNGE}")
+        ]
+        [own] = garage.events
+        assert own.transport_uri == f"x-rincon-queue:{GARAGE}#0"
+        assert left.events == [GroupVolumeChanged(LOUNGE, volume=50, muted=False)]
+        assert alone.events == [GroupVolumeChanged(GARAGE, volume=20, muted=False)]
+
+    def test_a_group_whose_coordinator_joins_another_stays_a_group(self, four_rooms):
+        four_rooms.load_queue(LOUNGE, [queue_track(7)])
+        four_rooms.load_queue(BEDROOM, [queue_track(9)])
+        four_rooms.join(LOUNGE, GARAGE)
+        four_rooms.join(KITCHEN, GARAGE)
+        lounge, _ = _subscribe(four_rooms, LOUNGE, SonosService.AV_TRANSPORT)
+        kitchen, _ = _subscribe(four_rooms, KITCHEN, SonosService.AV_TRANSPORT)
+        garage, _ = _subscribe(four_rooms, GARAGE, SonosService.AV_TRANSPORT)
+        left, _ = _subscribe(four_rooms, LOUNGE, SonosService.GROUP_RENDERING_CONTROL)
+        joined, _ = _subscribe(
+            four_rooms, BEDROOM, SonosService.GROUP_RENDERING_CONTROL
+        )
+
+        four_rooms.join(GARAGE, BEDROOM)
+        four_rooms.settle()
+
+        layout = four_rooms.read_household()
+        assert layout.groups == (
+            Group(LOUNGE, (LOUNGE, KITCHEN)),
+            Group(BEDROOM, (GARAGE, BEDROOM)),
+        )
+        assert sorted(
+            member_id for group in layout.groups for member_id in group.member_ids
+        ) == [room.id for room in layout.rooms]
+        assert four_rooms.read_playback(GARAGE).track == queue_track(9)
+        assert four_rooms.read_playback(LOUNGE).track == queue_track(7)
+        assert four_rooms.read_playback(KITCHEN).track == queue_track(7)
+        [leading] = lounge.events
+        assert leading.transport_uri == f"x-rincon-queue:{LOUNGE}#0"
+        assert kitchen.events == [
+            PlaybackChanged(KITCHEN, transport_uri=f"x-rincon:{LOUNGE}")
+        ]
+        assert garage.events == [
+            PlaybackChanged(GARAGE, transport_uri=f"x-rincon:{BEDROOM}")
+        ]
+        assert left.events == [GroupVolumeChanged(LOUNGE, volume=50, muted=False)]
+        assert joined.events == [GroupVolumeChanged(BEDROOM, volume=15, muted=False)]
+
+    def test_a_join_and_a_leave_reach_the_room_that_moves_alone(self, household):
+        reached = []
+        household.before_call = reached.append
+        household.silence_room(GARAGE)
+
+        household.join(LOUNGE, GARAGE)
+        household.unjoin(LOUNGE)
+
+        assert reached == [LOUNGE, LOUNGE]
+
+    @pytest.mark.parametrize(
+        ("command", "operation"),
+        [
+            (
+                lambda household: household.join(LOUNGE, GARAGE),
+                f"join the group of speaker {GARAGE} with speaker {LOUNGE}",
+            ),
+            (lambda household: household.unjoin(LOUNGE), f"ungroup speaker {LOUNGE}"),
+        ],
+        ids=["join", "unjoin"],
+    )
+    def test_a_join_and_a_leave_fail_as_the_rooms_other_commands_do(
+        self, household, command, operation
+    ):
+        household.reachable = False
+        with pytest.raises(ExternalServiceException) as unreachable:
+            command(household)
+        household.reachable = True
+        household.silence_room(LOUNGE)
+        with pytest.raises(ExternalServiceException) as silent:
+            command(household)
+        household.answer_again(LOUNGE)
+        household.remove_room(LOUNGE)
+        with pytest.raises(ExternalServiceException) as gone:
+            command(household)
+
+        assert unreachable.value.operation == operation
+        assert unreachable.value.cause == "none of the seed speakers answered"
+        assert silent.value.operation == operation
+        assert silent.value.cause == "the speaker did not answer (ConnectTimeout)"
+        assert gone.value.operation == operation
+        assert gone.value.cause == f"speaker {LOUNGE} is not in the household"
+        assert household.read_household().groups == (Group(GARAGE, (GARAGE,)),)
+
+    @pytest.mark.parametrize(
+        "member_id", ["RINCON_FAKE0000000991400", LOUNGE_SURROUNDS[0]]
+    )
+    def test_a_join_to_the_group_of_no_room_fails(self, household, member_id):
+        layout = household.read_household()
+
+        with pytest.raises(ExternalServiceException) as raised:
+            household.join(GARAGE, member_id)
+
+        assert raised.value.operation == (
+            f"join the group of speaker {member_id} with speaker {GARAGE}"
+        )
+        assert raised.value.cause == f"speaker {member_id} is not in the household"
+        assert household.read_household() == layout
 
 
 class TestSonosClientPicture:

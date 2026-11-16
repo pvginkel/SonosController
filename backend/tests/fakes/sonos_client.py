@@ -9,9 +9,9 @@ events, several for one change, on a thread of their own.
 
 A test builds its household with ``add_room()`` and ``load_queue()``. A change
 made "elsewhere", as the Sonos app makes one, is the same call a display's
-would be (``play()``, ``set_volume()``) or one of the methods under "What
-happens to a household". ``settle()`` waits until every event sent so far is
-delivered.
+would be (``play()``, ``set_volume()``, ``join()``) or one of the methods
+under "What happens to a household". ``settle()`` waits until every event
+sent so far is delivered.
 """
 
 from __future__ import annotations
@@ -289,30 +289,6 @@ class FakeSonosClient(SonosClient):
     # What happens to a household
     # ------------------------------------------------------------------
 
-    def join(self, speaker_id: str, coordinator_id: str) -> None:
-        """The room joins the group that ``coordinator_id`` coordinates."""
-        room = self._rooms[speaker_id]
-        assert self._rooms[coordinator_id].coordinator_id == coordinator_id
-        room.coordinator_id = coordinator_id
-        self._send_household()
-        self._send_group_volume(self._rooms[coordinator_id])
-        # The room joins by setting its own transport to the coordinator
-        # (section 1.2), and its own device reports that.
-        self._send(
-            room.id, PlaybackChanged(room.id, transport_uri=f"x-rincon:{coordinator_id}")
-        )
-
-    def unjoin(self, speaker_id: str) -> None:
-        """The room leaves its group and plays alone."""
-        room = self._rooms[speaker_id]
-        former = self._rooms[room.coordinator_id]
-        room.coordinator_id = speaker_id
-        self._send_household()
-        self._send_group_volume(former)
-        self._send_group_volume(room)
-        # Its transport is its own queue again.
-        self._send_playback(room, full=True)
-
     def rename_room(self, speaker_id: str, name: str) -> None:
         self._rooms[speaker_id].name = name
         self._send_household()
@@ -541,6 +517,31 @@ class FakeSonosClient(SonosClient):
             self._send(member.id, VolumeChanged(member.id, muted=muted))
         self._send_group_volume(coordinator)
 
+    def join(self, speaker_id: str, member_id: str) -> None:
+        operation = f"join the group of speaker {member_id} with"
+        room = self._room(speaker_id, operation)
+        # The command goes to the room that joins alone: the group's rooms
+        # are named in it and not reached.
+        if member_id not in self._rooms:
+            raise ExternalServiceException(
+                f"{operation} speaker {speaker_id}",
+                f"speaker {member_id} is not in the household",
+            )
+        coordinator = self._rooms[self._rooms[member_id].coordinator_id]
+        if room.coordinator_id == coordinator.id:
+            # What a speaker does with a join to the group it plays in was
+            # never tried on the real speakers. Here it changes nothing.
+            return
+        self._move(room, coordinator)
+
+    def unjoin(self, speaker_id: str) -> None:
+        room = self._room(speaker_id, "ungroup")
+        if self._members(room) == [room]:
+            # What a speaker does with a leave by a room alone was never
+            # tried on the real speakers. Here it changes nothing.
+            return
+        self._move(room, room)
+
     def read_picture(self, speaker_id: str, picture: str) -> bytes:
         self._coordinator(speaker_id, "read the picture served by")
         # A speaker serves /getaa for the address it is given, whatever plays.
@@ -629,6 +630,41 @@ class FakeSonosClient(SonosClient):
             for room in self._rooms.values()
             if room.coordinator_id == coordinator.id
         ]
+
+    def _move(self, room: _Room, coordinator: _Room) -> None:
+        """Put the room in the group ``coordinator`` leads, which is the room
+        itself when it is to play alone, and send what the devices report."""
+        left = [
+            member
+            for member in self._members(self._rooms[room.coordinator_id])
+            if member is not room
+        ]
+        handed_over = bool(left) and room.coordinator_id == room.id
+        if handed_over:
+            # The rooms it led stay a group, led by the first of them by id.
+            # What they play then, and what the room that led them plays, was
+            # never seen on the real speakers. Here every room keeps its own
+            # transport: the group it left plays its new coordinator's own
+            # queue, and a room that leaves to play alone plays what it led
+            # its group in.
+            leader = min(left, key=lambda member: member.id)
+            for member in left:
+                member.coordinator_id = leader.id
+        room.coordinator_id = coordinator.id
+        self._send_household()
+        if left:
+            self._send_group_volume(self._rooms[left[0].coordinator_id])
+        self._send_group_volume(coordinator)
+        if handed_over:
+            self._send_playback(leader, full=True)
+            for member in left:
+                if member is not leader:
+                    self._send_follows(member)
+        if coordinator is room:
+            # Its transport is its own queue again.
+            self._send_playback(room, full=True)
+        else:
+            self._send_follows(room)
 
     def _household(self) -> Household:
         rooms = sorted(self._rooms.values(), key=lambda room: room.id)
@@ -749,6 +785,15 @@ class FakeSonosClient(SonosClient):
         self._send(room.id, self._playback_event(room, full=full))
         if not full:
             self._send(room.id, PlaybackChanged(room.id, actions=self._actions(room)))
+
+    def _send_follows(self, room: _Room) -> None:
+        """Send the transport of a room that follows a coordinator: a room
+        joins by setting its own transport to the coordinator (section 1.2),
+        and its own device reports that."""
+        self._send(
+            room.id,
+            PlaybackChanged(room.id, transport_uri=f"x-rincon:{room.coordinator_id}"),
+        )
 
     def _send_track_change(self, room: _Room) -> None:
         playing = room.state is TransportState.PLAYING
