@@ -6,21 +6,27 @@ read from Plex. What leaves here is ready to serve: every string is Unicode
 NFC, and a picture is the artwork id the library carries for the item.
 """
 
+import logging
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 
 from psycopg.errors import UniqueViolation
-from sqlalchemy import Select, delete, select
+from sqlalchemy import Select, delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core_exceptions import ExternalServiceException
 from app.database import scoped_savepoint
 from app.exceptions import ItemNotFoundException, RecordNotFoundException
 from app.models import Favourite, ItemKind
+from app.schemas.favourite_schema import FavouriteListQuerySchema
 from app.services.plex_client import PlexClient
 from app.utils.artwork_id import plex_artwork_id
+from app.utils.pagination import apply_sorting
 from app.utils.plex_library import PlexAlbum, PlexArtist, PlexPlaylist
+
+logger = logging.getLogger(__name__)
 
 _PLEX_TYPE: dict[ItemKind, type[PlexArtist | PlexAlbum | PlexPlaylist]] = {
     ItemKind.ARTIST: PlexArtist,
@@ -56,6 +62,39 @@ class FavouriteService:
     def __init__(self, db_session: Session, plex_client: PlexClient) -> None:
         self._db = db_session
         self._plex = plex_client
+
+    def list_favourites(
+        self, query: FavouriteListQuerySchema
+    ) -> tuple[list[ServedFavourite], int]:
+        """A page of the favourites, each with its item as Plex has it now,
+        and how many favourites there are.
+
+        The page's favourites are looked for together, in one read of Plex:
+        each at the rating key it holds, where it is found when the item
+        there is of its kind and has its ``guid``. One that is not found is
+        served as it is stored, not available, and kept. While Plex fails,
+        the page is served from the store alone, none of it available, and
+        the failure is logged. Nothing stored changes.
+
+        A title is ordered by the database's collation, ICU's ``und``: by
+        its letters first, without accents and in one case.
+        """
+        total = self._db.execute(
+            select(func.count()).select_from(Favourite)
+        ).scalar_one()
+        page = self._db.scalars(
+            apply_sorting(select(Favourite), Favourite, query.sort_by, query.sort_dir)
+            .offset(query.offset)
+            .limit(query.per_page)
+        ).all()
+        try:
+            items = self._plex.read_items(favourite.rating_key for favourite in page)
+        except ExternalServiceException as error:
+            logger.warning("The favourites are served without their items: %s", error)
+            items = {}
+        return [
+            _listed(favourite, items.get(favourite.rating_key)) for favourite in page
+        ], total
 
     def mark(self, kind: ItemKind, item_id: str) -> tuple[ServedFavourite, bool]:
         """Mark an item of the library: the favourite that marks it, and
@@ -136,6 +175,35 @@ def _served(
         subtitle=_nfc(item.artist) if isinstance(item, PlexAlbum) else None,
         artwork_id=plex_artwork_id(item.picture) if item.picture is not None else None,
         available=True,
+        created_at=favourite.created_at,
+    )
+
+
+def _listed(
+    favourite: Favourite, item: PlexArtist | PlexAlbum | PlexPlaylist | None
+) -> ServedFavourite:
+    """A favourite with what Plex has at the rating key it holds: its item
+    when that is of the favourite's kind and has its guid."""
+    if (
+        isinstance(item, _PLEX_TYPE[favourite.item_kind])
+        and item.guid == favourite.guid
+    ):
+        return _served(favourite, item)
+    return _unavailable(favourite)
+
+
+def _unavailable(favourite: Favourite) -> ServedFavourite:
+    """A favourite whose item Plex does not give now, as it is stored."""
+    return ServedFavourite(
+        id=favourite.id,
+        kind=favourite.item_kind,
+        item_id=None,
+        title=_nfc(favourite.title),
+        subtitle=(
+            _nfc(favourite.artist_title) if favourite.artist_title is not None else None
+        ),
+        artwork_id=None,
+        available=False,
         created_at=favourite.created_at,
     )
 

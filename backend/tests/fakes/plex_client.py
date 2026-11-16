@@ -132,6 +132,9 @@ class FakePlexClient(PlexClient):
         self._next_stamp = 1700000000
         # False: Plex does not answer, as when its pod is down.
         self.reachable = True
+        # What Plex was asked, in order: one operation per request, also a
+        # request Plex did not answer.
+        self.requests: list[str] = []
         # False: Plex has no music library of the name the settings give.
         self.has_library = True
         # plexapi reads the server at the first call that needs it, and
@@ -486,6 +489,8 @@ class FakePlexClient(PlexClient):
             raise ExternalServiceException(operation, _NO_LIBRARY)
 
     def _require_reachable(self, operation: str) -> None:
+        """Plex is sent the request of ``operation``."""
+        self.requests.append(operation)
         if not self.reachable:
             raise ExternalServiceException(operation, _UNREACHABLE)
 

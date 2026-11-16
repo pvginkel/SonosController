@@ -1,7 +1,9 @@
 """Tests for the favourite service, on the in-memory Plex and the real store."""
 
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from flask import Flask
@@ -13,9 +15,10 @@ from app.core_exceptions import ExternalServiceException
 from app.exceptions import ItemNotFoundException, RecordNotFoundException
 from app.extensions import db
 from app.models import Favourite, ItemKind
+from app.schemas.favourite_schema import FavouriteListQuerySchema
 from app.schemas.library_schema import PlaylistListQuerySchema
 from app.services.container import ServiceContainer
-from app.services.favourite_service import FavouriteService
+from app.services.favourite_service import FavouriteService, ServedFavourite
 from tests.fakes.plex_client import FakePlexClient
 
 RADIOHEAD = "5001"
@@ -75,6 +78,54 @@ def stored(session: Session) -> list[tuple[object, ...]]:
         ).order_by(Favourite.id)
     )
     return [tuple(row) for row in rows]
+
+
+def store(
+    session: Session,
+    kind: ItemKind,
+    rating_key: str,
+    title: str,
+    guid: str | None = None,
+    artist_title: str | None = None,
+    created_at: datetime | None = None,
+) -> Favourite:
+    """A favourite put in the store as a mark would leave it, its guid the
+    fake's default for an item of its kind at this rating key."""
+    default_guid = {
+        ItemKind.ARTIST: f"plex://artist/{rating_key}",
+        ItemKind.ALBUM: f"plex://album/{rating_key}",
+        ItemKind.PLAYLIST: f"com.plexapp.agents.none://{rating_key}",
+    }[kind]
+    favourite = Favourite(
+        item_kind=kind,
+        guid=guid or default_guid,
+        rating_key=rating_key,
+        title=title,
+        artist_title=artist_title,
+    )
+    if created_at is not None:
+        favourite.created_at = created_at
+    session.add(favourite)
+    session.flush()
+    return favourite
+
+
+def query(**fields: object) -> FavouriteListQuerySchema:
+    return FavouriteListQuerySchema.model_validate(fields)
+
+
+def as_stored(favourite: Favourite, subtitle: str | None = None) -> ServedFavourite:
+    """A favourite served as it is stored: not available."""
+    return ServedFavourite(
+        id=favourite.id,
+        kind=favourite.item_kind,
+        item_id=None,
+        title=favourite.title,
+        subtitle=subtitle,
+        artwork_id=None,
+        available=False,
+        created_at=favourite.created_at,
+    )
 
 
 def wait_until_a_query_waits_for_a_lock(engine: Engine) -> None:
@@ -249,6 +300,181 @@ class TestFavouriteService:
 
             assert raised.value.message == f"Favourite {favourite_id} was not found"
             assert raised.value.error_code == "RECORD_NOT_FOUND"
+
+
+class TestListFavourites:
+    def test_each_favourite_is_listed_with_its_item_as_plex_has_it_now(
+        self, service, library
+    ):
+        marks = [
+            service.mark(ItemKind.ARTIST, RADIOHEAD),
+            service.mark(ItemKind.ALBUM, AMNESIAC),
+            service.mark(ItemKind.PLAYLIST, ROAD_TRIP),
+            service.mark(ItemKind.ALBUM, HOMOGENIC),
+        ]
+
+        listed, total = service.list_favourites(query())
+
+        assert listed == [served for served, _ in marks]
+        assert total == 4
+        album = listed[3]
+        assert (album.title, album.subtitle) == ("Homogénic", BJORK_COMPOSED)
+        assert all(favourite.available for favourite in listed)
+
+    def test_a_playlist_carries_the_artwork_id_the_list_of_playlists_carries(
+        self, service, container, library
+    ):
+        service.mark(ItemKind.PLAYLIST, ROAD_TRIP)
+        library_service = container.library_service()
+        library_service.playlist(ROAD_TRIP)
+
+        first, _ = service.list_favourites(query())
+        second, _ = service.list_favourites(query())
+
+        (listed,), _ = library_service.list_playlists(PlaylistListQuerySchema())
+        assert first[0].artwork_id == second[0].artwork_id == listed.artwork_id
+
+    def test_a_page_asks_plex_once_whatever_its_size(self, service, session, plex):
+        for number in range(30):
+            rating_key = str(6000 + number)
+            plex.add_artist(rating_key, f"Artist {number:02}", size=None)
+            store(session, ItemKind.ARTIST, rating_key, f"Artist {number:02}")
+
+        for page, per_page, size in [(1, 100, 30), (2, 7, 7), (4, 8, 6), (1, 1, 1)]:
+            plex.requests.clear()
+
+            listed, total = service.list_favourites(query(page=page, per_page=per_page))
+
+            assert (len(listed), total) == (size, 30)
+            assert all(favourite.available for favourite in listed)
+            assert plex.requests == [f"read {size} Plex items"]
+
+    def test_an_empty_page_asks_plex_nothing(self, service, session, plex):
+        assert service.list_favourites(query()) == ([], 0)
+        assert plex.requests == []
+
+        plex.add_artist(RADIOHEAD, "Radiohead", size=None)
+        store(session, ItemKind.ARTIST, RADIOHEAD, "Radiohead")
+
+        assert service.list_favourites(query(page=2)) == ([], 1)
+        assert plex.requests == []
+
+    def test_a_favourite_plex_has_not_at_its_rating_key_is_served_as_stored_and_kept(
+        self, service, session, library
+    ):
+        favourites = [
+            # Another release is at the album's rating key.
+            store(
+                session,
+                ItemKind.ALBUM,
+                AMNESIAC,
+                "Amnesiac",
+                guid="plex://album/another",
+                artist_title="Radiohead",
+            ),
+            # An album is at the artist's rating key, with the artist's guid.
+            store(session, ItemKind.ARTIST, AMNESIAC, "Amnesiac", guid=AMNESIAC_GUID),
+            # A track is at the playlist's.
+            store(session, ItemKind.PLAYLIST, TRACK, "Road trip"),
+            # Nothing is at the album's.
+            store(
+                session,
+                ItemKind.ALBUM,
+                "9999",
+                "Vespertine",
+                artist_title=BJORK_DECOMPOSED,
+            ),
+        ]
+        before = stored(session)
+
+        listed, total = service.list_favourites(query())
+
+        assert listed == [
+            as_stored(favourites[0], "Radiohead"),
+            as_stored(favourites[1]),
+            as_stored(favourites[2]),
+            as_stored(favourites[3], BJORK_COMPOSED),
+        ]
+        assert total == 4
+        assert stored(session) == before
+
+    def test_the_titles_of_a_favourite_not_found_are_served_in_nfc(
+        self, service, session, library
+    ):
+        store(session, ItemKind.ARTIST, "9998", BJORK_DECOMPOSED)
+
+        (listed,), _ = service.list_favourites(query())
+
+        assert listed.title == BJORK_COMPOSED
+
+    def test_while_plex_fails_the_page_is_served_from_the_store(
+        self, service, session, library, caplog
+    ):
+        artist, _ = service.mark(ItemKind.ARTIST, BJORK)
+        album, _ = service.mark(ItemKind.ALBUM, HOMOGENIC)
+        playlist, _ = service.mark(ItemKind.PLAYLIST, ROAD_TRIP)
+        before = stored(session)
+        library.reachable = False
+
+        with caplog.at_level(logging.WARNING, "app.services.favourite_service"):
+            listed, total = service.list_favourites(query())
+
+        unavailable = {"item_id": None, "artwork_id": None, "available": False}
+        assert [vars(favourite) for favourite in listed] == [
+            vars(favourite) | unavailable for favourite in (artist, album, playlist)
+        ]
+        assert total == 3
+        assert stored(session) == before
+        (record,) = caplog.records
+        assert record.levelno == logging.WARNING
+        assert "Cannot read 3 Plex items" in record.getMessage()
+
+    def test_the_favourites_are_ordered_by_when_each_was_marked_then_by_id(
+        self, service, session
+    ):
+        start = datetime(2026, 11, 15, 10, tzinfo=UTC)
+        later = [
+            store(
+                session,
+                ItemKind.ARTIST,
+                str(6000 + number),
+                "Artist",
+                created_at=start + timedelta(minutes=minutes),
+            ).id
+            for number, minutes in enumerate([2, 0, 1, 0])
+        ]
+
+        ascending, _ = service.list_favourites(query())
+        descending, _ = service.list_favourites(query(sort_dir="desc"))
+
+        oldest_first = [later[1], later[3], later[2], later[0]]
+        assert [favourite.id for favourite in ascending] == oldest_first
+        assert [favourite.id for favourite in descending] == oldest_first[::-1]
+
+    def test_the_favourites_are_ordered_by_title_without_accents_and_in_one_case(
+        self, service, session
+    ):
+        def mark(kind: ItemKind, title: str) -> int:
+            artist_title = "Radiohead" if kind is ItemKind.ALBUM else None
+            number = len(stored(session))
+            return store(
+                session, kind, str(6000 + number), title, artist_title=artist_title
+            ).id
+
+        zappa = mark(ItemKind.ARTIST, "Zappa")
+        bjorn = mark(ItemKind.ARTIST, "Bjorn")
+        bjork = mark(ItemKind.ARTIST, BJORK_DECOMPOSED)
+        abba = mark(ItemKind.ARTIST, "abba")
+        album = mark(ItemKind.ALBUM, "Amnesiac")
+        playlist = mark(ItemKind.PLAYLIST, "Amnesiac")
+        echoes = mark(ItemKind.PLAYLIST, "Échos")
+
+        ascending, _ = service.list_favourites(query(sort_by="title"))
+        descending, _ = service.list_favourites(query(sort_by="title", sort_dir="desc"))
+
+        in_order = [abba, album, playlist, bjork, bjorn, echoes, zappa]
+        assert [favourite.id for favourite in ascending] == in_order
+        assert [favourite.id for favourite in descending] == in_order[::-1]
 
 
 class TestMarkingAtOnce:

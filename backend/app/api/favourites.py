@@ -6,12 +6,52 @@ from spectree import Response as SpectreeResponse
 
 from app.models import ItemKind
 from app.schemas.common import ApiErrorResponseSchema
-from app.schemas.favourite_schema import FavouriteRequestSchema, FavouriteSchema
+from app.schemas.favourite_schema import (
+    FavouriteListQuerySchema,
+    FavouritePageSchema,
+    FavouriteRequestSchema,
+    FavouriteSchema,
+)
 from app.services.container import ServiceContainer
 from app.services.favourite_service import FavouriteService
+from app.utils.pagination import build_pagination_meta
 from app.utils.spectree_config import api
 
 favourites_bp = Blueprint("favourites", __name__, url_prefix="/favourites")
+
+
+@favourites_bp.route("", methods=["GET"])
+@api.validate(
+    query=FavouriteListQuerySchema,
+    resp=SpectreeResponse(
+        HTTP_200=(FavouritePageSchema, "A page of the favourites."),
+        HTTP_400=(
+            ApiErrorResponseSchema,
+            "`page`, `per_page`, `sort_by` or `sort_dir` holds a value the "
+            "list does not take.",
+        ),
+    ),
+)
+@inject
+def list_favourites(
+    favourite_service: FavouriteService = Provide[ServiceContainer.favourite_service],
+) -> Response:
+    """The household's favourites, each with its item as Plex has it now.
+
+    A favourite is `available` when Plex has its item. One whose item Plex
+    does not have is listed with its title and subtitle, without `item_id`
+    and `artwork_id`, and is kept. While Plex fails the favourites are
+    still listed, none of them `available`.
+    """
+    query = FavouriteListQuerySchema.model_validate(request.args.to_dict())
+    favourites, total = favourite_service.list_favourites(query)
+    page = FavouritePageSchema(
+        data=[FavouriteSchema.model_validate(favourite) for favourite in favourites],
+        meta=build_pagination_meta(
+            total, query.page, query.per_page, query.sort_by, query.sort_dir
+        ),
+    )
+    return jsonify(page.model_dump(mode="json"))
 
 
 @favourites_bp.route("", methods=["POST"])

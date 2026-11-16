@@ -10,7 +10,7 @@ from flask import Flask
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.models import Favourite
+from app.models import Favourite, ItemKind
 from app.services.artwork_service import ArtworkService
 from tests.api.documents import json_schema, schema_of, undescribed
 from tests.fakes.plex_client import FakePlexClient
@@ -33,6 +33,18 @@ BJORK_COMPOSED = "Björk"
 
 # Small pictures: the fake's default ones are large (card SCTL-14).
 SMALL = (16, 16)
+
+# What the list does not take as its query.
+REFUSED_QUERIES = [
+    "page=0",
+    "page=two",
+    "per_page=0",
+    "per_page=101",
+    "sort_dir=up",
+    "sort_by=id",
+    "sort_by=kind",
+    "sort_by=",
+]
 
 FIELDS = [
     "artwork_id",
@@ -100,6 +112,29 @@ def without_correlation_id(body: dict) -> dict:
 
 def stored(session: Session) -> int:
     return session.scalar(select(func.count()).select_from(Favourite))
+
+
+def listed(client, query: str = "") -> list[dict]:
+    response = client.get(f"{FAVOURITES}?{query}")
+    assert response.status_code == 200
+    return response.get_json()["data"]
+
+
+def meta(total: int, sort_by: str = "created_at", **paging: object) -> dict:
+    per_page = paging.get("per_page", 20)
+    return {
+        "page": paging.get("page", 1),
+        "per_page": per_page,
+        "total": total,
+        "total_pages": max(1, -(-total // per_page)),
+        "sort_by": sort_by,
+        "sort_dir": paging.get("sort_dir", "asc"),
+    }
+
+
+def unavailable(body: dict) -> dict:
+    """A favourite as it is listed while its item cannot be given."""
+    return body | {"item_id": None, "artwork_id": None, "available": False}
 
 
 class TestMarkFavourite:
@@ -259,6 +294,149 @@ class TestMarkFavourite:
         assert stored(session) == 0
 
 
+class TestListFavourites:
+    def test_the_favourites_are_listed_as_marked(self, client, library):
+        marked = [
+            mark(client, "artist", RADIOHEAD).get_json(),
+            mark(client, "album", HOMOGENIC).get_json(),
+            mark(client, "playlist", ROAD_TRIP).get_json(),
+        ]
+
+        response = client.get(FAVOURITES)
+
+        assert response.status_code == 200
+        assert response.get_json() == {"data": marked, "meta": meta(3)}
+        assert marked[1]["subtitle"] == BJORK_COMPOSED
+
+    def test_no_favourites_are_an_empty_page(self, client, library):
+        response = client.get(FAVOURITES)
+
+        assert response.status_code == 200
+        assert response.get_json() == {"data": [], "meta": meta(0)}
+
+    def test_the_whole_query_spelled_out_is_the_default(self, client, library):
+        mark(client, "artist", RADIOHEAD)
+
+        spelled_out = client.get(
+            f"{FAVOURITES}?page=1&per_page=20&sort_by=created_at&sort_dir=asc"
+        )
+
+        assert spelled_out.status_code == 200
+        assert spelled_out.get_json() == client.get(FAVOURITES).get_json()
+
+    @pytest.mark.parametrize("sort_by", ["created_at", "title"])
+    @pytest.mark.parametrize("sort_dir", ["asc", "desc"])
+    def test_the_pages_cut_one_sequence(self, client, session, sort_by, sort_dir):
+        # Stored in one transaction, they share their created_at.
+        ids = []
+        for number, title in enumerate(["b", "a", "b", "c", "a"]):
+            favourite = Favourite(
+                item_kind=ItemKind.ARTIST,
+                guid=f"plex://artist/{6000 + number}",
+                rating_key=str(6000 + number),
+                title=title,
+            )
+            session.add(favourite)
+            session.flush()
+            ids.append(favourite.id)
+        in_order = {
+            "created_at": ids,
+            "title": [ids[1], ids[4], ids[0], ids[2], ids[3]],
+        }[sort_by]
+        order = f"sort_by={sort_by}&sort_dir={sort_dir}"
+
+        whole = listed(client, f"{order}&per_page=100")
+        pages = [
+            client.get(f"{FAVOURITES}?{order}&per_page=2&page={page}").get_json()
+            for page in (1, 2, 3)
+        ]
+
+        expected = in_order if sort_dir == "asc" else in_order[::-1]
+        assert [favourite["id"] for favourite in whole] == expected
+        assert [favourite for page in pages for favourite in page["data"]] == whole
+        assert [page["meta"] for page in pages] == [
+            meta(5, sort_by, sort_dir=sort_dir, per_page=2, page=page)
+            for page in (1, 2, 3)
+        ]
+
+    def test_a_playlists_artwork_id_is_the_one_the_list_of_playlists_carries(
+        self, client, library
+    ):
+        mark(client, "playlist", ROAD_TRIP)
+        client.get(f"/api/library/playlists/{ROAD_TRIP}")
+
+        first, second = listed(client), listed(client)
+
+        playlists = client.get("/api/library/playlists").get_json()["data"]
+        assert first == second
+        assert first[0]["artwork_id"] == playlists[0]["artwork_id"] is not None
+
+    def test_an_items_artwork_id_is_one_the_artwork_endpoint_serves(
+        self, client, library, artwork: ArtworkService
+    ):
+        mark(client, "album", AMNESIAC)
+        (album,) = listed(client)
+
+        for format in ("jpeg", "lvgl"):
+            answer = client.get(
+                f"/api/artwork/{album['artwork_id']}?size=16&format={format}"
+            )
+            assert answer.status_code == 200
+
+    def test_a_favourite_plex_does_not_have_is_listed_unavailable_and_kept(
+        self, client, session, library
+    ):
+        gone = Favourite(
+            item_kind=ItemKind.ALBUM,
+            guid="plex://album/vespertine",
+            rating_key="9999",
+            title="Vespertine",
+            artist_title=BJORK_DECOMPOSED,
+        )
+        session.add(gone)
+        session.flush()
+
+        (body,) = listed(client)
+
+        assert body == {
+            "id": gone.id,
+            "kind": "album",
+            "item_id": None,
+            "title": "Vespertine",
+            "subtitle": BJORK_COMPOSED,
+            "artwork_id": None,
+            "available": False,
+            "created_at": body["created_at"],
+        }
+        assert datetime.fromisoformat(body["created_at"]) == gone.created_at
+        assert stored(session) == 1
+
+    def test_while_plex_does_not_answer_the_favourites_are_listed_from_the_store(
+        self, client, session, library
+    ):
+        marked = [
+            mark(client, "artist", BJORK).get_json(),
+            mark(client, "album", HOMOGENIC).get_json(),
+            mark(client, "playlist", ROAD_TRIP).get_json(),
+        ]
+        library.reachable = False
+
+        response = client.get(FAVOURITES)
+
+        assert response.status_code == 200
+        assert response.get_json() == {
+            "data": [unavailable(body) for body in marked],
+            "meta": meta(3),
+        }
+        assert stored(session) == 3
+
+    @pytest.mark.parametrize("query", REFUSED_QUERIES)
+    def test_a_query_the_list_does_not_take_is_refused(self, client, library, query):
+        response = client.get(f"{FAVOURITES}?{query}")
+
+        assert response.status_code == 400
+
+
 class TestUnmarkFavourite:
     def test_a_mark_is_removed(self, client, session, library):
         album = mark(client, "album", AMNESIAC).get_json()
@@ -340,7 +518,66 @@ class TestFavouritesDocument:
             if path.startswith(FAVOURITES)
         }
 
-        assert favourites == {FAVOURITES: ["post"], FAVOURITE: ["delete"]}
+        assert favourites == {FAVOURITES: ["get", "post"], FAVOURITE: ["delete"]}
+
+    def test_listing_says_what_it_serves(self, openapi_document):
+        operation = openapi_document["paths"][FAVOURITES]["get"]
+
+        assert operation["summary"] == (
+            "The household's favourites, each with its item as Plex has it now."
+        )
+        description = " ".join(operation["description"].split())
+        assert "is kept" in description
+        assert "While Plex fails" in description
+        for parameter in operation["parameters"]:
+            assert parameter["description"], parameter["name"]
+
+    def test_listing_is_documented_with_its_errors_in_the_envelope(
+        self, openapi_document
+    ):
+        responses = openapi_document["paths"][FAVOURITES]["get"]["responses"]
+
+        assert sorted(responses) == ["200", "400"]
+        assert responses["200"]["description"]
+        schema = responses["400"]["content"]["application/json"]["schema"]
+        assert "ApiErrorResponseSchema" in schema["$ref"]
+        assert responses["400"]["description"]
+
+    def test_listing_takes_the_paging_and_its_two_orders(self, openapi_document):
+        operation = openapi_document["paths"][FAVOURITES]["get"]
+        query = {
+            parameter["name"]: schema_of(openapi_document, parameter["schema"])
+            for parameter in operation["parameters"]
+            if parameter["in"] == "query"
+        }
+
+        assert sorted(query) == ["page", "per_page", "sort_by", "sort_dir"]
+        assert query["sort_by"]["enum"] == ["created_at", "title"]
+        assert query["sort_by"]["default"] == "created_at"
+        assert query["sort_dir"]["enum"] == ["asc", "desc"]
+        assert query["sort_dir"]["default"] == "asc"
+        assert (query["per_page"]["minimum"], query["per_page"]["maximum"]) == (1, 100)
+        assert query["page"]["minimum"] == 1
+        assert "requestBody" not in operation
+
+    def test_listing_answers_a_page_of_the_favourites_marking_answers(
+        self, openapi_document
+    ):
+        paths = openapi_document["paths"]
+        page = json_schema(
+            openapi_document, paths[FAVOURITES]["get"]["responses"]["200"]
+        )
+        created = json_schema(
+            openapi_document, paths[FAVOURITES]["post"]["responses"]["201"]
+        )
+
+        assert sorted(page["properties"]) == ["data", "meta"]
+        assert sorted(page["required"]) == ["data", "meta"]
+        assert undescribed(openapi_document, page) == []
+        item = schema_of(openapi_document, page["properties"]["data"]["items"])
+        assert item == created
+        available = " ".join(item["properties"]["available"]["description"].split())
+        assert "while Plex fails" in available
 
     @pytest.mark.parametrize(
         ("path", "method", "statuses", "code"),

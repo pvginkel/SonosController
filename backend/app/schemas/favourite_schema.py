@@ -6,6 +6,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.common import PaginationMetaSchema, PaginationQuerySchema
+
 FavouriteKind = Literal["artist", "album", "playlist"]
 
 
@@ -55,8 +57,29 @@ class FavouriteSchema(BaseModel):
     )
     available: bool = Field(
         description=(
-            "Whether Plex has the item now. A favourite whose item Plex does "
-            "not have is kept, with its title and subtitle."
+            "Whether the item can be opened and played now: `false` when Plex "
+            "does not have the item, and for every favourite listed while "
+            "Plex fails. A favourite that is not available is kept, with its "
+            "title and subtitle."
         )
     )
     created_at: datetime = Field(description="When the item was marked.")
+
+
+class FavouriteListQuerySchema(PaginationQuerySchema):
+    sort_by: Literal["created_at", "title"] = Field(
+        "created_at",
+        description=(
+            "`created_at`: by when the item was marked, then `id`. `title`: "
+            "by title, without accents and in one case, then `id`."
+        ),
+    )
+
+
+class FavouritePageSchema(BaseModel):
+    """A page of the favourites."""
+
+    data: list[FavouriteSchema] = Field(description="The favourites of the page.")
+    meta: PaginationMetaSchema = Field(
+        description="Which page it is, and how many favourites there are."
+    )
