@@ -1,19 +1,24 @@
 """Tests for the library service, on the in-memory Plex."""
 
 import unicodedata
+from collections.abc import Generator
+from contextlib import contextmanager
 from datetime import date
 
 import pytest
-from flask import Flask
+from sqlalchemy import event
+from sqlalchemy.orm import Session
 
 from app.core_exceptions import ExternalServiceException
 from app.exceptions import ItemNotFoundException
+from app.models import Favourite, ItemKind
 from app.schemas.library_schema import (
     AlbumListQuerySchema,
     ArtistListQuerySchema,
     PlaylistListQuerySchema,
     TrackListQuerySchema,
 )
+from app.services.container import ServiceContainer
 from app.services.library_service import (
     LibraryAlbum,
     LibraryArtist,
@@ -46,11 +51,23 @@ HOMOGENIC_COMPOSED = "Homogénic"
 # What is no item of a kind: a key Plex does not have, and what is no key.
 NO_KEYS = ["9999", "abba", "30 01", "-1"]
 
+RADIOHEAD = "5001"
+AMNESIAC = "5101"
+AMNESIAC_AGAIN = "5102"
+KID_A = "5103"
+ROAD_TRIP = "5301"
+DINNER = "5302"
+
+AMNESIAC_GUID = "plex://album/5d07amnesiac"
+
+# Small pictures: the fake's default ones are large (card SCTL-14).
+SMALL = (16, 16)
+
 
 @pytest.fixture
-def library(app: Flask) -> LibraryService:
-    """The container's library service, on the test's Plex."""
-    service: LibraryService = app.container.library_service()
+def library(container: ServiceContainer) -> LibraryService:
+    """The container's library service, on the test's Plex and session."""
+    service: LibraryService = container.library_service()
     return service
 
 
@@ -82,6 +99,57 @@ def beatles(plex: FakePlexClient) -> FakePlexClient:
     return plex
 
 
+@pytest.fixture
+def radiohead(plex: FakePlexClient) -> FakePlexClient:
+    """Radiohead with Amnesiac held twice and Kid A, and two playlists, with
+    small pictures or none."""
+    plex.add_artist(RADIOHEAD, "Radiohead", size=SMALL)
+    for album in (AMNESIAC, AMNESIAC_AGAIN):
+        plex.add_album(
+            album,
+            [],
+            size=SMALL,
+            artist=RADIOHEAD,
+            title="Amnesiac",
+            guid=AMNESIAC_GUID,
+        )
+    plex.add_album(KID_A, [], size=None, artist=RADIOHEAD, title="Kid A")
+    plex.add_playlist(ROAD_TRIP, "Road trip", 148, size=SMALL)
+    plex.add_playlist(DINNER, "Dinner", 12, size=SMALL)
+    return plex
+
+
+def store(session: Session, kind: ItemKind, guid: str, rating_key: str) -> int:
+    """Put a favourite of this kind and guid in the store, at a rating key:
+    its id."""
+    favourite = Favourite(
+        item_kind=kind,
+        guid=guid,
+        rating_key=rating_key,
+        title="A title",
+        artist_title="An artist" if kind is ItemKind.ALBUM else None,
+    )
+    session.add(favourite)
+    session.flush()
+    return favourite.id
+
+
+@contextmanager
+def statements(session: Session) -> Generator[list[str]]:
+    """The statements the session sends the store inside the block."""
+    sent: list[str] = []
+
+    def record(*args: object) -> None:
+        sent.append(str(args[2]))
+
+    connection = session.connection()
+    event.listen(connection, "before_cursor_execute", record)
+    try:
+        yield sent
+    finally:
+        event.remove(connection, "before_cursor_execute", record)
+
+
 def artist_ids(library: LibraryService, **query: object) -> list[str]:
     artists, _ = library.list_artists(ArtistListQuerySchema.model_validate(query))
     return [artist.id for artist in artists]
@@ -102,9 +170,7 @@ def track_ids(library: LibraryService, album_id: str, **query: object) -> list[s
 
 
 def playlist_ids(library: LibraryService, **query: object) -> list[str]:
-    playlists, _ = library.list_playlists(
-        PlaylistListQuerySchema.model_validate(query)
-    )
+    playlists, _ = library.list_playlists(PlaylistListQuerySchema.model_validate(query))
     return [playlist.id for playlist in playlists]
 
 
@@ -121,6 +187,7 @@ class TestLibraryServiceListArtists:
                 title="The Beatles",
                 index_letter="B",
                 artwork_id=plex_artwork_id(picture),
+                favourite_id=None,
             )
         ]
         assert total == 1
@@ -131,15 +198,19 @@ class TestLibraryServiceListArtists:
         artists, _ = library.list_artists(ArtistListQuerySchema())
 
         assert artists == [
-            LibraryArtist(id=ABBA, title="ABBA", index_letter="A", artwork_id=None)
+            LibraryArtist(
+                id=ABBA,
+                title="ABBA",
+                index_letter="A",
+                artwork_id=None,
+                favourite_id=None,
+            )
         ]
 
     def test_an_empty_library_has_no_artists(self, library):
         assert library.list_artists(ArtistListQuerySchema()) == ([], 0)
 
-    def test_they_come_by_sort_title_whatever_its_case_or_accents(
-        self, library, plex
-    ):
+    def test_they_come_by_sort_title_whatever_its_case_or_accents(self, library, plex):
         plex.add_artist("1", "Pink")
         plex.add_artist("2", "Ólafur Arnalds")
         plex.add_artist("3", "nina simone")
@@ -303,7 +374,11 @@ class TestLibraryServiceArtist:
         plex.add_artist(BJORK, BJORK_DECOMPOSED, sort_title="Bjork", size=None)
 
         assert library.artist(BJORK) == LibraryArtist(
-            id=BJORK, title=BJORK_COMPOSED, index_letter="B", artwork_id=None
+            id=BJORK,
+            title=BJORK_COMPOSED,
+            index_letter="B",
+            artwork_id=None,
+            favourite_id=None,
         )
         assert library.artist(ABBA).artwork_id == plex_artwork_id(
             plex.read_artist(ABBA).picture
@@ -343,6 +418,7 @@ class TestLibraryServiceListArtistAlbums:
                 year=1966,
                 track_count=2,
                 artwork_id=plex_artwork_id(picture),
+                favourite_id=None,
             )
         ]
         assert total == 5
@@ -484,6 +560,7 @@ class TestLibraryServiceAlbum:
             year=1965,
             track_count=1,
             artwork_id=plex_artwork_id(beatles.read_album(HELP).picture),
+            favourite_id=None,
         )
 
     def test_an_album_without_a_date_or_a_cover(self, library, beatles):
@@ -524,13 +601,9 @@ class TestLibraryServiceListAlbumTracks:
         plex.add_album(ANTHOLOGY, [], artist=BEATLES, title="Anthology 1")
         plex.add_track(ANTHOLOGY, "3215", disc=2, number=2)
         plex.add_track(ANTHOLOGY, "3212", disc=1, number=2, duration_ms=241_000)
-        plex.add_track(
-            ANTHOLOGY, "3214", disc=2, number=1, artist="Tony Sheridan"
-        )
+        plex.add_track(ANTHOLOGY, "3214", disc=2, number=1, artist="Tony Sheridan")
         plex.add_track(ANTHOLOGY, "3211", disc=1, number=1)
-        plex.add_track(
-            ANTHOLOGY, "3213", disc=None, number=None, duration_ms=None
-        )
+        plex.add_track(ANTHOLOGY, "3213", disc=None, number=None, duration_ms=None)
         return plex
 
     def test_a_track_is_served_with_its_place_its_length_and_its_albums_picture(
@@ -633,9 +706,7 @@ class TestLibraryServiceListAlbumTracks:
         plex.add_artist(BJORK, BJORK_DECOMPOSED)
         plex.add_album("3130", [], artist=BJORK)
         plex.add_track("3130", "3131", title="Jogá")
-        plex.add_track(
-            "3130", "3132", title="Bachelorette", artist="Sjón", number=2
-        )
+        plex.add_track("3130", "3132", title="Bachelorette", artist="Sjón", number=2)
 
         tracks, _ = library.list_album_tracks("3130", TrackListQuerySchema())
 
@@ -677,6 +748,7 @@ class TestLibraryServiceListPlaylists:
                 track_count=148,
                 duration_ms=listed.duration_ms,
                 artwork_id=plex_artwork_id(listed.picture),
+                favourite_id=None,
             )
         ]
         assert listed.duration_ms is not None
@@ -694,8 +766,12 @@ class TestLibraryServiceListPlaylists:
         assert [playlist.id for playlist in playlists] == ["4002", "4003"]
         assert total == 2
 
-    def test_the_most_tracks_listed_is_the_setting(self, plex):
-        library = LibraryService(plex_client=plex, playlist_max_tracks=3)
+    def test_the_most_tracks_listed_is_the_setting(self, container, plex):
+        library = LibraryService(
+            plex_client=plex,
+            favourite_service=container.favourite_service(),
+            playlist_max_tracks=3,
+        )
         plex.add_playlist("4001", "Three", 3)
         plex.add_playlist("4002", "Four", 4)
 
@@ -780,12 +856,11 @@ class TestLibraryServicePlaylist:
             track_count=148,
             duration_ms=listed.duration_ms,
             artwork_id=plex_artwork_id(listed.picture),
+            favourite_id=None,
         )
 
     @pytest.mark.parametrize("track_count", [0, 1001, 12_019])
-    def test_a_playlist_the_list_leaves_out_is_served(
-        self, library, plex, track_count
-    ):
+    def test_a_playlist_the_list_leaves_out_is_served(self, library, plex, track_count):
         plex.add_playlist("4001", "Not listed", track_count)
 
         assert library.list_playlists(PlaylistListQuerySchema()) == ([], 0)
@@ -830,3 +905,129 @@ class TestLibraryServicePlaylist:
 
         with pytest.raises(ExternalServiceException, match="Plex did not answer"):
             library.playlist("4001")
+
+
+class TestLibraryServiceFavourites:
+    def test_an_artist_carries_the_favourite_that_marks_it_listed_and_alone(
+        self, library, session, radiohead
+    ):
+        radiohead.add_artist(BJORK, BJORK_DECOMPOSED, size=None)
+        favourite_id = store(
+            session, ItemKind.ARTIST, f"plex://artist/{RADIOHEAD}", RADIOHEAD
+        )
+
+        artists, _ = library.list_artists(ArtistListQuerySchema())
+
+        assert [(artist.id, artist.favourite_id) for artist in artists] == [
+            (BJORK, None),
+            (RADIOHEAD, favourite_id),
+        ]
+        assert library.artist(RADIOHEAD).favourite_id == favourite_id
+        assert library.artist(BJORK).favourite_id is None
+
+    def test_both_copies_of_a_release_held_twice_carry_its_one_favourite(
+        self, library, session, radiohead
+    ):
+        favourite_id = store(session, ItemKind.ALBUM, AMNESIAC_GUID, AMNESIAC)
+
+        albums, _ = library.list_artist_albums(
+            RADIOHEAD, AlbumListQuerySchema(sort_by="title", sort_dir="asc")
+        )
+
+        assert [(album.id, album.favourite_id) for album in albums] == [
+            (AMNESIAC, favourite_id),
+            (AMNESIAC_AGAIN, favourite_id),
+            (KID_A, None),
+        ]
+        assert library.album(AMNESIAC_AGAIN).favourite_id == favourite_id
+        assert library.album(KID_A).favourite_id is None
+
+    def test_a_playlist_carries_the_favourite_that_marks_it_listed_and_alone(
+        self, library, session, radiohead
+    ):
+        radiohead.add_playlist("5303", "Not listed", 0)
+        road_trip = store(
+            session,
+            ItemKind.PLAYLIST,
+            f"com.plexapp.agents.none://{ROAD_TRIP}",
+            ROAD_TRIP,
+        )
+        not_listed = store(
+            session, ItemKind.PLAYLIST, "com.plexapp.agents.none://5303", "5303"
+        )
+
+        playlists, _ = library.list_playlists(PlaylistListQuerySchema())
+
+        assert [(playlist.id, playlist.favourite_id) for playlist in playlists] == [
+            (DINNER, None),
+            (ROAD_TRIP, road_trip),
+        ]
+        assert library.playlist(ROAD_TRIP).favourite_id == road_trip
+        assert library.playlist(DINNER).favourite_id is None
+        assert library.playlist("5303").favourite_id == not_listed
+
+    def test_an_item_is_marked_by_its_kind_and_guid_not_by_its_rating_key(
+        self, library, session, radiohead
+    ):
+        # A favourite of an item Plex has since moved holds the old rating
+        # key; one whose item Plex no longer has, a rating key Plex has
+        # given another item.
+        moved = store(session, ItemKind.ARTIST, f"plex://artist/{RADIOHEAD}", "9999")
+        store(session, ItemKind.ALBUM, "plex://album/5d07gone", KID_A)
+
+        assert library.artist(RADIOHEAD).favourite_id == moved
+        assert library.album(KID_A).favourite_id is None
+        (_, _, kid_a), _ = library.list_artist_albums(
+            RADIOHEAD, AlbumListQuerySchema(sort_by="title", sort_dir="asc")
+        )
+        assert (kid_a.id, kid_a.favourite_id) == (KID_A, None)
+
+    def test_a_favourite_of_another_kind_marks_nothing(self, library, session, plex):
+        shared = "plex://5d07shared"
+        plex.add_artist(RADIOHEAD, "Radiohead", size=None, guid=shared)
+        plex.add_album(AMNESIAC, [], size=None, artist=RADIOHEAD, guid=shared)
+        plex.add_playlist(ROAD_TRIP, "Road trip", 148, size=SMALL, guid=shared)
+        favourite_id = store(session, ItemKind.ARTIST, shared, RADIOHEAD)
+
+        assert library.artist(RADIOHEAD).favourite_id == favourite_id
+        assert library.album(AMNESIAC).favourite_id is None
+        assert library.playlist(ROAD_TRIP).favourite_id is None
+
+    def test_a_page_asks_the_store_once_and_plex_nothing_more(
+        self, library, session, plex
+    ):
+        for number in range(30):
+            rating_key = str(6000 + number)
+            plex.add_artist(rating_key, f"Artist {number:02}", size=None)
+            store(session, ItemKind.ARTIST, f"plex://artist/{rating_key}", rating_key)
+        plex.requests.clear()
+
+        with statements(session) as sent:
+            artists, total = library.list_artists(ArtistListQuerySchema(per_page=25))
+
+        assert (len(artists), total) == (25, 30)
+        assert None not in {artist.favourite_id for artist in artists}
+        assert len(sent) == 1
+        assert plex.requests == ["read the artists of Plex's music library"]
+
+    def test_an_empty_page_asks_the_store_nothing(self, library, session, radiohead):
+        store(session, ItemKind.ARTIST, f"plex://artist/{RADIOHEAD}", RADIOHEAD)
+
+        with statements(session) as sent:
+            artists, total = library.list_artists(ArtistListQuerySchema(page=2))
+
+        assert (artists, total) == ([], 1)
+        assert sent == []
+
+    def test_a_plex_that_does_not_answer_fails_before_the_store_is_asked(
+        self, library, session, radiohead
+    ):
+        radiohead.reachable = False
+
+        with (
+            statements(session) as sent,
+            pytest.raises(ExternalServiceException, match="Plex did not answer"),
+        ):
+            library.artist(RADIOHEAD)
+
+        assert sent == []

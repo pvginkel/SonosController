@@ -71,6 +71,27 @@ PLAYLIST = "/api/library/playlists/{playlist_id}"
 LIST_PATHS = [ARTISTS, ALBUMS, TRACKS, PLAYLISTS]
 ITEM_PATHS = [ARTIST, ALBUM, PLAYLIST]
 
+FAVOURITES = "/api/favourites"
+FAVOURITE = "/api/favourites/{favourite_id}"
+
+# The favourite toggle's library.
+RADIOHEAD = "5001"
+AMNESIAC = "5101"
+AMNESIAC_AGAIN = "5102"
+KID_A = "5103"
+RADIOHEADS_TRACK = "5201"
+MIX = "5301"
+DINNER = "5302"
+
+AMNESIAC_GUID = "plex://album/5d07amnesiac"
+
+RADIOHEADS_ALBUMS = (
+    f"/api/library/artists/{RADIOHEAD}/albums?sort_by=title&sort_dir=asc"
+)
+
+# Small pictures: the fake's default ones are large (card SCTL-14).
+SMALL = (16, 16)
+
 
 @pytest.fixture
 def library(plex: FakePlexClient, artwork: ArtworkService) -> FakePlexClient:
@@ -104,6 +125,46 @@ def library(plex: FakePlexClient, artwork: ArtworkService) -> FakePlexClient:
     plex.add_playlist(EMPTY, "Empty", 0)
     plex.add_playlist(EVERYTHING, "All music", 12_019)
     return plex
+
+
+@pytest.fixture
+def radiohead(plex: FakePlexClient) -> FakePlexClient:
+    """Björk, and Radiohead with Amnesiac held twice and Kid A; two
+    playlists. Small pictures or none."""
+    plex.add_artist(BJORK, BJORK_DECOMPOSED, size=None)
+    plex.add_artist(RADIOHEAD, "Radiohead", size=SMALL)
+    for album in (AMNESIAC, AMNESIAC_AGAIN):
+        plex.add_album(
+            album,
+            [],
+            size=SMALL,
+            artist=RADIOHEAD,
+            title="Amnesiac",
+            guid=AMNESIAC_GUID,
+        )
+    plex.add_track(AMNESIAC, RADIOHEADS_TRACK)
+    plex.add_album(KID_A, [], size=None, artist=RADIOHEAD, title="Kid A")
+    plex.add_playlist(MIX, "Mix", 148, size=SMALL)
+    plex.add_playlist(DINNER, "Dinner", 12, size=SMALL)
+    return plex
+
+
+def mark(client, kind: str, item_id: str):
+    return client.post(FAVOURITES, json={"kind": kind, "item_id": item_id})
+
+
+def favourite_ids(client, path: str) -> dict[str, int | None]:
+    """The ``favourite_id`` of every item of a list, by the item's id."""
+    response = client.get(path)
+    assert response.status_code == 200
+    return {item["id"]: item["favourite_id"] for item in response.get_json()["data"]}
+
+
+def favourite_id(client, path: str) -> int | None:
+    """The ``favourite_id`` one item carries."""
+    response = client.get(path)
+    assert response.status_code == 200
+    return response.get_json()["favourite_id"]
 
 
 def meta(total: int, sort_by: str, sort_dir: str = "asc", **paging: int) -> dict:
@@ -177,18 +238,21 @@ class TestListArtists:
             "title": "ABBA",
             "index_letter": "A",
             "artwork_id": None,
+            "favourite_id": None,
         }
         assert beatles == {
             "id": BEATLES,
             "title": "The Beatles",
             "index_letter": "B",
             "artwork_id": beatles["artwork_id"],
+            "favourite_id": None,
         }
         assert bjork == {
             "id": BJORK,
             "title": BJORK_COMPOSED,
             "index_letter": "B",
             "artwork_id": bjork["artwork_id"],
+            "favourite_id": None,
         }
         assert beatles["artwork_id"] != bjork["artwork_id"]
 
@@ -266,6 +330,7 @@ class TestGetArtist:
             "title": BJORK_COMPOSED,
             "index_letter": "B",
             "artwork_id": body["artwork_id"],
+            "favourite_id": None,
         }
         (listed,) = (
             artist
@@ -310,6 +375,7 @@ class TestListArtistAlbums:
             "year": 1966,
             "track_count": 2,
             "artwork_id": revolver["artwork_id"],
+            "favourite_id": None,
         }
         assert (help_["id"], help_["year"], help_["track_count"]) == (HELP, 1965, 1)
         # An album without a cover has its artist's picture.
@@ -322,6 +388,7 @@ class TestListArtistAlbums:
             "year": None,
             "track_count": 1,
             "artwork_id": beatles["artwork_id"],
+            "favourite_id": None,
         }
 
     def test_an_albums_artwork_id_is_one_the_artwork_endpoint_serves(
@@ -361,9 +428,7 @@ class TestListArtistAlbums:
     def test_the_artists_name_is_nfc(self, client, library):
         library.add_album("3110", [], artist=BJORK, title="Homogénic")
 
-        (album,) = client.get(f"/api/library/artists/{BJORK}/albums").get_json()[
-            "data"
-        ]
+        (album,) = client.get(f"/api/library/artists/{BJORK}/albums").get_json()["data"]
 
         assert (album["title"], album["artist"]) == ("Homogénic", BJORK_COMPOSED)
 
@@ -398,9 +463,9 @@ class TestGetAlbum:
         response = client.get(f"/api/library/albums/{REVOLVER}")
 
         assert response.status_code == 200
-        (listed, *_) = client.get(
-            f"/api/library/artists/{BEATLES}/albums"
-        ).get_json()["data"]
+        (listed, *_) = client.get(f"/api/library/artists/{BEATLES}/albums").get_json()[
+            "data"
+        ]
         assert response.get_json() == listed
         assert listed["id"] == REVOLVER
 
@@ -524,6 +589,7 @@ class TestListPlaylists:
             "track_count": 148,
             "duration_ms": 148 * 180_000,
             "artwork_id": road_trip["artwork_id"],
+            "favourite_id": None,
         }
         assert road_trip["artwork_id"] is not None
 
@@ -584,6 +650,7 @@ class TestGetPlaylist:
             "track_count": 148,
             "duration_ms": 148 * 180_000,
             "artwork_id": body["artwork_id"],
+            "favourite_id": None,
         }
         assert near(colour_of(client, body["artwork_id"]), PURPLE)
 
@@ -597,6 +664,7 @@ class TestGetPlaylist:
             "track_count": 0,
             "duration_ms": None,
             "artwork_id": None,
+            "favourite_id": None,
         }
         assert everything.status_code == 200
         assert everything.get_json()["track_count"] == 12_019
@@ -633,6 +701,96 @@ class TestGetPlaylist:
         assert without_correlation_id(response.get_json()) == plex_failed(
             f"read Plex playlist {ROAD_TRIP}"
         )
+
+
+# A mark and an unmark send favourites_changed; the test's own event sender
+# leaves none behind for a later test's connections.
+@pytest.mark.usefixtures("sender")
+class TestLibraryFavourites:
+    @pytest.mark.parametrize(
+        ("kind", "item_id", "list_path", "item_path", "unmarked"),
+        [
+            (
+                "artist",
+                RADIOHEAD,
+                ARTISTS,
+                ARTIST.format(artist_id=RADIOHEAD),
+                [BJORK],
+            ),
+            (
+                "album",
+                KID_A,
+                RADIOHEADS_ALBUMS,
+                ALBUM.format(album_id=KID_A),
+                [AMNESIAC, AMNESIAC_AGAIN],
+            ),
+            (
+                "playlist",
+                MIX,
+                PLAYLISTS,
+                PLAYLIST.format(playlist_id=MIX),
+                [DINNER],
+            ),
+        ],
+    )
+    def test_the_toggle_reads_the_mark_a_mark_answers_listed_and_alone(
+        self, client, radiohead, kind, item_id, list_path, item_path, unmarked
+    ):
+        assert favourite_ids(client, list_path) == dict.fromkeys(
+            [item_id, *unmarked], None
+        )
+        assert favourite_id(client, item_path) is None
+
+        marked = mark(client, kind, item_id)
+
+        assert marked.status_code == 201
+        favourite = marked.get_json()["id"]
+        assert favourite_ids(client, list_path) == {
+            item_id: favourite,
+            **dict.fromkeys(unmarked, None),
+        }
+        assert favourite_id(client, item_path) == favourite
+        again = mark(client, kind, item_id)
+        assert (again.status_code, again.get_json()["id"]) == (200, favourite)
+
+        assert (
+            client.delete(FAVOURITE.format(favourite_id=favourite)).status_code == 204
+        )
+
+        assert favourite_ids(client, list_path) == dict.fromkeys(
+            [item_id, *unmarked], None
+        )
+        assert favourite_id(client, item_path) is None
+
+    def test_both_copies_of_a_release_held_twice_carry_the_one_mark(
+        self, client, radiohead
+    ):
+        favourite = mark(client, "album", AMNESIAC).get_json()["id"]
+
+        assert favourite_ids(client, RADIOHEADS_ALBUMS) == {
+            AMNESIAC: favourite,
+            AMNESIAC_AGAIN: favourite,
+            KID_A: None,
+        }
+        assert favourite_id(client, ALBUM.format(album_id=AMNESIAC_AGAIN)) == favourite
+        other_copy = mark(client, "album", AMNESIAC_AGAIN)
+        assert (other_copy.status_code, other_copy.get_json()["id"]) == (200, favourite)
+
+        assert (
+            client.delete(FAVOURITE.format(favourite_id=favourite)).status_code == 204
+        )
+
+        assert favourite_ids(client, RADIOHEADS_ALBUMS) == dict.fromkeys(
+            [AMNESIAC, AMNESIAC_AGAIN, KID_A], None
+        )
+
+    def test_a_track_carries_no_mark(self, client, radiohead):
+        mark(client, "album", AMNESIAC)
+
+        (track,) = client.get(TRACKS.format(album_id=AMNESIAC)).get_json()["data"]
+
+        assert track["id"] == RADIOHEADS_TRACK
+        assert "favourite_id" not in track
 
 
 class TestLibraryQueries:
@@ -774,13 +932,14 @@ class TestLibraryDocument:
     @pytest.mark.parametrize(
         ("path", "fields"),
         [
-            (ARTISTS, ["artwork_id", "id", "index_letter", "title"]),
+            (ARTISTS, ["artwork_id", "favourite_id", "id", "index_letter", "title"]),
             (
                 ALBUMS,
                 [
                     "artist",
                     "artist_id",
                     "artwork_id",
+                    "favourite_id",
                     "id",
                     "title",
                     "track_count",
@@ -799,7 +958,17 @@ class TestLibraryDocument:
                     "title",
                 ],
             ),
-            (PLAYLISTS, ["artwork_id", "duration_ms", "id", "title", "track_count"]),
+            (
+                PLAYLISTS,
+                [
+                    "artwork_id",
+                    "duration_ms",
+                    "favourite_id",
+                    "id",
+                    "title",
+                    "track_count",
+                ],
+            ),
         ],
     )
     def test_a_list_answers_a_page_of_items_whose_fields_are_described(
@@ -832,10 +1001,26 @@ class TestLibraryDocument:
         self, openapi_document, item_path, list_path
     ):
         paths = openapi_document["paths"]
-        item = json_schema(openapi_document, paths[item_path]["get"]["responses"]["200"])
-        page = json_schema(openapi_document, paths[list_path]["get"]["responses"]["200"])
+        item = json_schema(
+            openapi_document, paths[item_path]["get"]["responses"]["200"]
+        )
+        page = json_schema(
+            openapi_document, paths[list_path]["get"]["responses"]["200"]
+        )
 
         assert item == schema_of(openapi_document, page["properties"]["data"]["items"])
+
+    @pytest.mark.parametrize("path", ITEM_PATHS)
+    def test_an_item_carries_the_id_of_the_favourite_that_marks_it_or_null(
+        self, openapi_document, path
+    ):
+        answer = openapi_document["paths"][path]["get"]["responses"]["200"]
+        item = json_schema(openapi_document, answer)
+
+        field = item["properties"]["favourite_id"]
+        assert field["anyOf"] == [{"type": "integer"}, {"type": "null"}]
+        assert "`POST /api/favourites`" in field["description"]
+        assert "`null`" in field["description"]
 
     def test_an_index_letter_is_a_letter_or_the_hash(self, openapi_document):
         answer = openapi_document["paths"][ARTIST]["get"]["responses"]["200"]

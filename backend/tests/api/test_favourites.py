@@ -222,7 +222,9 @@ class TestMarkFavourite:
         assert response.status_code == 201
         body = response.get_json()
         assert body == favourite(ROAD_TRIP, "playlist", "Road trip") | own(body)
-        assert client.get("/api/library/playlists").get_json()["data"] == listed
+        assert client.get("/api/library/playlists").get_json()["data"] == [
+            playlist | {"favourite_id": body["id"]} for playlist in listed
+        ]
         assert [playlist["artwork_id"] for playlist in listed] == [body["artwork_id"]]
 
     def test_an_items_artwork_id_is_one_the_artwork_endpoint_serves(

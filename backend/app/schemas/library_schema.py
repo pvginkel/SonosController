@@ -18,6 +18,15 @@ _ARTWORK = (
 )
 
 
+def _favourite(item: str) -> str:
+    return (
+        f"The `id` of the favourite that marks the {item}, the one "
+        "`POST /api/favourites` answers for it and the `favourite_id` that "
+        "`DELETE /api/favourites/{favourite_id}` removes; `null` when no "
+        f"favourite marks the {item}."
+    )
+
+
 class ArtistSchema(BaseModel):
     """An artist of the music library."""
 
@@ -46,6 +55,7 @@ class ArtistSchema(BaseModel):
             "without a picture."
         )
     )
+    favourite_id: int | None = Field(description=_favourite("artist"))
 
 
 class AlbumSchema(BaseModel):
@@ -71,6 +81,12 @@ class AlbumSchema(BaseModel):
             f"The id of the album's picture, {_ARTWORK} It is the album's "
             "cover, or its artist's picture where the album has no cover; "
             "`null` when it has neither."
+        )
+    )
+    favourite_id: int | None = Field(
+        description=(
+            f"{_favourite('album')} The two copies of a release the library "
+            "holds twice carry the one favourite."
         )
     )
 
@@ -144,6 +160,7 @@ class PlaylistSchema(BaseModel):
             "answering the picture."
         )
     )
+    favourite_id: int | None = Field(description=_favourite("playlist"))
 
 
 class ArtistListQuerySchema(PaginationQuerySchema):

@@ -150,13 +150,6 @@ class ServiceContainer(containers.DeclarativeContainer):
         plex_client=plex_client,
     )
 
-    # Library service - the music library, read from Plex on each request
-    library_service = providers.Factory(
-        LibraryService,
-        plex_client=plex_client,
-        playlist_max_tracks=app_config.provided.playlist_max_tracks,
-    )
-
     # Favourite service - the favourites, in the store; their items read from
     # Plex on each request
     favourite_service = providers.Factory(
@@ -164,6 +157,15 @@ class ServiceContainer(containers.DeclarativeContainer):
         db_session=db_session,
         plex_client=plex_client,
         event_sender=event_sender,
+    )
+
+    # Library service - the music library, read from Plex on each request;
+    # its items carry the favourites that mark them
+    library_service = providers.Factory(
+        LibraryService,
+        plex_client=plex_client,
+        favourite_service=favourite_service,
+        playlist_max_tracks=app_config.provided.playlist_max_tracks,
     )
 
     # Speaker service - playback and volume commands to the speakers

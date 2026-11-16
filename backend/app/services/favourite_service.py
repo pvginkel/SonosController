@@ -12,7 +12,7 @@ Every change to the store is announced to every client, as
 
 import logging
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -175,6 +175,23 @@ class FavouriteService:
             return _served(stored_first, item), False
         self._announce()
         return _served(favourite, item), True
+
+    def favourite_ids(self, kind: ItemKind, guids: Iterable[str]) -> dict[str, int]:
+        """The id of the favourite that marks the items of this kind and each
+        of these guids, by guid: the favourite a mark of such an item answers.
+        A guid no favourite marks is left out.
+
+        One query of the store, none for no guids; Plex is not asked.
+        """
+        wanted = set(guids)
+        if not wanted:
+            return {}
+        rows = self._db.execute(
+            select(Favourite.guid, Favourite.id).where(
+                Favourite.item_kind == kind, Favourite.guid.in_(wanted)
+            )
+        )
+        return {row.guid: row.id for row in rows}
 
     def unmark(self, favourite_id: int) -> None:
         """Remove a favourite, and announce it. Plex is not asked.

@@ -5,16 +5,19 @@ Every call reads Plex through the Plex client, and nothing of the library is
 kept. An item is addressed by its rating key. What leaves here is ready to
 serve: every string is Unicode NFC, a picture is the artwork id the artwork
 endpoint takes, and a list is in an order that ends in the rating key, so
-that its pages cut one sequence.
+that its pages cut one sequence. An artist, an album and a playlist carry the
+favourite that marks them, from one query of the store per call.
 
 A title is ordered and filed by its letters alone: without accents and in
 one case.
 """
 
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from app.exceptions import ItemNotFoundException
+from app.models import ItemKind
 from app.schemas.common import PaginationQuerySchema
 from app.schemas.library_schema import (
     AlbumListQuerySchema,
@@ -22,6 +25,7 @@ from app.schemas.library_schema import (
     PlaylistListQuerySchema,
     TrackListQuerySchema,
 )
+from app.services.favourite_service import FavouriteService
 from app.services.plex_client import PlexClient
 from app.utils.artwork_id import plex_artwork_id
 from app.utils.plex_library import PlexAlbum, PlexArtist, PlexPlaylist, PlexTrack
@@ -36,6 +40,7 @@ class LibraryArtist:
     title: str
     index_letter: str
     artwork_id: str | None
+    favourite_id: int | None
 
 
 @dataclass(frozen=True)
@@ -47,6 +52,7 @@ class LibraryAlbum:
     year: int | None
     track_count: int
     artwork_id: str | None
+    favourite_id: int | None
 
 
 @dataclass(frozen=True)
@@ -67,6 +73,7 @@ class LibraryPlaylist:
     track_count: int
     duration_ms: int | None
     artwork_id: str | None
+    favourite_id: int | None
 
 
 class LibraryService:
@@ -75,8 +82,14 @@ class LibraryService:
     Every method raises ``ExternalServiceException`` when Plex fails.
     """
 
-    def __init__(self, plex_client: PlexClient, playlist_max_tracks: int) -> None:
+    def __init__(
+        self,
+        plex_client: PlexClient,
+        favourite_service: FavouriteService,
+        playlist_max_tracks: int,
+    ) -> None:
         self._plex = plex_client
+        self._favourites = favourite_service
         self._playlist_max_tracks = playlist_max_tracks
 
     def list_artists(
@@ -92,7 +105,9 @@ class LibraryService:
             key=_artist_order,
             reverse=query.sort_dir == "desc",
         )
-        return [_artist(artist) for artist in _page(artists, query)], len(artists)
+        page = _page(artists, query)
+        marks = self._marks(ItemKind.ARTIST, page)
+        return [_artist(artist, marks) for artist in page], len(artists)
 
     def artist(self, artist_id: str) -> LibraryArtist:
         """One artist.
@@ -103,7 +118,7 @@ class LibraryService:
         artist = self._plex.read_artist(artist_id)
         if artist is None:
             raise ItemNotFoundException("Artist", artist_id)
-        return _artist(artist)
+        return _artist(artist, self._marks(ItemKind.ARTIST, [artist]))
 
     def list_artist_albums(
         self, artist_id: str, query: AlbumListQuerySchema
@@ -123,7 +138,9 @@ class LibraryService:
             raise ItemNotFoundException("Artist", artist_id)
         if query.sort_by == "title":
             albums = sorted(albums, key=_title_order, reverse=descending)
-        return [_album(album) for album in _page(albums, query)], len(albums)
+        page = _page(albums, query)
+        marks = self._marks(ItemKind.ALBUM, page)
+        return [_album(album, marks) for album in page], len(albums)
 
     def album(self, album_id: str) -> LibraryAlbum:
         """One album.
@@ -134,7 +151,7 @@ class LibraryService:
         album = self._plex.read_album(album_id)
         if album is None:
             raise ItemNotFoundException("Album", album_id)
-        return _album(album)
+        return _album(album, self._marks(ItemKind.ALBUM, [album]))
 
     def list_album_tracks(
         self, album_id: str, query: TrackListQuerySchema
@@ -171,10 +188,9 @@ class LibraryService:
             key=_title_order,
             reverse=query.sort_dir == "desc",
         )
-        return (
-            [_playlist(playlist) for playlist in _page(playlists, query)],
-            len(playlists),
-        )
+        page = _page(playlists, query)
+        marks = self._marks(ItemKind.PLAYLIST, page)
+        return [_playlist(playlist, marks) for playlist in page], len(playlists)
 
     def playlist(self, playlist_id: str) -> LibraryPlaylist:
         """One playlist as it is now, also one the list leaves out.
@@ -186,7 +202,14 @@ class LibraryService:
         playlist = self._plex.read_playlist(playlist_id)
         if playlist is None:
             raise ItemNotFoundException("Playlist", playlist_id)
-        return _playlist(playlist)
+        return _playlist(playlist, self._marks(ItemKind.PLAYLIST, [playlist]))
+
+    def _marks(
+        self, kind: ItemKind, items: Sequence[PlexArtist | PlexAlbum | PlexPlaylist]
+    ) -> dict[str, int]:
+        """The id of the favourite that marks each of these items, by the
+        item's guid; an item no favourite marks is left out."""
+        return self._favourites.favourite_ids(kind, (item.guid for item in items))
 
 
 def _page[T](items: list[T], query: PaginationQuerySchema) -> list[T]:
@@ -223,16 +246,17 @@ def _index_letter(sort_title: str) -> str:
     return first if len(first) == 1 and "A" <= first <= "Z" else NO_LETTER
 
 
-def _artist(artist: PlexArtist) -> LibraryArtist:
+def _artist(artist: PlexArtist, marks: dict[str, int]) -> LibraryArtist:
     return LibraryArtist(
         id=artist.rating_key,
         title=_nfc(artist.title),
         index_letter=_index_letter(artist.sort_title),
         artwork_id=_artwork_id(artist.picture),
+        favourite_id=marks.get(artist.guid),
     )
 
 
-def _album(album: PlexAlbum) -> LibraryAlbum:
+def _album(album: PlexAlbum, marks: dict[str, int]) -> LibraryAlbum:
     return LibraryAlbum(
         id=album.rating_key,
         title=_nfc(album.title),
@@ -241,6 +265,7 @@ def _album(album: PlexAlbum) -> LibraryAlbum:
         year=album.year,
         track_count=album.track_count,
         artwork_id=_artwork_id(album.picture),
+        favourite_id=marks.get(album.guid),
     )
 
 
@@ -256,13 +281,14 @@ def _track(track: PlexTrack) -> LibraryTrack:
     )
 
 
-def _playlist(playlist: PlexPlaylist) -> LibraryPlaylist:
+def _playlist(playlist: PlexPlaylist, marks: dict[str, int]) -> LibraryPlaylist:
     return LibraryPlaylist(
         id=playlist.rating_key,
         title=_nfc(playlist.title),
         track_count=playlist.track_count,
         duration_ms=playlist.duration_ms,
         artwork_id=_artwork_id(playlist.picture),
+        favourite_id=marks.get(playlist.guid),
     )
 
 
