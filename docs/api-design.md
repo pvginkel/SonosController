@@ -63,6 +63,12 @@ What follows from the detail:
   the lease ends a subscription its subscriber left behind (a killed process, a stopped
   environment): the backend asks 5 minutes, and a session that subscribes unsubscribes before it
   ends (`docs/change-discipline.md`, the live rules).
+- **The events Service routes to the pod before the pod is ready.** The backend subscribes while
+  it starts, before its readiness check passes, and SoCo binds its listener before the first
+  `SUBSCRIBE`. A Service that waits for readiness drops the speakers' first notifications, and
+  then the backend's own subscriptions are the ones whose delivery failed: after one deploy, no
+  change reached the backend for 3.5 minutes. The deployment's events Service sets
+  `publishNotReadyAddresses`.
 - **SoCo advertises the port it binds.** It has an advertised address (`EVENT_ADVERTISE_IP`, which
   also takes a name) but no advertised port. So the Service's port and the container's port are
   the same number, 1400.
