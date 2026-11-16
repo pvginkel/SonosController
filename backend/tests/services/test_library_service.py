@@ -441,10 +441,13 @@ class TestLibraryServiceListArtistAlbums:
             BOOTLEG: None,
         }
 
-    def test_an_album_without_a_picture_has_no_artwork_id(self, library, beatles):
+    def test_an_album_without_a_cover_has_its_artists_artwork_id(
+        self, library, beatles
+    ):
         albums, _ = library.list_artist_albums(BEATLES, AlbumListQuerySchema())
 
-        assert [album.id for album in albums if album.artwork_id is None] == [DEMOS]
+        artists = plex_artwork_id(beatles.read_artist(BEATLES).picture)
+        assert [album.id for album in albums if album.artwork_id == artists] == [DEMOS]
 
     def test_the_titles_are_nfc(self, library, plex):
         plex.add_artist(BJORK, BJORK_DECOMPOSED)
@@ -483,10 +486,11 @@ class TestLibraryServiceAlbum:
             artwork_id=plex_artwork_id(beatles.read_album(HELP).picture),
         )
 
-    def test_an_album_without_a_date_or_a_picture(self, library, beatles):
+    def test_an_album_without_a_date_or_a_cover(self, library, beatles):
         album = library.album(DEMOS)
 
-        assert (album.year, album.artwork_id) == (None, None)
+        artists = plex_artwork_id(beatles.read_artist(BEATLES).picture)
+        assert (album.year, album.artwork_id) == (None, artists)
 
     def test_the_titles_are_nfc(self, library, plex):
         plex.add_artist(BJORK, BJORK_DECOMPOSED)

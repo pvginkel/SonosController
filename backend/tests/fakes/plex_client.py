@@ -473,7 +473,12 @@ class FakePlexClient(PlexClient):
             track_count=sum(
                 1 for track in self._tracks.values() if track.album == album.rating_key
             ),
-            picture=self._picture_path(album.rating_key),
+            # Plex gives an album without a cover its artist's picture, and
+            # leaves its tracks without one.
+            picture=(
+                self._picture_path(album.rating_key)
+                or self._picture_path(album.artist)
+            ),
         )
 
     def _track(self, track: _Track) -> PlexTrack:

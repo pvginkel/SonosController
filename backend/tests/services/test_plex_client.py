@@ -501,12 +501,12 @@ class TestPlexClientAlbums:
         assert album.picture.startswith(f"/library/metadata/{REVOLVER}/thumb/")
         _assert_colour(_image(music.read_picture(album.picture, 100)), RED)
 
-    def test_an_album_without_a_date_or_a_picture_has_none(self, music):
+    def test_an_album_without_a_date_or_a_cover_has_its_artists_picture(self, music):
         album = music.read_album(BOOTLEG)
 
         assert album.released is None
         assert album.year is None
-        assert album.picture is None
+        assert album.picture == music.read_artist(BEATLES).picture
 
     def test_one_album_is_the_one_listed(self, music):
         for album in music.read_artist_albums(BEATLES, newest_first=True):

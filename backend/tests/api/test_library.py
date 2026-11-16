@@ -312,6 +312,8 @@ class TestListArtistAlbums:
             "artwork_id": revolver["artwork_id"],
         }
         assert (help_["id"], help_["year"], help_["track_count"]) == (HELP, 1965, 1)
+        # An album without a cover has its artist's picture.
+        beatles = client.get(f"/api/library/artists/{BEATLES}").get_json()
         assert demos == {
             "id": DEMOS,
             "title": "Demos",
@@ -319,7 +321,7 @@ class TestListArtistAlbums:
             "artist": "The Beatles",
             "year": None,
             "track_count": 1,
-            "artwork_id": None,
+            "artwork_id": beatles["artwork_id"],
         }
 
     def test_an_albums_artwork_id_is_one_the_artwork_endpoint_serves(
