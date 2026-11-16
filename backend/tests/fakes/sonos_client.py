@@ -5,7 +5,8 @@ hidden devices, groups, each room's transport with its queue or stream, and
 room and group volume. It answers ``SonosClient``'s calls from that state and
 sends events the way ``docs/api-design.md`` section 1.1 found the speakers
 send them: a service's state in full when a subscription starts, then partial
-events, several for one change, on a thread of their own.
+events, several for one change, on a thread of their own. A ``Queue`` event
+follows every change to a queue, a change of play mode included.
 
 A room's queue is kept the way ``docs/api-design.md`` sections 1.3 to 1.6
 found the speakers keep one. A container of the Plex service becomes the
@@ -51,6 +52,7 @@ from app.services.sonos_client import (
     Playback,
     PlaybackChanged,
     PlexItem,
+    QueueChanged,
     QueuePage,
     Room,
     SonosClient,
@@ -290,6 +292,7 @@ class FakeSonosClient(SonosClient):
         room.position = 1 if tracks else 0
         room.stream = None
         room.state = TransportState.STOPPED
+        self._send_queue(room)
         self._send_playback(room, full=True)
 
     def start_stream(
@@ -637,12 +640,14 @@ class FakeSonosClient(SonosClient):
         room.position = 0
         if not room.stream:
             room.state = TransportState.STOPPED
+        self._send_queue(room)
         self._send_playback(room)
 
     def set_shuffle(self, speaker_id: str, shuffle: bool) -> None:
         room = self._coordinator(speaker_id, "set the play mode of")
+        changed = shuffle != room.shuffle
         # A queue that holds tracks is at one of them.
-        if shuffle != room.shuffle and room.queue:
+        if changed and room.queue:
             current = room.position - 1
             if shuffle:
                 # The current track stays first, and the rest follow drawn.
@@ -655,6 +660,8 @@ class FakeSonosClient(SonosClient):
             room.normal = [room.normal[index] for index in order]
             room.position = order.index(current) + 1
         room.shuffle = shuffle
+        if changed:
+            self._send_queue(room)
         self._send_playback(room)
 
     def add_to_queue(self, speaker_id: str, item: PlexItem) -> None:
@@ -824,6 +831,7 @@ class FakeSonosClient(SonosClient):
             room.normal.insert(place, index)
         if tracks and not room.position:
             room.position = 1
+        self._send_queue(room)
         self._send_playback(room)
 
     def _members(self, coordinator: _Room) -> list[_Room]:
@@ -953,6 +961,8 @@ class FakeSonosClient(SonosClient):
             group = self._group_volume(self._rooms[room.coordinator_id])
             volume = self._lagging_group_volume.get(room.id, group.volume)
             return GroupVolumeChanged(room.id, volume=volume, muted=group.muted)
+        if service is SonosService.QUEUE:
+            return QueueChanged(room.id)
         return HouseholdChanged(room.id, self._household())
 
     def _playback_event(
@@ -997,6 +1007,10 @@ class FakeSonosClient(SonosClient):
             PlaybackChanged(room.id, transport_uri=f"x-rincon:{room.coordinator_id}"),
         )
 
+    def _send_queue(self, room: _Room) -> None:
+        """Send a change of the room's own queue, to its own device."""
+        self._send(room.id, QueueChanged(room.id))
+
     def _send_track_change(self, room: _Room) -> None:
         playing = room.state is TransportState.PLAYING
         self._send_playback(room, via=TransportState.TRANSITIONING if playing else None)
@@ -1025,11 +1039,12 @@ class FakeSonosClient(SonosClient):
     ) -> None:
         """Queue an event of a room's device for the subscriptions it holds."""
         if service is None:
-            service = (
-                SonosService.AV_TRANSPORT
-                if isinstance(event, PlaybackChanged)
-                else SonosService.RENDERING_CONTROL
-            )
+            if isinstance(event, PlaybackChanged):
+                service = SonosService.AV_TRANSPORT
+            elif isinstance(event, QueueChanged):
+                service = SonosService.QUEUE
+            else:
+                service = SonosService.RENDERING_CONTROL
         for subscription in self._held(speaker_id):
             if subscription.service is service:
                 self._enqueue(lambda s=subscription: self._deliver_to(s, event))

@@ -22,6 +22,7 @@ from app.services.sonos_client import (
     PlaybackChanged,
     PlexItem,
     PlexItemKind,
+    QueueChanged,
     QueuePage,
     SoCoSonosClient,
     SonosService,
@@ -331,6 +332,7 @@ class TestLiveSubscriptions:
             playback = listener.take(lambda e: isinstance(e, PlaybackChanged))
             volume = listener.take(lambda e: isinstance(e, VolumeChanged))
             group = listener.take(lambda e: isinstance(e, GroupVolumeChanged))
+            queue = listener.take(lambda e: isinstance(e, QueueChanged))
             layout = listener.take(lambda e: isinstance(e, HouseholdChanged))
         finally:
             for subscription in subscriptions:
@@ -359,6 +361,7 @@ class TestLiveSubscriptions:
         assert group.speaker_id == garage
         assert 0 <= group.volume <= 100
         assert group.muted is False
+        assert queue == QueueChanged(garage)
         assert layout == HouseholdChanged(garage, sonos.read_household())
         assert listener.lost == 0
 
@@ -674,6 +677,25 @@ class TestLiveQueue:
 
         assert sonos.read_queue(garage, 0, 1000) == in_order
         assert sonos.read_playback(garage).shuffle is False
+
+    def test_a_queue_change_arrives_as_a_queue_event(
+        self, sonos, garage, kept_queue, library
+    ):
+        listener = _Listener()
+        subscription = sonos.subscribe(
+            garage, SonosService.QUEUE, listener.on_event, listener.on_lost
+        )
+        try:
+            # The state in full a subscription starts with.
+            assert listener.take(lambda e: True) == QueueChanged(garage)
+
+            sonos.add_to_queue(garage, library.album(library.albums[0]))
+            added = listener.take(lambda e: True)
+        finally:
+            subscription.unsubscribe()
+
+        assert added == QueueChanged(garage)
+        assert listener.lost == 0
 
     def test_a_container_the_service_does_not_have_is_refused_in_the_clients_words(
         self, sonos, garage, kept_queue, library

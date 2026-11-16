@@ -23,6 +23,7 @@ from app.services.sonos_client import (
     PlaybackChanged,
     PlexItem,
     PlexItemKind,
+    QueueChanged,
     SoCoSonosClient,
     SonosService,
     TransportAction,
@@ -547,7 +548,7 @@ class TestSonosClientGroups:
         household.settle()
 
         assert household.read_household() == layout
-        assert [listener.events for listener in listeners] == [[]] * 8
+        assert [listener.events for listener in listeners] == [[]] * 10
 
     def test_a_room_that_moves_to_another_group_leaves_its_own(self, four_rooms):
         four_rooms.join(LOUNGE, GARAGE)
@@ -603,7 +604,7 @@ class TestSonosClientGroups:
 
         assert household.read_household() == layout
         assert household.read_playback(GARAGE) == playback
-        assert [listener.events for listener in listeners] == [[]] * 4
+        assert [listener.events for listener in listeners] == [[]] * 5
 
     def test_a_group_whose_coordinator_leaves_stays_a_group_led_by_one_of_its_rooms(
         self, four_rooms
@@ -1111,6 +1112,47 @@ class TestSonosClientQueue:
             None,
         )
 
+    def test_a_queue_change_arrives_as_a_queue_event(self, household, library):
+        listener, _ = _subscribe(household, GARAGE, SonosService.QUEUE)
+
+        household.add_to_queue(GARAGE, _album("10"))
+        household.add_many_to_queue(GARAGE, [_album("30"), _album("10")])
+        household.set_shuffle(GARAGE, True)
+        household.set_shuffle(GARAGE, False)
+        household.clear_queue(GARAGE)
+        household.load_queue(GARAGE, [queue_track(1)])
+        household.settle()
+
+        # One for every change, a change of play mode included
+        # (docs/api-design.md section 1.1).
+        assert listener.events == [QueueChanged(GARAGE)] * 6
+
+    def test_what_leaves_the_queue_as_it_is_sends_no_queue_event(self, household):
+        listener, _ = _subscribe(household, GARAGE, SonosService.QUEUE)
+
+        household.play(GARAGE)
+        household.next(GARAGE)
+        household.previous(GARAGE)
+        household.stop(GARAGE)
+        household.set_shuffle(GARAGE, False)
+        household.set_volume(GARAGE, 30)
+        household.start_stream(GARAGE, "Groove Salad")
+        household.join(LOUNGE, GARAGE)
+        household.settle()
+
+        assert listener.events == []
+
+    def test_a_groups_queue_events_come_from_its_coordinator(self, household):
+        household.join(LOUNGE, GARAGE)
+        garage, _ = _subscribe(household, GARAGE, SonosService.QUEUE)
+        lounge, _ = _subscribe(household, LOUNGE, SonosService.QUEUE)
+
+        household.clear_queue(LOUNGE)
+        household.settle()
+
+        assert garage.events == [QueueChanged(GARAGE)]
+        assert lounge.events == []
+
     def test_the_soco_client_fails_queue_calls_in_its_own_words(self, app):
         client = SoCoSonosClient(
             settings=AppSettings(
@@ -1208,6 +1250,7 @@ class TestSonosClientSubscriptions:
             ),
             VolumeChanged(GARAGE, volume=20, muted=False),
             GroupVolumeChanged(GARAGE, volume=20, muted=False),
+            QueueChanged(GARAGE),
             HouseholdChanged(GARAGE, household.read_household()),
         ]
 

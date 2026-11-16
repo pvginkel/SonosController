@@ -83,8 +83,27 @@ class PlaybackChangedEvent(BaseModel):
     payload: SpeakerPayload = Field(description="The speaker whose playback changed.")
 
 
+class QueueChangedEvent(BaseModel):
+    """The queue a speaker plays from changed: its tracks or their order,
+    shuffle included, or the speaker joined or left a group and plays from
+    another queue. A client that shows the speaker's queue fetches
+    `GET /api/speakers/{speaker_id}/queue`. A queue is a group's, so the
+    event is sent once for every speaker of the group.
+    """
+
+    model_config = _EVENT
+
+    type: Literal["queue_changed"] = Field(
+        default="queue_changed", description="The event's type."
+    )
+    payload: SpeakerPayload = Field(description="The speaker whose queue changed.")
+
+
 StreamEvent = Annotated[
-    SpeakersChangedEvent | VolumeChangedEvent | PlaybackChangedEvent,
+    SpeakersChangedEvent
+    | VolumeChangedEvent
+    | PlaybackChangedEvent
+    | QueueChangedEvent,
     Field(discriminator="type"),
 ]
 

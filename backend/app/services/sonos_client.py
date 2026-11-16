@@ -29,6 +29,7 @@ from xml.etree.ElementTree import ParseError
 import requests
 import soco.config
 import soco.events
+import soco.services
 from soco import SoCo
 from soco.core import PLAY_MODES
 from soco.data_structures import (
@@ -75,6 +76,7 @@ class SonosService(StrEnum):
     AV_TRANSPORT = "AVTransport"
     RENDERING_CONTROL = "RenderingControl"
     GROUP_RENDERING_CONTROL = "GroupRenderingControl"
+    QUEUE = "Queue"
     ZONE_GROUP_TOPOLOGY = "ZoneGroupTopology"
 
 
@@ -236,6 +238,15 @@ class GroupVolumeChanged:
 
 
 @dataclass(frozen=True)
+class QueueChanged:
+    """A Queue event of a room's own device: its queue changed, a change of
+    its play mode included. A room that follows a coordinator reports its own
+    queue."""
+
+    speaker_id: str
+
+
+@dataclass(frozen=True)
 class HouseholdChanged:
     """A ZoneGroupTopology event: the household's layout as it is now."""
 
@@ -243,7 +254,13 @@ class HouseholdChanged:
     household: Household
 
 
-SonosEvent = PlaybackChanged | VolumeChanged | GroupVolumeChanged | HouseholdChanged
+SonosEvent = (
+    PlaybackChanged
+    | VolumeChanged
+    | GroupVolumeChanged
+    | QueueChanged
+    | HouseholdChanged
+)
 
 
 class SonosSubscription(ABC):
@@ -438,12 +455,14 @@ class SonosClient(ABC):
         """
 
 
-# The SoCo attribute of each service.
-_SOCO_SERVICES = {
-    SonosService.AV_TRANSPORT: "avTransport",
-    SonosService.RENDERING_CONTROL: "renderingControl",
-    SonosService.GROUP_RENDERING_CONTROL: "groupRenderingControl",
-    SonosService.ZONE_GROUP_TOPOLOGY: "zoneGroupTopology",
+# The SoCo service of each service, on a device. A SoCo instance has no
+# attribute for Queue.
+_SOCO_SERVICES: dict[SonosService, Callable[[Any], Any]] = {
+    SonosService.AV_TRANSPORT: lambda device: device.avTransport,
+    SonosService.RENDERING_CONTROL: lambda device: device.renderingControl,
+    SonosService.GROUP_RENDERING_CONTROL: lambda device: device.groupRenderingControl,
+    SonosService.QUEUE: soco.services.Queue,
+    SonosService.ZONE_GROUP_TOPOLOGY: lambda device: device.zoneGroupTopology,
 }
 
 _REQUEST_TIMEOUT_SECONDS = 5.0
@@ -776,7 +795,7 @@ class SoCoSonosClient(SonosClient):
             # subscribe() returns, and the delivery thread must find the
             # subscription when it takes that event.
             with self._lock:
-                subscription = getattr(device, _SOCO_SERVICES[service]).subscribe(
+                subscription = _SOCO_SERVICES[service](device).subscribe(
                     requested_timeout=_SUBSCRIPTION_LEASE_SECONDS,
                     auto_renew=True,
                     event_queue=self._events,
@@ -1096,6 +1115,11 @@ def _event(subscribed: _Subscribed, variables: dict[str, Any]) -> SonosEvent | N
             volume=None if volume is None else int(volume),
             muted=None if mute is None else mute == "1",
         )
+    if subscribed.service is SonosService.QUEUE:
+        # Its update id changes on every change to the queue.
+        if "update_id" not in variables:
+            return None
+        return QueueChanged(speaker_id)
     if "zone_group_state" not in variables:
         return None
     # SoCo has taken the event's layout into the household's state already.

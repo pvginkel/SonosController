@@ -405,10 +405,13 @@ class TestJoinGroup:
             for speaker_id in (GARAGE, KITCHEN, LOUNGE)
         }
         assert titles == {GARAGE: "Track 9", KITCHEN: "Track 9", LOUNGE: "Track 7"}
-        # Every room's group changed, and the Kitchen plays what it played.
+        # Every room's group changed, and the Kitchen plays what it played,
+        # from its own queue.
         assert changed(stream.events()) == [
             ("playback_changed", GARAGE),
             ("playback_changed", LOUNGE),
+            ("queue_changed", GARAGE),
+            ("queue_changed", LOUNGE),
             ("speakers_changed", None),
             ("volume_changed", GARAGE),
             ("volume_changed", LOUNGE),
@@ -440,10 +443,11 @@ class TestJoinGroup:
         household.settle()
 
         # Both rooms' group changed, and the Lounge plays what the Garage
-        # plays.
+        # plays, from the Garage's queue.
         for stream in streams:
             assert changed(stream.events()) == [
                 ("playback_changed", LOUNGE),
+                ("queue_changed", LOUNGE),
                 ("speakers_changed", None),
                 ("volume_changed", GARAGE),
                 ("volume_changed", LOUNGE),
@@ -661,10 +665,13 @@ class TestLeaveGroup:
             for speaker_id in (GARAGE, KITCHEN, LOUNGE)
         }
         assert titles == {GARAGE: "Track 1", KITCHEN: "Track 7", LOUNGE: "Track 7"}
-        # Every room's group changed, and the Garage plays what it played.
+        # Every room's group changed, and the Garage plays what it played,
+        # from its own queue.
         assert changed(stream.events()) == [
             ("playback_changed", LOUNGE),
             ("playback_changed", KITCHEN),
+            ("queue_changed", LOUNGE),
+            ("queue_changed", KITCHEN),
             ("speakers_changed", None),
             ("volume_changed", GARAGE),
             ("volume_changed", LOUNGE),
@@ -700,10 +707,12 @@ class TestLeaveGroup:
         leave(client, LOUNGE)
         household.settle()
 
-        # Both rooms' group changed, and the Lounge plays its own again.
+        # Both rooms' group changed, and the Lounge plays its own again, from
+        # its own queue.
         for stream in streams:
             assert changed(stream.events()) == [
                 ("playback_changed", LOUNGE),
+                ("queue_changed", LOUNGE),
                 ("speakers_changed", None),
                 ("volume_changed", GARAGE),
                 ("volume_changed", LOUNGE),

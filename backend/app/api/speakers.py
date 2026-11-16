@@ -122,8 +122,9 @@ def join_group(
     The answer says that the speaker took the command, not that the group
     has changed: `GET /api/speakers` shows the old groups until the speakers
     have reported the new ones. The event `speakers_changed` says that they
-    have, with `volume_changed` for every speaker whose group changed and
-    `playback_changed` for every speaker that now plays something else.
+    have, with `volume_changed` for every speaker whose group changed,
+    `playback_changed` for every speaker that now plays something else and
+    `queue_changed` for every speaker that now plays from another queue.
     """
     join = GroupJoinSchema.model_validate(request.get_json())
     speaker_service.join_group(speaker_id, join.speaker_id)
@@ -155,8 +156,9 @@ def leave_group(
     The answer says that the speaker took the command, not that the group
     has changed: `GET /api/speakers` shows the old groups until the speakers
     have reported the new ones. The event `speakers_changed` says that they
-    have, with `volume_changed` for every speaker whose group changed and
-    `playback_changed` for every speaker that now plays something else.
+    have, with `volume_changed` for every speaker whose group changed,
+    `playback_changed` for every speaker that now plays something else and
+    `queue_changed` for every speaker that now plays from another queue.
     """
     speaker_service.leave_group(speaker_id)
     return "", 204

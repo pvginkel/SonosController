@@ -5,7 +5,9 @@ speakers' state." One instance subscribes to every room's events, reads the
 room in full when it does, and merges each event into what it holds. The API
 reads rooms and playback from it without asking a speaker, and it sends
 section 4's ``speakers_changed``, ``volume_changed`` and ``playback_changed``
-when what it holds changes. Nothing of it is stored.
+when what it holds changes. A group's queue is not held: the mirror sends
+``queue_changed`` when the speakers report that it changed, and when a room
+plays from another queue after a regrouping. Nothing of it is stored.
 
 Its subscriptions live in this process, which is why the app runs as one
 replica. They heal themselves: a room is subscribed to and read again after
@@ -18,8 +20,9 @@ makes no call to a speaker. The mirror reads the layout itself every
 restarted without a word, a room that did not answer before, a household
 that did not answer when the app started.
 
-Playback and the group volume are a group's: the mirror takes them from the
-events of the group's coordinator and serves them for every member. Every
+Playback, the group volume and the queue are a group's: the mirror takes
+them from the events of the group's coordinator and serves them for every
+member. Every
 string it serves is Unicode NFC.
 
 A room the layout lists that the mirror could not subscribe to and read is
@@ -47,6 +50,7 @@ from app.core_exceptions import ExternalServiceException
 from app.exceptions import SpeakerNotFoundException
 from app.schemas.stream_event_schema import (
     PlaybackChangedEvent,
+    QueueChangedEvent,
     SpeakerPayload,
     SpeakersChangedEvent,
     StreamEvent,
@@ -62,6 +66,7 @@ from app.services.sonos_client import (
     HouseholdChanged,
     Playback,
     PlaybackChanged,
+    QueueChanged,
     Room,
     SonosClient,
     SonosEvent,
@@ -211,7 +216,7 @@ _PLAYBACK_FIELDS = (
     "queue_length",
 )
 
-_GroupEvent = VolumeChanged | GroupVolumeChanged | PlaybackChanged
+_GroupEvent = VolumeChanged | GroupVolumeChanged | PlaybackChanged | QueueChanged
 
 
 @dataclass
@@ -732,8 +737,8 @@ class HouseholdMirror:
             self._merge(room_id, event)
 
     def _subscribe_and_read(self, room: Room, feed: _Feed) -> _RoomState:
-        """Subscribe the feed to the room's four services, then read the room
-        in full.
+        """Subscribe the feed to the room's services, then read the room in
+        full.
 
         In that order: what changes after the read arrives as an event, and
         the events that arrive before the read is held wait in the feed.
@@ -816,7 +821,8 @@ class HouseholdMirror:
             self._events.send(stream_event)
 
     def _merge(self, speaker_id: str, event: _GroupEvent) -> list[StreamEvent]:
-        """Merge an event into what is held of the room.
+        """Merge an event into what is held of the room. A queue is not held:
+        a change of it is passed on.
 
         Returns:
             The events to send: none when the event changed nothing.
@@ -831,8 +837,14 @@ class HouseholdMirror:
 
         group = self._groups[speaker_id]
         if group.coordinator_id != speaker_id:
-            # A group's volume and playback are its coordinator's to report.
+            # A group's volume, playback and queue are its coordinator's to
+            # report.
             return []
+        if isinstance(event, QueueChanged):
+            return [
+                QueueChangedEvent(payload=SpeakerPayload(speaker_id=member_id))
+                for member_id in group.member_ids
+            ]
         if isinstance(event, GroupVolumeChanged):
             group_volume = _merged_volume(state.group_volume, event)
             if group_volume == state.group_volume:
@@ -864,8 +876,8 @@ def _layout_events(
     """The events of a layout that was applied.
 
     A room whose group changed has another group volume, and one whose
-    coordinator changed plays something else. A room that was read again has
-    the events of what the read changed.
+    coordinator changed plays something else, from another queue. A room
+    that was read again has the events of what the read changed.
     """
     events: list[StreamEvent] = []
     if {room_id: (room.name, room.group) for room_id, room in before.items()} != {
@@ -880,13 +892,13 @@ def _layout_events(
             now.group_volume,
         ):
             events.append(VolumeChangedEvent(payload=SpeakerPayload(speaker_id=room_id)))
-        if (
-            was.group.coordinator_id != now.group.coordinator_id
-            or was.playback != now.playback
-        ):
+        regrouped = was.group.coordinator_id != now.group.coordinator_id
+        if regrouped or was.playback != now.playback:
             events.append(
                 PlaybackChangedEvent(payload=SpeakerPayload(speaker_id=room_id))
             )
+        if regrouped:
+            events.append(QueueChangedEvent(payload=SpeakerPayload(speaker_id=room_id)))
     return events
 
 

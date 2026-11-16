@@ -61,6 +61,10 @@ def playback_changed(speaker_id: str) -> dict:
     return {"type": "playback_changed", "payload": {"speaker_id": speaker_id}}
 
 
+def queue_changed(speaker_id: str) -> dict:
+    return {"type": "queue_changed", "payload": {"speaker_id": speaker_id}}
+
+
 def in_any_order(events: list[dict]) -> list[dict]:
     return sorted(events, key=lambda event: (event["type"], str(event["payload"])))
 
@@ -847,7 +851,7 @@ class TestHouseholdMirrorLayout:
             "Lounge",
         ]
         assert started.speaker(KITCHEN).model == "One"
-        assert household.subscription_count(KITCHEN) == 4
+        assert household.subscription_count(KITCHEN) == 5
 
         household.set_volume(KITCHEN, 16)
         household.settle()
@@ -907,7 +911,7 @@ class TestHouseholdMirrorRoomsThatDoNotAnswer:
         household.settle()
 
         assert started.speaker(GARAGE).volume == 33
-        assert household.subscription_count(GARAGE) == 4
+        assert household.subscription_count(GARAGE) == 5
         assert len(started.speakers()) == 2
 
     def test_a_group_whose_coordinator_does_not_answer_is_left_out_whole(
@@ -929,7 +933,7 @@ class TestHouseholdMirrorRoomsThatDoNotAnswer:
         assert LOUNGE not in reached
         assert household.subscription_count(GARAGE) == 0
         assert household.subscription_count(LOUNGE) == 0
-        assert household.subscription_count(KITCHEN) == 4
+        assert household.subscription_count(KITCHEN) == 5
 
     def test_a_held_room_is_left_out_when_it_joins_a_coordinator_that_does_not_answer(
         self, started, household, connect
@@ -1022,7 +1026,7 @@ class TestHouseholdMirrorRoomsThatDoNotAnswer:
 
 
 class TestHouseholdMirrorSubscriptions:
-    def test_it_subscribes_to_the_four_services_of_every_room(self, started, household):
+    def test_it_subscribes_to_the_five_services_of_every_room(self, started, household):
         for speaker_id in (GARAGE, LOUNGE):
             for service in SonosService:
                 assert household.subscription_count(speaker_id, service) == 1
@@ -1103,7 +1107,7 @@ class TestHouseholdMirrorSubscriptions:
 
         coordinator.fire_startup()
         assert len(mirror.speakers()) == 2
-        assert household.subscription_count(GARAGE) == 4
+        assert household.subscription_count(GARAGE) == 5
 
         coordinator.shutdown()
         assert mirror.speakers() == []
@@ -1134,7 +1138,7 @@ class TestHouseholdMirrorSubscriptions:
         assert mirror.playback(GARAGE).queue_length == 3
         with pytest.raises(SpeakerNotFoundException):
             mirror.speaker(LOUNGE)
-        assert household.subscription_count(GARAGE) == 4
+        assert household.subscription_count(GARAGE) == 5
         assert household.subscription_count(LOUNGE) == 0
         assert logged(caplog) == [
             (
@@ -1274,12 +1278,13 @@ class TestHouseholdMirrorEvents:
         household.settle()
 
         # Both rooms' group changed, and with it their group volume; the
-        # Lounge now plays what the Garage plays. The Garage's own event for
-        # its group's new volume follows. The Lounge's device reports its own
-        # transport, which names the Garage: that is not the group's playback,
-        # and the Garage's has not changed.
+        # Lounge now plays what the Garage plays, from the Garage's queue. The
+        # Garage's own event for its group's new volume follows. The Lounge's
+        # device reports its own transport, which names the Garage: that is
+        # not the group's playback, and the Garage's has not changed.
         assert in_any_order(stream.events()) == [
             playback_changed(LOUNGE),
+            queue_changed(LOUNGE),
             speakers_changed(),
             volume_changed(GARAGE),
             volume_changed(GARAGE),
@@ -1302,8 +1307,89 @@ class TestHouseholdMirrorEvents:
         assert speakers_changed() in events
         assert playback_changed(LOUNGE) in events
         assert playback_changed(GARAGE) not in events
+        assert queue_changed(LOUNGE) in events
+        assert queue_changed(GARAGE) not in events
         assert volume_changed(LOUNGE) in events
         assert volume_changed(GARAGE) in events
+
+    def test_the_rooms_a_coordinator_leaves_play_from_another_queue(
+        self, household, mirror, connect
+    ):
+        household.add_room(KITCHEN, "Kitchen")
+        household.join(LOUNGE, GARAGE)
+        household.join(KITCHEN, GARAGE)
+        mirror.start()
+        household.settle()
+        stream = connect()
+
+        household.unjoin(GARAGE)
+        household.settle()
+
+        # The Lounge leads the Kitchen now, from its own queue; the Garage
+        # plays from the queue it led them in.
+        events = stream.events()
+        assert queue_changed(LOUNGE) in events
+        assert queue_changed(KITCHEN) in events
+        assert queue_changed(GARAGE) not in events
+
+    def test_a_queue_change_reaches_every_connection(self, started, household, connect):
+        first, second = connect(), connect()
+
+        household.clear_queue(GARAGE)
+        household.settle()
+
+        # What plays changed with it.
+        for stream in (first, second):
+            events = stream.events()
+            assert events.count(queue_changed(GARAGE)) == 1
+            assert playback_changed(GARAGE) in events
+
+    def test_a_groups_queue_change_goes_out_for_every_member(
+        self, household, mirror, connect
+    ):
+        household.add_room(KITCHEN, "Kitchen")
+        household.join(LOUNGE, GARAGE)
+        mirror.start()
+        household.settle()
+        stream = connect()
+
+        household.load_queue(LOUNGE, [queue_track(7)])
+        household.settle()
+
+        # The Kitchen is not in the group.
+        assert in_any_order(stream.events()) == [
+            playback_changed(GARAGE),
+            playback_changed(LOUNGE),
+            queue_changed(GARAGE),
+            queue_changed(LOUNGE),
+        ]
+
+    def test_a_change_of_play_mode_changes_the_queue(self, started, household, connect):
+        stream = connect()
+
+        household.set_shuffle(GARAGE, True)
+        household.settle()
+
+        # With shuffle on, the queue is presented in play order.
+        assert in_any_order(stream.events()) == [
+            playback_changed(GARAGE),
+            queue_changed(GARAGE),
+        ]
+
+    def test_a_burst_of_queue_changes_is_coalesced(self, started, household, connect):
+        stream = connect()
+        began = time.perf_counter()
+
+        # As queueing track by track did on the Garage: 17 Queue events in
+        # two seconds (docs/api-design.md section 1.1).
+        for count in range(1, 18):
+            household.load_queue(GARAGE, [queue_track(n) for n in range(1, count + 1)])
+        household.settle()
+        windows = (time.perf_counter() - began) // COALESCE_SECONDS
+
+        # One at once, one for every 250 ms the burst took, and the last one
+        # after it.
+        assert 2 <= stream.events().count(queue_changed(GARAGE)) <= 2 + windows
 
     def test_a_room_that_appears_or_goes_sends_speakers_changed(
         self, started, household, connect
@@ -1335,7 +1421,7 @@ class TestHouseholdMirrorHealing:
 
         assert started.speaker(GARAGE).volume == 33
         assert started.speaker(GARAGE).group.volume == 33
-        assert household.subscription_count(GARAGE) == 4
+        assert household.subscription_count(GARAGE) == 5
         assert stream.events() == [volume_changed(GARAGE)]
 
         household.set_volume(GARAGE, 34)
@@ -1353,9 +1439,9 @@ class TestHouseholdMirrorHealing:
         household.fail_renewals(GARAGE)
         household.settle()
 
-        # Four subscriptions and the four reads of a room, and no more.
-        assert reached == [GARAGE] * 8
-        assert household.subscription_count(LOUNGE) == 4
+        # Five subscriptions and the four reads of a room, and no more.
+        assert reached == [GARAGE] * 9
+        assert household.subscription_count(LOUNGE) == 5
 
     def test_a_speaker_that_restarted_is_subscribed_to_again_and_read_again(
         self, started, household, connect
@@ -1372,7 +1458,7 @@ class TestHouseholdMirrorHealing:
         household.settle()
 
         assert started.playback(GARAGE).state is PlaybackStatus.STOPPED
-        assert household.subscription_count(GARAGE) == 4
+        assert household.subscription_count(GARAGE) == 5
         assert stream.events() == [playback_changed(GARAGE)]
 
         household.play(GARAGE)
@@ -1391,7 +1477,7 @@ class TestHouseholdMirrorHealing:
 
         assert started.speaker(GARAGE).volume == 33
         assert household.subscribed_addresses(GARAGE) == {address}
-        assert household.subscription_count(GARAGE) == 4
+        assert household.subscription_count(GARAGE) == 5
 
         household.set_volume(GARAGE, 21)
         household.settle()
@@ -1693,7 +1779,7 @@ class TestHouseholdMirrorHealingThread:
             call.release()
 
         assert started.wait_until_applied(5.0) is True
-        assert household.subscription_count(GARAGE) == 4
+        assert household.subscription_count(GARAGE) == 5
 
     def test_wait_until_applied_does_not_wait_when_nothing_was_sent(self, started):
         assert started.wait_until_applied(0) is True
@@ -1734,8 +1820,8 @@ class TestHouseholdMirrorChecks:
         eventually(lambda: len(mirror.speakers()) == 2)
 
         assert mirror.playback(GARAGE).queue_length == 3
-        assert household.subscription_count(GARAGE) == 4
-        assert household.subscription_count(LOUNGE) == 4
+        assert household.subscription_count(GARAGE) == 5
+        assert household.subscription_count(LOUNGE) == 5
         assert stream.events() == [speakers_changed()]
 
         household.set_volume(LOUNGE, 41)
@@ -1774,8 +1860,8 @@ class TestHouseholdMirrorChecks:
         household.answer_again(LOUNGE)
         eventually(lambda: len(mirror.speakers()) == 2)
 
-        assert household.subscription_count(GARAGE) == 4
-        assert household.subscription_count(LOUNGE) == 4
+        assert household.subscription_count(GARAGE) == 5
+        assert household.subscription_count(LOUNGE) == 5
         assert stream.events() == [speakers_changed()]
 
         household.set_volume(LOUNGE, 41)
@@ -1800,8 +1886,8 @@ class TestHouseholdMirrorChecks:
         assert mirror.speaker(GARAGE).group == group
         assert mirror.speaker(LOUNGE).group == group
         assert mirror.playback(LOUNGE).track.title == "Track 1"
-        assert household.subscription_count(GARAGE) == 4
-        assert household.subscription_count(LOUNGE) == 4
+        assert household.subscription_count(GARAGE) == 5
+        assert household.subscription_count(LOUNGE) == 5
         assert stream.events() == [speakers_changed()]
 
     def test_a_held_room_is_mirrored_again_once_the_coordinator_it_joined_answers(
@@ -1820,8 +1906,8 @@ class TestHouseholdMirrorChecks:
             coordinator_id=KITCHEN, member_ids=(LOUNGE, KITCHEN), volume=50, muted=False
         )
         assert started.playback(LOUNGE).queue_length == 0
-        assert household.subscription_count(LOUNGE) == 4
-        assert household.subscription_count(KITCHEN) == 4
+        assert household.subscription_count(LOUNGE) == 5
+        assert household.subscription_count(KITCHEN) == 5
 
         household.load_queue(KITCHEN, [queue_track(9)])
         household.settle()
@@ -1843,7 +1929,7 @@ class TestHouseholdMirrorChecks:
         )
         assert mirror.speaker(GARAGE).group == group
         assert mirror.speaker(LOUNGE).group == group
-        assert household.subscription_count(LOUNGE) == 4
+        assert household.subscription_count(LOUNGE) == 5
 
     def test_a_room_that_now_coordinates_is_mirrored_again_once_it_answers(
         self, household, mirror
@@ -1863,7 +1949,7 @@ class TestHouseholdMirrorChecks:
             coordinator_id=LOUNGE, member_ids=(LOUNGE,), volume=40, muted=False
         )
         assert mirror.playback(LOUNGE).track is None
-        assert household.subscription_count(LOUNGE) == 4
+        assert household.subscription_count(LOUNGE) == 5
 
     def test_a_new_room_that_does_not_answer_is_mirrored_once_it_does(
         self, started, household
@@ -1876,7 +1962,7 @@ class TestHouseholdMirrorChecks:
         household.answer_again(KITCHEN)
         eventually(lambda: len(started.speakers()) == 3)
 
-        assert household.subscription_count(KITCHEN) == 4
+        assert household.subscription_count(KITCHEN) == 5
 
     def test_a_speaker_that_restarted_without_a_word_is_read_again(
         self, sonos, mirror, connect
@@ -1894,7 +1980,7 @@ class TestHouseholdMirrorChecks:
         sonos.restart_room(GARAGE)
         eventually(lambda: mirror.playback(GARAGE).state is PlaybackStatus.STOPPED)
 
-        assert sonos.subscription_count(GARAGE) == 4
+        assert sonos.subscription_count(GARAGE) == 5
         assert stream.events() == [playback_changed(GARAGE)]
 
         sonos.play(GARAGE)
@@ -1915,7 +2001,7 @@ class TestHouseholdMirrorChecks:
         household.stop(GARAGE)
         eventually(lambda: started.playback(GARAGE).state is PlaybackStatus.STOPPED)
 
-        assert household.subscription_count(GARAGE) == 4
+        assert household.subscription_count(GARAGE) == 5
         household.set_volume(GARAGE, 21)
         household.settle()
         assert started.speaker(GARAGE).volume == 21
@@ -1927,13 +2013,13 @@ class TestHouseholdMirrorChecks:
         household.restart_room(LOUNGE)
         household.restart_room(GARAGE)
 
-        eventually(lambda: household.subscription_count(GARAGE) == 4)
+        eventually(lambda: household.subscription_count(GARAGE) == 5)
         household.set_volume(GARAGE, 33)
         eventually(lambda: started.speaker(GARAGE).volume == 33)
         assert household.subscription_count(LOUNGE) == 0
 
         household.answer_again(LOUNGE)
-        eventually(lambda: household.subscription_count(LOUNGE) == 4)
+        eventually(lambda: household.subscription_count(LOUNGE) == 5)
 
     def test_a_failure_is_logged_once_and_its_end_once(
         self, household, mirror, caplog

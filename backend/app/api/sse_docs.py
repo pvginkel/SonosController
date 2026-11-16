@@ -45,11 +45,14 @@ went, was renamed, or joined or left a group. |
 | `volume_changed` | `{"speaker_id": …}` | `GET /api/speakers/{speaker_id}` |
 | `playback_changed` | `{"speaker_id": …}` | \
 `GET /api/speakers/{speaker_id}/playback` |
+| `queue_changed` | `{"speaker_id": …}` | \
+`GET /api/speakers/{speaker_id}/queue`, when it shows the queue |
 
-An event about a group, its volume or what it plays, is sent once for every \
-speaker of the group, so a client follows the one speaker it shows. The \
-backend sends at most one event of a type for a speaker in 250 ms, and always \
-the last one: a burst of changes arrives as one or two events.
+An event about a group, its volume, what it plays or its queue, is sent once \
+for every speaker of the group, so a client follows the one speaker it \
+shows. The backend sends at most one event of a type for a speaker in \
+250 ms, and always the last one: a burst of changes arrives as one or two \
+events.
 """
 
 _REQUEST_ID = {

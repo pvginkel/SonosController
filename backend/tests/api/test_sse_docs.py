@@ -10,6 +10,7 @@ import pytest
 
 from app.schemas.stream_event_schema import (
     PlaybackChangedEvent,
+    QueueChangedEvent,
     SpeakerPayload,
     SpeakersChangedEvent,
     StreamMessage,
@@ -60,10 +61,12 @@ class TestEventStreamDocument:
             "`speakers_changed`",
             "`volume_changed`",
             "`playback_changed`",
+            "`queue_changed`",
         ]
         assert "`GET /api/speakers`" in rows[1]
         assert "`GET /api/speakers/{speaker_id}`" in rows[2]
         assert "`GET /api/speakers/{speaker_id}/playback`" in rows[3]
+        assert "`GET /api/speakers/{speaker_id}/queue`" in rows[4]
 
     def test_the_request_id_is_a_required_query_parameter(self, document):
         (parameter,) = document["paths"]["/api/sse/stream"]["get"]["parameters"]
@@ -74,7 +77,7 @@ class TestEventStreamDocument:
         assert parameter["schema"] == {"type": "string"}
         assert "colon" in parameter["description"]
 
-    def test_the_answer_is_an_event_stream_of_the_three_events(self, document):
+    def test_the_answer_is_an_event_stream_of_every_event(self, document):
         responses = document["paths"]["/api/sse/stream"]["get"]["responses"]
 
         assert list(responses) == ["200"]
@@ -83,10 +86,11 @@ class TestEventStreamDocument:
         assert message["discriminator"]["propertyName"] == "type"
         assert sorted(message["discriminator"]["mapping"]) == [
             "playback_changed",
+            "queue_changed",
             "speakers_changed",
             "volume_changed",
         ]
-        assert len(message["oneOf"]) == 3
+        assert len(message["oneOf"]) == 4
 
     @pytest.mark.parametrize(
         ("event_type", "payload_properties"),
@@ -94,6 +98,7 @@ class TestEventStreamDocument:
             ("speakers_changed", []),
             ("volume_changed", ["speaker_id"]),
             ("playback_changed", ["speaker_id"]),
+            ("queue_changed", ["speaker_id"]),
         ],
     )
     def test_each_event_has_its_payloads_schema_with_every_field_described(
@@ -147,7 +152,9 @@ class TestEventStream:
             sonos.settle()
             sonos.play(GARAGE)
             sonos.settle()
-            received = [next(frames).decode() for _ in range(3)]
+            sonos.set_shuffle(GARAGE, True)
+            sonos.settle()
+            received = [next(frames).decode() for _ in range(4)]
         finally:
             response.close()
 
@@ -163,10 +170,12 @@ class TestEventStream:
             SpeakersChangedEvent(),
             VolumeChangedEvent(payload=SpeakerPayload(speaker_id=GARAGE)),
             PlaybackChangedEvent(payload=SpeakerPayload(speaker_id=GARAGE)),
+            QueueChangedEvent(payload=SpeakerPayload(speaker_id=GARAGE)),
         }
         speaker = '{"speaker_id": "' + GARAGE + '"}'
         assert sorted(received) == [
             'data: {"type":"playback_changed","payload":' + speaker + "}\n\n",
+            'data: {"type":"queue_changed","payload":' + speaker + "}\n\n",
             'data: {"type":"speakers_changed","payload":{}}\n\n',
             'data: {"type":"volume_changed","payload":' + speaker + "}\n\n",
         ]
