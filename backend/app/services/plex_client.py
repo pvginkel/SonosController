@@ -148,6 +148,20 @@ class PlexClient(ABC):
         """
 
     @abstractmethod
+    def read_items(
+        self, rating_keys: Iterable[str]
+    ) -> dict[str, PlexArtist | PlexAlbum | PlexPlaylist]:
+        """The artists, albums and audio playlists with these rating keys,
+        the kinds mixed, by rating key, from one request.
+
+        Each is what ``read_artist()`` and ``read_album()`` give, and a
+        playlist what ``read_playlists()`` gives: this is not a read of the
+        playlist on its own, and leaves the stamp on its picture as it is. A
+        rating key Plex has no artist, album or audio playlist with is left
+        out.
+        """
+
+    @abstractmethod
     def read_track_picture(self, rating_key: str) -> str | None:
         """The path of the picture Plex gives a track.
 
@@ -304,6 +318,25 @@ class PlexapiPlexClient(PlexClient):
             for item in _audio_playlists(answer):
                 return parse_playlist(item)
             return None
+
+    def read_items(
+        self, rating_keys: Iterable[str]
+    ) -> dict[str, PlexArtist | PlexAlbum | PlexPlaylist]:
+        keys = list(
+            dict.fromkeys(key for key in rating_keys if _RATING_KEY.fullmatch(key))
+        )
+        if not keys:
+            return {}
+        with _plex_call(f"read {len(keys)} Plex items"):
+            # /library/metadata/ answers a playlist as /playlists lists it;
+            # /playlists/<rating key> would give its picture a new stamp.
+            answer = self._several(keys)
+            items: list[PlexArtist | PlexAlbum | PlexPlaylist] = [
+                *map(parse_artist, _items(answer, "artist")),
+                *map(parse_album, _items(answer, "album")),
+                *map(parse_playlist, _audio_playlists(answer)),
+            ]
+        return {item.rating_key: item for item in items}
 
     def read_track_picture(self, rating_key: str) -> str | None:
         if not _RATING_KEY.fullmatch(rating_key):

@@ -11,8 +11,12 @@ its artist, and the picture's stamp; a playlist's picture is at a path of
 its own, which gets a new stamp whenever the playlist is read on its own,
 and a playlist without tracks has no picture and no duration; a picture
 comes back as a JPEG that covers the square asked for and keeps its shape;
-a path with another stamp answers the picture as it is now. Like plexapi, it holds which
-server it is from Plex's first answer.
+a path with another stamp answers the picture as it is now. Every artist,
+album and playlist has a guid of its own unless a test gives it one: two
+albums may share one, as the same release held twice does, and an item Plex
+has not matched has ``local://<rating key>``. The read of several items reads
+a playlist as the list does, its picture's stamp left as it is. Like plexapi,
+it holds which server it is from Plex's first answer.
 
 A test builds its library with ``add_artist()``, ``add_album()``,
 ``add_track()`` and ``add_playlist()``. ``served_tracks()`` is what the Plex
@@ -62,6 +66,7 @@ _TRACK_MS = 180_000
 @dataclass
 class _Artist:
     rating_key: str
+    guid: str
     title: str
     sort_title: str | None
 
@@ -69,6 +74,7 @@ class _Artist:
 @dataclass
 class _Album:
     rating_key: str
+    guid: str
     artist: str
     title: str
     released: date | None
@@ -88,6 +94,7 @@ class _Track:
 @dataclass
 class _Playlist:
     rating_key: str
+    guid: str
     title: str
     track_count: int
     duration_ms: int | None
@@ -142,10 +149,15 @@ class FakePlexClient(PlexClient):
         sort_title: str | None = None,
         size: tuple[int, int] | None = (1000, 1000),
         colour: tuple[int, int, int] = (30, 120, 60),
+        *,
+        guid: str | None = None,
     ) -> None:
         """Add an artist. ``sort_title=None`` is an artist Plex gives no sort
-        title, and ``size=None`` one without a picture."""
-        self._artists[rating_key] = _Artist(rating_key, title, sort_title)
+        title, and ``size=None`` one without a picture. Without ``guid`` it
+        has one of its own."""
+        self._artists[rating_key] = _Artist(
+            rating_key, guid or f"plex://artist/{rating_key}", title, sort_title
+        )
         if size is not None:
             self.set_picture(rating_key, size, colour)
 
@@ -159,18 +171,24 @@ class FakePlexClient(PlexClient):
         artist: str = ARTIST,
         title: str | None = None,
         released: date | None = None,
+        guid: str | None = None,
     ) -> None:
         """Add an album with its tracks, by their rating keys, on one disc in
         the order given. Its picture is ``size`` pixels of one colour;
         ``size=None`` is an album without a picture, and ``released=None``
         one without a date. Without ``artist`` it is the album of an artist
-        the fake adds for it, ``ARTIST``, who has no picture."""
+        the fake adds for it, ``ARTIST``, who has no picture. Without
+        ``guid`` it has one of its own."""
         if artist == ARTIST and ARTIST not in self._artists:
             self.add_artist(ARTIST, "Artist 1", size=None)
         if artist not in self._artists:
             raise KeyError(f"The fake Plex has no artist {artist}")
         self._albums[rating_key] = _Album(
-            rating_key, artist, title or f"Album {rating_key}", released
+            rating_key,
+            guid or f"plex://album/{rating_key}",
+            artist,
+            title or f"Album {rating_key}",
+            released,
         )
         for number, track_key in enumerate(track_keys, start=1):
             self.add_track(rating_key, track_key, number=number)
@@ -212,10 +230,11 @@ class FakePlexClient(PlexClient):
         colour: tuple[int, int, int] = (90, 30, 160),
         *,
         track_keys: Iterable[str] | None = None,
+        guid: str | None = None,
     ) -> None:
         """Add a playlist of so many tracks: the operator's or Plex's own,
         which nothing tells apart. One without tracks has no picture and no
-        duration.
+        duration. Without ``guid`` it has one of its own.
 
         ``track_keys`` are its tracks, in its own order, as many as
         ``track_count``. A playlist given a count of tracks alone cannot be
@@ -225,7 +244,12 @@ class FakePlexClient(PlexClient):
         if keys is not None and len(keys) != track_count:
             raise ValueError(f"Playlist {rating_key} has {len(keys)} track keys")
         self._playlists[rating_key] = _Playlist(
-            rating_key, title, track_count, track_count * _TRACK_MS or None, keys
+            rating_key,
+            guid or f"com.plexapp.agents.none://{rating_key}",
+            title,
+            track_count,
+            track_count * _TRACK_MS or None,
+            keys,
         )
         if track_count:
             self.set_picture(rating_key, size, colour)
@@ -396,6 +420,23 @@ class FakePlexClient(PlexClient):
             self._next_stamp += 1
         return self._playlist(playlist)
 
+    def read_items(
+        self, rating_keys: Iterable[str]
+    ) -> dict[str, PlexArtist | PlexAlbum | PlexPlaylist]:
+        keys = list(dict.fromkeys(rating_keys))
+        if not keys:
+            return {}
+        self._asked(f"read {len(keys)} Plex items")
+        items: dict[str, PlexArtist | PlexAlbum | PlexPlaylist] = {}
+        for key in keys:
+            if key in self._artists:
+                items[key] = self._artist(self._artists[key])
+            elif key in self._albums:
+                items[key] = self._album(self._albums[key])
+            elif key in self._playlists:
+                items[key] = self._playlist(self._playlists[key])
+        return items
+
     def read_track_picture(self, rating_key: str) -> str | None:
         self._asked(f"read the picture of Plex track {rating_key}")
         track = self._tracks.get(rating_key)
@@ -459,6 +500,7 @@ class FakePlexClient(PlexClient):
     def _artist(self, artist: _Artist) -> PlexArtist:
         return PlexArtist(
             rating_key=artist.rating_key,
+            guid=artist.guid,
             title=artist.title,
             sort_title=artist.sort_title or artist.title,
             picture=self._picture_path(artist.rating_key),
@@ -467,6 +509,7 @@ class FakePlexClient(PlexClient):
     def _album(self, album: _Album) -> PlexAlbum:
         return PlexAlbum(
             rating_key=album.rating_key,
+            guid=album.guid,
             title=album.title,
             artist_rating_key=album.artist,
             artist=self._artists[album.artist].title,
@@ -501,6 +544,7 @@ class FakePlexClient(PlexClient):
     def _playlist(self, playlist: _Playlist) -> PlexPlaylist:
         return PlexPlaylist(
             rating_key=playlist.rating_key,
+            guid=playlist.guid,
             title=playlist.title,
             track_count=playlist.track_count,
             duration_ms=playlist.duration_ms,

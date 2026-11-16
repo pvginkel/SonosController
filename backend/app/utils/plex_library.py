@@ -25,6 +25,9 @@ class PlexAnswerError(Exception):
 @dataclass(frozen=True)
 class PlexArtist:
     rating_key: str
+    # Plex's guid: ``plex://artist/…``, or ``local://<rating key>`` for an
+    # artist Plex has not matched.
+    guid: str
     title: str
     # The title Plex files the artist under: its sort title, or its title
     # where Plex gives no sort title.
@@ -36,6 +39,9 @@ class PlexArtist:
 @dataclass(frozen=True)
 class PlexAlbum:
     rating_key: str
+    # Plex's guid: ``plex://album/…``, or ``local://<rating key>`` for an
+    # album Plex has not matched. The same release held twice has one guid.
+    guid: str
     title: str
     artist_rating_key: str
     artist: str
@@ -69,6 +75,8 @@ class PlexTrack:
 @dataclass(frozen=True)
 class PlexPlaylist:
     rating_key: str
+    # Plex's guid, ``com.plexapp.agents.none://<uuid>``.
+    guid: str
     title: str
     track_count: int
     # None for a playlist without tracks.
@@ -83,6 +91,7 @@ def parse_artist(item: Element) -> PlexArtist:
     title = _text(item, "title")
     return PlexArtist(
         rating_key=parse_rating_key(item, "ratingKey"),
+        guid=_text(item, "guid"),
         title=title,
         sort_title=item.attrib.get("titleSort") or title,
         picture=item.attrib.get("thumb") or None,
@@ -92,6 +101,7 @@ def parse_artist(item: Element) -> PlexArtist:
 def parse_album(item: Element) -> PlexAlbum:
     return PlexAlbum(
         rating_key=parse_rating_key(item, "ratingKey"),
+        guid=_text(item, "guid"),
         title=_text(item, "title"),
         artist_rating_key=parse_rating_key(item, "parentRatingKey"),
         artist=_text(item, "parentTitle"),
@@ -126,6 +136,7 @@ def track_picture(item: Element) -> str | None:
 def parse_playlist(item: Element) -> PlexPlaylist:
     return PlexPlaylist(
         rating_key=parse_rating_key(item, "ratingKey"),
+        guid=_text(item, "guid"),
         title=_text(item, "title"),
         track_count=_count(item, "leafCount"),
         duration_ms=_number(item, "duration"),

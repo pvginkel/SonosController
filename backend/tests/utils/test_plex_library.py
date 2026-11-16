@@ -1,7 +1,7 @@
 """Tests for the reading of the library's items in Plex's answers.
 
 The answers are Plex's as the real one gave them on 2026-11-16, cut to what
-is read, with made-up titles and rating keys.
+is read, with made-up titles, rating keys and guids.
 """
 
 from datetime import date
@@ -25,12 +25,14 @@ from app.utils.plex_library import (
 )
 
 ARTIST = (
-    '<Directory ratingKey="3001" type="artist" title="The Beatles" '
+    '<Directory ratingKey="3001" type="artist" '
+    'guid="plex://artist/5d07bbfd403c6402904a0001" title="The Beatles" '
     'titleSort="Beatles" thumb="/library/metadata/3001/thumb/1700000001" />'
 )
 ALBUM = (
     '<Directory ratingKey="3101" parentRatingKey="3001" type="album" '
-    'title="Revolver" parentTitle="The Beatles" year="1966" '
+    'guid="plex://album/5d07c1d7403c640290870001" title="Revolver" '
+    'parentTitle="The Beatles" year="1966" '
     'originallyAvailableAt="1966-08-05" leafCount="14" '
     'thumb="/library/metadata/3101/thumb/1700000002" />'
 )
@@ -42,8 +44,9 @@ TRACK = (
     'grandparentThumb="/library/metadata/3001/thumb/1700000001" />'
 )
 PLAYLIST = (
-    '<Playlist ratingKey="3301" type="playlist" title="Mix" smart="0" '
-    'playlistType="audio" leafCount="148" duration="37610000" '
+    '<Playlist ratingKey="3301" type="playlist" '
+    'guid="com.plexapp.agents.none://00000000-0000-4000-8000-000000003301" '
+    'title="Mix" smart="0" playlistType="audio" leafCount="148" duration="37610000" '
     'composite="/playlists/3301/composite/1700000003" />'
 )
 
@@ -60,6 +63,7 @@ def _item(xml: str, without: tuple[str, ...] = (), **changed: str) -> Element:
 def _album(rating_key: str, title: str, released: date | None) -> PlexAlbum:
     return PlexAlbum(
         rating_key=rating_key,
+        guid=f"plex://album/{rating_key}",
         title=title,
         artist_rating_key="3001",
         artist="The Beatles",
@@ -73,6 +77,7 @@ class TestParseArtist:
     def test_an_artist(self):
         assert parse_artist(_item(ARTIST)) == PlexArtist(
             rating_key="3001",
+            guid="plex://artist/5d07bbfd403c6402904a0001",
             title="The Beatles",
             sort_title="Beatles",
             picture="/library/metadata/3001/thumb/1700000001",
@@ -87,7 +92,12 @@ class TestParseArtist:
         assert parse_artist(_item(ARTIST, without=("thumb",))).picture is None
         assert parse_artist(_item(ARTIST, thumb="")).picture is None
 
-    @pytest.mark.parametrize("name", ["ratingKey", "title"])
+    def test_an_artist_plex_has_not_matched_has_a_local_guid(self):
+        artist = parse_artist(_item(ARTIST, guid="local://3001"))
+
+        assert artist.guid == "local://3001"
+
+    @pytest.mark.parametrize("name", ["ratingKey", "guid", "title"])
     def test_an_artist_without_what_every_artist_has_is_no_answer(self, name):
         with pytest.raises(PlexAnswerError) as raised:
             parse_artist(_item(ARTIST, without=(name,)))
@@ -101,6 +111,7 @@ class TestParseAlbum:
 
         assert album == PlexAlbum(
             rating_key="3101",
+            guid="plex://album/5d07c1d7403c640290870001",
             title="Revolver",
             artist_rating_key="3001",
             artist="The Beatles",
@@ -119,8 +130,14 @@ class TestParseAlbum:
     def test_an_album_without_a_picture_has_none(self):
         assert parse_album(_item(ALBUM, without=("thumb",))).picture is None
 
+    def test_an_album_plex_has_not_matched_has_a_local_guid(self):
+        album = parse_album(_item(ALBUM, guid="local://3101"))
+
+        assert album.guid == "local://3101"
+
     @pytest.mark.parametrize(
-        "name", ["ratingKey", "title", "parentRatingKey", "parentTitle", "leafCount"]
+        "name",
+        ["ratingKey", "guid", "title", "parentRatingKey", "parentTitle", "leafCount"],
     )
     def test_an_album_without_what_every_album_has_is_no_answer(self, name):
         with pytest.raises(PlexAnswerError) as raised:
@@ -220,6 +237,7 @@ class TestParsePlaylist:
     def test_a_playlist(self):
         assert parse_playlist(_item(PLAYLIST)) == PlexPlaylist(
             rating_key="3301",
+            guid="com.plexapp.agents.none://00000000-0000-4000-8000-000000003301",
             title="Mix",
             track_count=148,
             duration_ms=37610000,
@@ -235,7 +253,7 @@ class TestParsePlaylist:
         assert playlist.duration_ms is None
         assert playlist.picture is None
 
-    @pytest.mark.parametrize("name", ["ratingKey", "title", "leafCount"])
+    @pytest.mark.parametrize("name", ["ratingKey", "guid", "title", "leafCount"])
     def test_a_playlist_without_what_every_playlist_has_is_no_answer(self, name):
         with pytest.raises(PlexAnswerError) as raised:
             parse_playlist(_item(PLAYLIST, without=(name,)))

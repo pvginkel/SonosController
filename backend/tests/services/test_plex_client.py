@@ -109,6 +109,11 @@ READS = [
         lambda plex: plex.read_track_pictures(["3201", "3202"]),
         "read the pictures of 2 Plex tracks",
     ),
+    (
+        "read_items",
+        lambda plex: plex.read_items([BEATLES, REVOLVER, MIX]),
+        "read 3 Plex items",
+    ),
 ]
 
 # The reads of one item, by its rating key.
@@ -388,6 +393,13 @@ class TestPlexClientLibrary:
         assert unanswered.read_track_pictures(NOT_A_RATING_KEY) == {}
         assert unanswered.read_track_pictures([]) == {}
 
+    def test_the_plexapi_client_asks_for_the_items_of_rating_keys_only(
+        self, unanswered
+    ):
+        # Plex does not answer: a call that reached it would fail.
+        assert unanswered.read_items(NOT_A_RATING_KEY) == {}
+        assert unanswered.read_items([]) == {}
+
     def test_nothing_of_the_library_is_kept(self, music):
         before = music.read_artists()
 
@@ -423,6 +435,7 @@ class TestPlexClientArtists:
 
         assert artist == PlexArtist(
             rating_key=BEATLES,
+            guid=artist.guid,
             title="The Beatles",
             sort_title="Beatles",
             picture=artist.picture,
@@ -490,6 +503,7 @@ class TestPlexClientAlbums:
 
         assert album == PlexAlbum(
             rating_key=REVOLVER,
+            guid=album.guid,
             title="Revolver",
             artist_rating_key=BEATLES,
             artist="The Beatles",
@@ -620,6 +634,7 @@ class TestPlexClientPlaylists:
 
         assert playlist == PlexPlaylist(
             rating_key=MIX,
+            guid=playlist.guid,
             title="Mix",
             track_count=148,
             duration_ms=148 * 180_000,
@@ -649,6 +664,7 @@ class TestPlexClientPlaylists:
             assert read[key].picture.startswith(f"/playlists/{key}/composite/")
             assert read[key] == PlexPlaylist(
                 rating_key=key,
+                guid=listed[key].guid,
                 title=listed[key].title,
                 track_count=listed[key].track_count,
                 duration_ms=listed[key].duration_ms,
@@ -660,6 +676,92 @@ class TestPlexClientPlaylists:
     @pytest.mark.parametrize("rating_key", ["9999", BEATLES, REVOLVER, "3201"])
     def test_a_playlist_plex_does_not_have_is_none(self, music, rating_key):
         assert music.read_playlist(rating_key) is None
+
+
+class TestPlexClientGuid:
+    def test_every_artist_album_and_playlist_has_a_guid_of_its_own(self, music):
+        items = [
+            *music.read_artists(),
+            *music.read_artist_albums(BEATLES, newest_first=True),
+            *music.read_artist_albums(ABBA, newest_first=True),
+            *music.read_playlists(),
+        ]
+
+        guids = [item.guid for item in items]
+        assert all(guids)
+        assert len(set(guids)) == len(guids)
+
+    def test_the_list_and_the_read_of_one_item_carry_its_guid(self, music):
+        for artist in music.read_artists():
+            assert music.read_artist(artist.rating_key).guid == artist.guid
+        for playlist in music.read_playlists():
+            assert music.read_playlist(playlist.rating_key).guid == playlist.guid
+
+    def test_a_test_gives_an_item_its_guid(self, music):
+        music.add_artist("3009", "Aerosmith", guid="plex://artist/aerosmith")
+        music.add_album("3109", [], artist=ABBA, guid="plex://album/abba-gold")
+        music.add_playlist("3309", "New", 0, guid="com.plexapp.agents.none://new")
+
+        assert music.read_artist("3009").guid == "plex://artist/aerosmith"
+        assert music.read_album("3109").guid == "plex://album/abba-gold"
+        assert music.read_playlist("3309").guid == "com.plexapp.agents.none://new"
+
+    def test_a_release_held_twice_has_one_guid(self, music):
+        # A guid is not unique (docs/api-design.md section 1.8).
+        guid = music.read_album(ARRIVAL).guid
+        music.add_album("3108", ["3252"], artist=ABBA, title="Arrival", guid=guid)
+
+        assert music.read_album("3108").guid == guid
+        assert music.read_album("3108").rating_key != ARRIVAL
+
+    def test_an_item_plex_has_not_matched_has_a_local_guid(self, music):
+        music.add_album("3109", ["3261"], artist=BARE_ARTIST, guid="local://3109")
+
+        assert music.read_album("3109").guid == "local://3109"
+
+
+class TestPlexClientItems:
+    def test_an_artist_an_album_and_a_playlist_together(self, music):
+        [mix] = [p for p in music.read_playlists() if p.rating_key == MIX]
+
+        items = music.read_items([BEATLES, REVOLVER, MIX])
+
+        assert items == {
+            BEATLES: music.read_artist(BEATLES),
+            REVOLVER: music.read_album(REVOLVER),
+            MIX: mix,
+        }
+
+    def test_a_playlist_is_the_one_listed_and_keeps_the_stamp_on_its_picture(
+        self, music
+    ):
+        listed = {p.rating_key: p for p in music.read_playlists()}
+
+        items = music.read_items(list(listed))
+
+        assert items == listed
+        assert {p.rating_key: p for p in music.read_playlists()} == listed
+
+    def test_a_playlist_read_on_its_own_has_the_stamp_that_read_gave_it(self, music):
+        read = music.read_playlist(MIX)
+
+        assert music.read_items([MIX]) == {MIX: read}
+
+    def test_what_is_no_artist_album_or_playlist_is_left_out(self, music):
+        items = music.read_items(["9999", REVOLVER_TRACKS[0], ARRIVAL])
+
+        assert list(items) == [ARRIVAL]
+
+    def test_an_item_asked_twice_is_there_once(self, music):
+        assert list(music.read_items([ABBA, ABBA])) == [ABBA]
+
+    def test_items_plex_does_not_have_are_left_out(self, music):
+        assert music.read_items(["9998", "9999"]) == {}
+
+    def test_no_items_are_not_asked_for(self, music):
+        music.reachable = False
+
+        assert music.read_items([]) == {}
 
 
 class TestPlexClientTrackPictures:

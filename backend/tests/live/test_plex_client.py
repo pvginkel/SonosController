@@ -6,6 +6,9 @@ comparison pytest would print.
 
 import io
 import re
+from collections import Counter
+from unittest import mock
+from urllib.parse import urlsplit
 
 import pytest
 from PIL import Image
@@ -20,6 +23,12 @@ pytestmark = pytest.mark.live
 
 _PICTURE = re.compile(r"/library/metadata/([0-9]+)/thumb/[0-9]+")
 _COMPOSITE = re.compile(r"/playlists/([0-9]+)/composite/[0-9]+")
+
+# The guid of an item Plex has matched, and of an item it has not
+# (docs/api-design.md section 1.8).
+_MATCHED = re.compile(r"plex://(artist|album)/[0-9a-f]+")
+_LOCAL = re.compile(r"local://([0-9]+)")
+_PLAYLIST_GUID = re.compile(r"com\.plexapp\.agents\.none://[0-9a-f-]+")
 
 # A rating key far above any the library has given out.
 NO_ITEM = "999999999"
@@ -180,6 +189,7 @@ class TestPlexClientLibrary:
             client.read_playlists,
             lambda: client.read_playlist(album),
             lambda: client.read_track_pictures([plex_track]),
+            lambda: client.read_items([artist, album]),
         ):
             with pytest.raises(ExternalServiceException) as raised:
                 read()
@@ -214,6 +224,16 @@ class TestPlexClientLibrary:
         # a date: the library read here is the one they were found in.
         assert any(found.picture is None for found in artists)
         assert any(a.released is None for a in albums)
+        # Every artist and album carries its guid, from the list too.
+        for kind, items in (("artist", artists), ("album", albums)):
+            for item in items:
+                matched = _MATCHED.fullmatch(item.guid)
+                local = _LOCAL.fullmatch(item.guid)
+                assert (matched and matched.group(1) == kind) or (
+                    local and local.group(1) == item.rating_key
+                )
+        # Section 1.8: a guid is not unique, the same release held twice.
+        assert max(Counter(a.guid for a in albums).values()) > 1
 
 
 class TestPlexClientArtists:
@@ -372,6 +392,10 @@ class TestPlexClientPlaylists:
         # has it from then on, a smart playlist's track count included.
         assert {found.rating_key: found for found in plex.read_playlists()} == read
 
+    def test_every_playlist_has_a_guid_of_its_own(self, playlists):
+        assert all(_PLAYLIST_GUID.fullmatch(found.guid) for found in playlists)
+        assert len({found.guid for found in playlists}) == len(playlists)
+
     def test_a_playlist_with_tracks_has_a_duration_and_a_picture(
         self, plex, playlists
     ):
@@ -411,6 +435,54 @@ class TestPlexClientPlaylists:
 
         path = f"/library/metadata/{found.rating_key}/thumb/1"
         assert plex.read_picture(path, 100) is None
+
+
+class TestPlexClientItems:
+    def test_an_artist_an_album_and_a_playlist_from_one_request(
+        self, plex, artist, album
+    ):
+        # The playlists as they are now: the other tests read them on their
+        # own, which gives their pictures new stamps.
+        listed = {found.rating_key: found for found in plex.read_playlists()}
+        playlist = next(found for found in listed.values() if found.picture)
+        # The server is read at the first call that needs it.
+        plex.machine_identifier()
+
+        with mock.patch.object(
+            plex._session, "send", wraps=plex._session.send
+        ) as send:
+            items = plex.read_items([artist, album, playlist.rating_key])
+
+        # The path alone: the token is in a header, never compared.
+        paths = [urlsplit(call.args[0].url).path for call in send.call_args_list]
+        assert paths == [f"/library/metadata/{artist},{album},{playlist.rating_key}"]
+        assert items == {
+            artist: plex.read_artist(artist),
+            album: plex.read_album(album),
+            playlist.rating_key: playlist,
+        }
+
+    def test_a_playlist_is_the_one_listed_and_keeps_the_stamp_on_its_picture(
+        self, plex
+    ):
+        listed = {found.rating_key: found for found in plex.read_playlists()}
+        assert any(found.picture for found in listed.values())
+
+        items = plex.read_items(list(listed))
+
+        assert items == listed
+        assert {found.rating_key: found for found in plex.read_playlists()} == listed
+
+    def test_what_is_no_artist_album_or_playlist_is_left_out(
+        self, plex, artist, plex_track
+    ):
+        items = plex.read_items([NO_ITEM, plex_track, artist])
+
+        assert list(items) == [artist]
+
+    def test_items_plex_does_not_have_are_left_out(self, plex):
+        # Plex answers 404 when it has none of the rating keys.
+        assert plex.read_items([NO_ITEM, "999999998"]) == {}
 
 
 class TestPlexClientTrackPictures:
