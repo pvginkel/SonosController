@@ -1,0 +1,416 @@
+"""Tests for the favourites endpoints, on the in-memory Plex and the real
+store."""
+
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+
+import pytest
+from flask import Flask
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from app.models import Favourite
+from app.services.artwork_service import ArtworkService
+from tests.api.documents import json_schema, schema_of, undescribed
+from tests.fakes.plex_client import FakePlexClient
+
+FAVOURITES = "/api/favourites"
+FAVOURITE = "/api/favourites/{favourite_id}"
+
+RADIOHEAD = "5001"
+BJORK = "5002"
+AMNESIAC = "5101"
+AMNESIAC_AGAIN = "5102"
+HOMOGENIC = "5103"
+TRACK = "5201"
+ROAD_TRIP = "5301"
+EMPTY = "5302"
+
+# "Björk" as Plex may give it: the letter, then its accent.
+BJORK_DECOMPOSED = "Björk"
+BJORK_COMPOSED = "Björk"
+
+# Small pictures: the fake's default ones are large (card SCTL-14).
+SMALL = (16, 16)
+
+FIELDS = [
+    "artwork_id",
+    "available",
+    "created_at",
+    "id",
+    "item_id",
+    "kind",
+    "subtitle",
+    "title",
+]
+
+
+@pytest.fixture
+def library(plex: FakePlexClient) -> FakePlexClient:
+    """Radiohead with Amnesiac held twice, Björk with an album without a
+    picture, a playlist and an empty one."""
+    plex.add_artist(RADIOHEAD, "Radiohead", size=SMALL)
+    plex.add_artist(BJORK, BJORK_DECOMPOSED, size=None)
+    for album in (AMNESIAC, AMNESIAC_AGAIN):
+        plex.add_album(
+            album,
+            [],
+            size=SMALL,
+            artist=RADIOHEAD,
+            title="Amnesiac",
+            guid="plex://album/5d07amnesiac",
+        )
+    plex.add_track(AMNESIAC, TRACK)
+    plex.add_album(HOMOGENIC, [], size=None, artist=BJORK, title="Homogenic")
+    plex.add_playlist(ROAD_TRIP, "Road trip", 148, size=SMALL)
+    plex.add_playlist(EMPTY, "Empty", 0)
+    return plex
+
+
+def mark(client, kind: str, item_id: str):
+    return client.post(FAVOURITES, json={"kind": kind, "item_id": item_id})
+
+
+def unmark(client, favourite_id: int | str):
+    return client.delete(FAVOURITE.format(favourite_id=favourite_id))
+
+
+def favourite(item_id: str, kind: str, title: str, **fields: object) -> dict:
+    """What a favourite answers for an item of the library, its own fields
+    aside."""
+    return {
+        "kind": kind,
+        "item_id": item_id,
+        "title": title,
+        "subtitle": None,
+        "available": True,
+        **fields,
+    }
+
+
+def own(body: dict) -> dict:
+    """The fields of a favourite that are its own, not its item's."""
+    return {key: body[key] for key in ("id", "created_at", "artwork_id")}
+
+
+def without_correlation_id(body: dict) -> dict:
+    return {key: value for key, value in body.items() if key != "correlationId"}
+
+
+def stored(session: Session) -> int:
+    return session.scalar(select(func.count()).select_from(Favourite))
+
+
+class TestMarkFavourite:
+    def test_an_artist_is_marked(self, client, session, library):
+        response = mark(client, "artist", RADIOHEAD)
+
+        assert response.status_code == 201
+        body = response.get_json()
+        assert body == favourite(RADIOHEAD, "artist", "Radiohead") | own(body)
+        assert sorted(body) == FIELDS
+        assert type(body["id"]) is int
+        created_at = datetime.fromisoformat(body["created_at"])
+        assert created_at.utcoffset() == timedelta(0)
+        artist = client.get(f"/api/library/artists/{RADIOHEAD}").get_json()
+        assert body["artwork_id"] == artist["artwork_id"] is not None
+        assert stored(session) == 1
+
+    def test_an_album_is_marked_with_its_artist(self, client, library):
+        response = mark(client, "album", AMNESIAC)
+
+        assert response.status_code == 201
+        body = response.get_json()
+        assert body == favourite(
+            AMNESIAC, "album", "Amnesiac", subtitle="Radiohead"
+        ) | own(body)
+        album = client.get(f"/api/library/albums/{AMNESIAC}").get_json()
+        assert body["artwork_id"] == album["artwork_id"] is not None
+
+    def test_a_playlist_is_marked_with_the_artwork_id_the_list_carries(
+        self, client, library
+    ):
+        listed = client.get("/api/library/playlists").get_json()["data"]
+
+        response = mark(client, "playlist", ROAD_TRIP)
+
+        assert response.status_code == 201
+        body = response.get_json()
+        assert body == favourite(ROAD_TRIP, "playlist", "Road trip") | own(body)
+        assert client.get("/api/library/playlists").get_json()["data"] == listed
+        assert [playlist["artwork_id"] for playlist in listed] == [body["artwork_id"]]
+
+    def test_an_items_artwork_id_is_one_the_artwork_endpoint_serves(
+        self, client, library, artwork: ArtworkService
+    ):
+        artwork_id = mark(client, "album", AMNESIAC).get_json()["artwork_id"]
+
+        for format in ("jpeg", "lvgl"):
+            answer = client.get(f"/api/artwork/{artwork_id}?size=16&format={format}")
+            assert answer.status_code == 200
+
+    @pytest.mark.parametrize(
+        ("kind", "item_id"), [("album", HOMOGENIC), ("playlist", EMPTY)]
+    )
+    def test_an_item_without_a_picture_has_no_artwork_id(
+        self, client, library, kind, item_id
+    ):
+        response = mark(client, kind, item_id)
+
+        assert response.status_code == 201
+        assert response.get_json()["artwork_id"] is None
+
+    def test_the_names_are_nfc(self, client, library):
+        artist = mark(client, "artist", BJORK).get_json()
+        album = mark(client, "album", HOMOGENIC).get_json()
+
+        assert artist["title"] == BJORK_COMPOSED
+        assert album["subtitle"] == BJORK_COMPOSED
+
+    def test_marking_a_marked_item_answers_its_favourite(
+        self, client, session, library
+    ):
+        first = mark(client, "album", AMNESIAC).get_json()
+
+        response = mark(client, "album", AMNESIAC)
+
+        assert response.status_code == 200
+        assert response.get_json() == first
+        assert stored(session) == 1
+
+    def test_marking_the_other_copy_of_a_release_answers_its_favourite(
+        self, client, session, library
+    ):
+        first = mark(client, "album", AMNESIAC).get_json()
+
+        response = mark(client, "album", AMNESIAC_AGAIN)
+
+        assert response.status_code == 200
+        other = client.get(f"/api/library/albums/{AMNESIAC_AGAIN}").get_json()
+        assert response.get_json() == first | {
+            "item_id": AMNESIAC_AGAIN,
+            "artwork_id": other["artwork_id"],
+        }
+        assert stored(session) == 1
+
+    @pytest.mark.parametrize(
+        ("kind", "item_id", "word"),
+        [
+            ("artist", AMNESIAC, "Artist"),
+            ("album", RADIOHEAD, "Album"),
+            ("album", TRACK, "Album"),
+            ("playlist", AMNESIAC, "Playlist"),
+            ("artist", "9999", "Artist"),
+            ("album", "abba", "Album"),
+            ("playlist", "", "Playlist"),
+        ],
+    )
+    def test_an_item_plex_has_not_of_the_kind_is_not_found(
+        self, client, session, library, kind, item_id, word
+    ):
+        response = mark(client, kind, item_id)
+
+        assert response.status_code == 404
+        assert without_correlation_id(response.get_json()) == {
+            "error": f"{word} {item_id} was not found",
+            "details": {"message": "The requested resource could not be found"},
+            "code": "ITEM_NOT_FOUND",
+        }
+        assert stored(session) == 0
+
+    def test_a_plex_that_does_not_answer_is_a_bad_gateway(
+        self, client, session, library, test_app_settings
+    ):
+        library.reachable = False
+
+        response = mark(client, "artist", RADIOHEAD)
+
+        assert response.status_code == 502
+        assert response.get_json()["code"] == "EXTERNAL_SERVICE_ERROR"
+        text = response.get_data(as_text=True)
+        assert "192.0.2.1" not in text
+        assert test_app_settings.plex_token not in text
+        assert stored(session) == 0
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            None,
+            [],
+            {},
+            {"item_id": AMNESIAC},
+            {"kind": "album"},
+            {"kind": "track", "item_id": TRACK},
+            {"kind": "song", "item_id": AMNESIAC},
+            {"kind": "Album", "item_id": AMNESIAC},
+            {"kind": "album", "item_id": 5101},
+            {"kind": "album", "item_id": None},
+            {"kind": "album", "item_id": AMNESIAC, "title": "Amnesiac"},
+            {"kind": "album", "item_id": AMNESIAC, "id": 1},
+        ],
+    )
+    def test_a_body_the_route_does_not_take_is_refused(
+        self, client, session, library, body
+    ):
+        response = client.post(FAVOURITES, json=body)
+
+        assert response.status_code == 400
+        assert stored(session) == 0
+
+
+class TestUnmarkFavourite:
+    def test_a_mark_is_removed(self, client, session, library):
+        album = mark(client, "album", AMNESIAC).get_json()
+        playlist = mark(client, "playlist", ROAD_TRIP).get_json()
+
+        response = unmark(client, album["id"])
+
+        assert response.status_code == 204
+        assert response.data == b""
+        assert session.scalars(select(Favourite.id)).all() == [playlist["id"]]
+        again = mark(client, "album", AMNESIAC)
+        assert again.status_code == 201
+        assert again.get_json()["id"] not in (album["id"], playlist["id"])
+
+    def test_it_asks_nothing_of_plex(self, client, session, library):
+        artist = mark(client, "artist", RADIOHEAD).get_json()
+        library.reachable = False
+
+        response = unmark(client, artist["id"])
+
+        assert response.status_code == 204
+        assert stored(session) == 0
+
+    def test_an_id_the_store_does_not_hold_is_not_found(self, client, library):
+        artist = mark(client, "artist", RADIOHEAD).get_json()
+        assert unmark(client, artist["id"]).status_code == 204
+
+        for favourite_id in (artist["id"], 2**40):
+            response = unmark(client, favourite_id)
+
+            assert response.status_code == 404
+            assert without_correlation_id(response.get_json()) == {
+                "error": f"Favourite {favourite_id} was not found",
+                "details": {"message": "The requested resource could not be found"},
+                "code": "RECORD_NOT_FOUND",
+            }
+
+    @pytest.mark.parametrize("favourite_id", ["abc", "-1", "1.5"])
+    def test_an_id_that_is_no_number_is_not_found(self, client, favourite_id):
+        assert unmark(client, favourite_id).status_code == 404
+
+
+class TestMarkingAtOnce:
+    def test_two_marks_of_one_item_leave_one_favourite_which_both_answer(
+        self,
+        committed_app: Flask,
+        committed_plex: FakePlexClient,
+        monkeypatch: pytest.MonkeyPatch,
+        aside: ThreadPoolExecutor,
+    ):
+        committed_plex.add_album(AMNESIAC, [], size=None, title="Amnesiac")
+        together = threading.Barrier(2, timeout=5.0)
+        read_items = committed_plex.read_items
+
+        def read_together(rating_keys):
+            items = read_items(rating_keys)
+            together.wait()
+            return items
+
+        monkeypatch.setattr(committed_plex, "read_items", read_together)
+
+        marks = [
+            aside.submit(mark, committed_app.test_client(), "album", AMNESIAC)
+            for _ in range(2)
+        ]
+        answers = [marked.result(timeout=10.0) for marked in marks]
+
+        assert sorted(answer.status_code for answer in answers) == [200, 201]
+        assert answers[0].get_json() == answers[1].get_json()
+        with committed_app.container.session_maker()() as session:
+            assert stored(session) == 1
+
+
+class TestFavouritesDocument:
+    def test_the_favourites_are_these_routes(self, openapi_document):
+        favourites = {
+            path: sorted(operations)
+            for path, operations in openapi_document["paths"].items()
+            if path.startswith(FAVOURITES)
+        }
+
+        assert favourites == {FAVOURITES: ["post"], FAVOURITE: ["delete"]}
+
+    @pytest.mark.parametrize(
+        ("path", "method", "statuses", "code"),
+        [
+            (FAVOURITES, "post", ["200", "201", "400", "404", "502"], "ITEM_NOT_FOUND"),
+            (FAVOURITE, "delete", ["204", "404"], "RECORD_NOT_FOUND"),
+        ],
+    )
+    def test_every_error_status_is_documented_with_the_envelope(
+        self, openapi_document, path, method, statuses, code
+    ):
+        responses = openapi_document["paths"][path][method]["responses"]
+
+        assert sorted(responses) == statuses
+        for status in responses:
+            assert responses[status]["description"]
+            if status.startswith(("4", "5")):
+                schema = responses[status]["content"]["application/json"]["schema"]
+                assert "ApiErrorResponseSchema" in schema["$ref"]
+        assert f"`{code}`" in responses["404"]["description"]
+
+    def test_marking_says_what_it_does(self, openapi_document):
+        operation = openapi_document["paths"][FAVOURITES]["post"]
+
+        assert operation["summary"] == (
+            "Mark an artist, an album or a playlist of the library as a favourite."
+        )
+        description = " ".join(operation["description"].split())
+        assert "marked already is no error" in description
+        assert "two copies of a release" in description
+        assert "track" in operation["responses"]["400"]["description"]
+
+    def test_marking_takes_a_described_item(self, openapi_document):
+        body = openapi_document["paths"][FAVOURITES]["post"]["requestBody"]
+        schema = json_schema(openapi_document, body)
+
+        assert body["required"] is True
+        assert sorted(schema["properties"]) == ["item_id", "kind"]
+        assert sorted(schema["required"]) == ["item_id", "kind"]
+        assert schema["additionalProperties"] is False
+        assert undescribed(openapi_document, schema) == []
+        kind = schema_of(openapi_document, schema["properties"]["kind"])
+        assert kind["enum"] == ["artist", "album", "playlist"]
+        assert schema["properties"]["item_id"]["type"] == "string"
+
+    def test_marking_answers_a_described_favourite(self, openapi_document):
+        responses = openapi_document["paths"][FAVOURITES]["post"]["responses"]
+        created = json_schema(openapi_document, responses["201"])
+
+        assert json_schema(openapi_document, responses["200"]) == created
+        assert sorted(created["properties"]) == FIELDS
+        assert sorted(created["required"]) == FIELDS
+        assert undescribed(openapi_document, created) == []
+        fields = created["properties"]
+        assert fields["id"]["type"] == "integer"
+        assert fields["created_at"]["format"] == "date-time"
+        assert schema_of(openapi_document, fields["kind"])["enum"] == [
+            "artist",
+            "album",
+            "playlist",
+        ]
+        assert "`GET /api/artwork/{artwork_id}`" in fields["artwork_id"]["description"]
+
+    def test_unmarking_names_the_favourite_by_its_id(self, openapi_document):
+        operation = openapi_document["paths"][FAVOURITE]["delete"]
+
+        (favourite_id,) = operation["parameters"]
+        assert favourite_id["name"] == "favourite_id"
+        assert favourite_id["in"] == "path"
+        assert favourite_id["schema"]["type"] == "integer"
+        assert favourite_id["description"]
+        assert "requestBody" not in operation
+        assert "content" not in operation["responses"]["204"]

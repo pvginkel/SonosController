@@ -145,6 +145,16 @@ def plex(app: Flask) -> Generator[FakePlexClient]:
 
 
 @pytest.fixture
+def committed_plex(committed_app: Flask) -> FakePlexClient:
+    """The Plex ``committed_app`` runs against: the in-memory fake, its
+    library empty. The app is disposed of after the test, its override
+    with it."""
+    fake = FakePlexClient(health_service=committed_app.container.health_service())
+    committed_app.container.plex_client.override(fake)
+    return fake
+
+
+@pytest.fixture
 def check_seconds() -> float:
     """The time between two reads of the layout by the test's mirror: the
     app's, which no test waits for. A test of what those reads heal replaces
