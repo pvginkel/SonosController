@@ -857,14 +857,22 @@ class TestPlexClientPicture:
         )
         assert raised.value.cause == "Plex did not answer (ConnectionError)"
 
+    @pytest.mark.parametrize(
+        "picture",
+        [
+            "/library/metadata/2001/thumb/1700000000",
+            "/playlists/3301/composite/1700000000",
+        ],
+        ids=["thumb", "composite"],
+    )
     def test_the_plexapi_client_fails_without_the_token_or_the_address(
-        self, unanswered
+        self, unanswered, picture
     ):
+        # A path the client lets Plex fetch: it asks, and Plex does not answer.
         with pytest.raises(ExternalServiceException) as raised:
-            unanswered.read_picture("/library/metadata/2001/thumb/1700000000", 100)
+            unanswered.read_picture(picture, 100)
 
         assert raised.value.message == (
-            "Cannot read Plex's picture /library/metadata/2001/thumb/1700000000 "
-            "at 100 pixels because external service failed: Plex did not "
-            "answer (ConnectionError)"
+            f"Cannot read Plex's picture {picture} at 100 pixels because "
+            "external service failed: Plex did not answer (ConnectionError)"
         )
