@@ -468,9 +468,12 @@ class PlexapiPlexClient(PlexClient):
     ) -> list[PlexArtist | PlexAlbum | PlexPlaylist]:
         """The items of a kind whose ``field`` is exactly ``value``."""
         # A filter's name ending in "=" asks Plex for the items whose field
-        # is the value, compared without case; without it Plex gives those
-        # whose field contains the value.
-        query = urlencode({f"{field}=": value})
+        # is the value, compared without case; without it, for those whose
+        # field has the value at the start of a word. Plex reads a comma in
+        # the value as "or" and has no escape for it, so a value with one is
+        # asked as the part before its first comma, at the start of a word.
+        first, comma, _ = value.partition(",")
+        query = urlencode({field: first} if comma else {f"{field}=": value})
         if kind is PlexPlaylist:
             answer = self._query(f"/playlists?playlistType=audio&{query}")
             return [

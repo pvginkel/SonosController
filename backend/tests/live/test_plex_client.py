@@ -567,8 +567,13 @@ class TestPlexClientFind:
             None,
         )
         assert marked is not None, "the music library has no title with & ? / # + % ="
+        # Plex reads a comma in a filter's value as "or".
+        with_comma = next(
+            (found.title for found in albums if "," in found.title), None
+        )
+        assert with_comma is not None, "the music library has no title with a comma"
 
-        for asked in (title, marked, title.swapcase()):
+        for asked in (title, marked, with_comma, title.swapcase()):
             assert _by_key(plex.find_by_title(PlexAlbum, asked)) == _by_key(
                 found for found in albums if found.title == asked
             ), asked
