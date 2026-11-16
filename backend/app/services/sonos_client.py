@@ -372,7 +372,10 @@ _REQUEST_TIMEOUT_SECONDS = 5.0
 # 412, so only the lease ends it.
 _SUBSCRIPTION_LEASE_SECONDS = 300
 _SEED_TIMEOUT_SECONDS = 2.0
-_READINESS_TIMEOUT_SECONDS = 1.0
+# The readiness check's probes of all the seeds together. It is under
+# readyz's wait for the check (health_service.DEFAULT_CHECK_TIMEOUT_SECONDS),
+# so a seed that answers is reached after every seed that does not.
+_READINESS_SECONDS = 0.5
 
 _INSTANCE = [("InstanceID", 0)]
 _DURATION = re.compile(r"(\d+):(\d\d):(\d\d)")
@@ -455,9 +458,10 @@ class SoCoSonosClient(SonosClient):
         soco.config.EVENT_ADVERTISE_IP = settings.sonos_event_advertise_host
 
     def check_readiness(self) -> CheckResult:
+        timeout = _READINESS_SECONDS / len(self._seed_hosts)
         for device in self._candidates():
             try:
-                _probe(device, _READINESS_TIMEOUT_SECONDS)
+                _probe(device, timeout)
             except _SPEAKER_ERRORS:
                 continue
             return CheckResult(CheckStatus.OK)

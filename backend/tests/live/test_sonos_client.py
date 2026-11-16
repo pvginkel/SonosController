@@ -11,7 +11,7 @@ import pytest
 
 from app.core_exceptions import ExternalServiceException
 from app.exceptions import CommandRefusedException
-from app.services.health_service import CheckStatus
+from app.services.health_service import CheckStatus, HealthService
 from app.services.sonos_client import (
     UNREPORTED,
     GroupVolumeChanged,
@@ -111,6 +111,32 @@ class TestLiveHousehold:
 
     def test_the_readiness_check_passes_on_a_seed_that_answers(self, sonos):
         assert sonos.check_readiness().status is CheckStatus.OK
+
+    def test_readyz_passes_when_the_seed_asked_first_does_not_answer(
+        self, app, live_settings
+    ):
+        health = HealthService(
+            lifecycle_coordinator=app.container.lifecycle_coordinator(),
+            settings=app.container.config(),
+        )
+        # 192.0.2.1 is of a range no host has: asked first, it never answers.
+        SoCoSonosClient(
+            settings=live_settings.model_copy(
+                update={
+                    "sonos_seed_hosts": [
+                        "192.0.2.1",
+                        *live_settings.sonos_seed_hosts,
+                    ]
+                }
+            ),
+            health_service=health,
+        )
+
+        with app.app_context():
+            body, status = health.check_readyz()
+
+        assert status == 200
+        assert body["checks"] == {"sonos": {"status": "ok", "critical": False}}
 
     def test_every_room_can_be_read(self, sonos):
         for room in sonos.read_household().rooms:

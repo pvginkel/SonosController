@@ -13,7 +13,6 @@ from PIL import Image
 from app.app_config import AppSettings
 from app.core_exceptions import ExternalServiceException
 from app.exceptions import CommandRefusedException
-from app.services.health_service import CheckStatus
 from app.services.sonos_client import (
     UNREPORTED,
     Group,
@@ -118,10 +117,14 @@ class TestSonosClientReadiness:
     def test_the_container_provides_the_soco_client(self, app):
         assert app.container.sonos_client.provides is SoCoSonosClient
 
-    def test_the_soco_client_reports_seeds_that_do_not_answer(self, app):
-        client = SoCoSonosClient(
+    @pytest.mark.parametrize("seeds", [2, 5])
+    def test_the_soco_client_reports_seeds_that_do_not_answer(
+        self, app, client, seeds
+    ):
+        # It registers its check in place of the fake's.
+        SoCoSonosClient(
             settings=AppSettings(
-                sonos_seed_hosts=["192.0.2.1", "192.0.2.2"],
+                sonos_seed_hosts=[f"192.0.2.{n}" for n in range(1, seeds + 1)],
                 sonos_event_advertise_host="sonos-events.invalid",
                 plex_url="http://192.0.2.1:32400",
                 plex_token="the-suites-plex-token",
@@ -129,10 +132,15 @@ class TestSonosClientReadiness:
             health_service=app.container.health_service(),
         )
 
-        result = client.check_readiness()
+        response = client.get("/health/readyz")
 
-        assert result.status is CheckStatus.ERROR
-        assert result.detail == "none of the 2 seed speakers answered"
+        # Every seed was asked inside readyz's wait for the check: a check
+        # that outlives it reads "timed out after 0.8 s".
+        assert response.get_json()["checks"]["sonos"] == {
+            "status": "error",
+            "critical": False,
+            "detail": f"none of the {seeds} seed speakers answered",
+        }
 
 
 class TestSonosClientHousehold:
