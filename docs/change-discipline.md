@@ -42,8 +42,9 @@ backend stores none of it. Favourites in PostgreSQL are its only stored data.
 
 In memory the backend keeps what the design (`docs/api-design.md`) names, and nothing else: the
 mirror of the speakers' state, fed by their events and read again from the speaker at every
-subscription (section 2), and a small cache of finished artwork by id, size and format
-(section 3.7). Both are lost at a restart and built again. Do not cache anything else of a speaker
+subscription (section 2), a small cache of finished artwork by id, size and format
+(section 3.7), and each group's queueing tasks in their turns (section 3.4). All are lost at a
+restart, and the first two built again. Do not cache anything else of a speaker
 or of the library to save a round trip: the library is read from Plex on each request.
 
 The backend reaches Sonos and Plex only through two thin client services in the DI container:
@@ -61,7 +62,7 @@ PostgreSQL and the real SSE machinery.
 TEST-1 (no mocks or fakes), approved for this project at its onboarding.** CI has no speaker and no
 Plex. pytest overrides the two client providers with hand-written in-memory fakes that keep state,
 in `backend/tests/fakes/` (a household's rooms with their queues, transport, volume and groups;
-Plex's albums and their pictures). Never `MagicMock`,
+Plex's library of artists, albums, tracks and playlists, with their pictures). Never `MagicMock`,
 never `monkeypatch` of SoCo or plexapi internals, and no other fake anywhere: everything above the
 clients is real. One test is the named exception:
 `test_the_soco_client_asks_a_speaker_while_soco_holds_a_topology_subscription` in

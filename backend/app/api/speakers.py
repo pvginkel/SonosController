@@ -49,7 +49,9 @@ def list_speakers(
 
     A speaker is a room: the devices a room is made of are not listed
     themselves. The list is not paged, a household's speakers being few, and
-    it is empty while no speaker answers the backend.
+    it is empty while no speaker answers the backend. A speaker that does
+    not answer is left out until it does, and so is every speaker of a
+    group it leads; a group lists only the speakers that are listed.
 
     The event `speakers_changed` says that the list changed, and
     `volume_changed` that a speaker's volume did.

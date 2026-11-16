@@ -5,11 +5,11 @@ Plex server that decides each part of it. Milestones 1 to 4 build on this note. 
 between the backend and its clients stays the OpenAPI document the deployed backend serves; this
 note says what that document must come to hold, and why.
 
-Everything under "What the speakers and Plex do" was tried on 2026-11-15 against the operator's
-household: Sonos S2 software 86.11, Plex Media Server 1.43, SoCo 0.32.2 and plexapi 4.18, from a
-pod in the cluster. Live tests ran on the Garage speaker only, at low volume, and its queue,
-position, volume and play mode were put back as found. Where something could not be tried, it
-says so, and section 7 lists it.
+Everything under "What the speakers and Plex do" was tried on 2026-11-15 and 2026-11-16 against
+the operator's household: Sonos S2 software 86.11, Plex Media Server 1.43, SoCo 0.32.2 and
+plexapi 4.18, from a pod in the cluster. Live tests ran on the Garage speaker only, at low
+volume, and its queue, position, volume and play mode were put back as found. Where something
+could not be tried, it says so, and section 7 lists it.
 
 ## The decisions
 
@@ -125,10 +125,14 @@ Every queue entry came out complete: title, artist, album, duration and artwork.
 
 - **The account number does not matter.** `sn=0`, `1`, `9` and the real one all queued, and the
   speaker wrote the real one into every queue entry. The backend need not find it, which is as
-  well: `/status/accounts` lists no accounts on this software.
-- **A queue entry names its Plex track.** Its address is
+  well: `/status/accounts` lists no accounts on this software. Nor does the section: an album
+  addressed with section `999` queued whole.
+- **A queue entry names its Plex track and its server.** Its address is
   `x-sonos-http:<machine>%3a<section>%3a<rating key>%3atrack.mp3?…`, so the backend can tell a
-  Plex track in the queue and read its rating key.
+  track of the Plex service in the queue and read its rating key. A track the Sonos app queues
+  from another Plex server the account sees has an address of the same form, with that server's
+  machine identifier and a rating key of that server: an entry is a track of the library only
+  when its machine identifier is the configured server's (section 2).
 - **`AddMultipleURIsToQueue` takes 16 items a call**, tracks or album containers. The metadata
   documents are joined with plain spaces, unencoded. Encoding the spaces inside them makes the
   speaker accept the addresses and drop every title.
@@ -185,13 +189,17 @@ The speaker's shuffle mode (`SHUFFLE_NOREPEAT`) does more than pick tracks at ra
   and the first track differed on each of three tries. Setting shuffle on a loaded queue instead
   keeps the current track first.
 - **Appending while shuffle is on** mixes the new tracks into the rest of the shuffled order.
+- **A stream refuses shuffle** (1.7). With a stream as the source, setting the transport to the
+  queue just cleared, `x-rincon-queue:<id>#0`, was taken, and shuffle after it. Setting it on a
+  queue that is the source already keeps its position and order.
 
 So:
 
-- **Play** clears the queue, sets the mode to `NORMAL`, queues, and plays from the first track.
-- **Shuffle** clears the queue, sets `SHUFFLE_NOREPEAT`, queues the item as **one** container (for
-  an artist the artist container, so every track is there before the first is drawn), and plays
-  from the first track of the shuffled order.
+- **Play** clears the queue, makes the queue the source, sets the mode to `NORMAL`, queues, and
+  plays from the first track.
+- **Shuffle** clears the queue, makes the queue the source, sets `SHUFFLE_NOREPEAT`, queues the
+  item as **one** container (for an artist the artist container, so every track is there before
+  the first is drawn), and plays from the first track of the shuffled order.
 - **Add to queue** appends and leaves the mode alone.
 
 Shuffling in the backend instead, and queueing tracks in that order, is ruled out by 1.3: 287
@@ -200,8 +208,13 @@ tracks would take a minute and a half.
 ### 1.6 A very large playlist, and which playlists are shown
 
 Plex shows nine audio playlists: four the operator made (4 to 148 tracks) and five that Plex
-makes itself. Four of those five are empty; the fifth holds all 12,019 tracks.
+makes itself, smart playlists, one of which holds the whole library.
 
+- **Plex lists a smart playlist with the track count it stored earlier**, not what it holds now.
+  The list gave two of Plex's own as empty that held 29 and 76 tracks when each was read on its
+  own (`/playlists/<rating key>`), and 12,019 tracks for the one of the whole library, which then
+  read as 12,030. After such a read the list carries the new count. What else makes Plex store
+  the count was not established. A playlist's own answer has it as it is.
 - **The speaker refuses the 12,019-track playlist.** `AddURIToQueue` fails after about ten
   seconds with UPnP error 800 and queues nothing. Since Play clears first, a failed Play leaves an
   empty queue.
@@ -216,7 +229,9 @@ makes itself. Four of those five are empty; the fifth holds all 12,019 tracks.
 
 **The library shows a playlist when it holds 1 to 1,000 tracks** (`PLAYLIST_MAX_TRACKS`). That
 drops the empty ones and the one the speaker cannot take, by what they are and not by their
-names. Queueing a larger playlist is refused before the speaker is asked. Playing the whole
+names. The list goes by the count Plex lists, so a smart playlist of Plex's own shows once a read
+of its own has stored that it holds tracks. Queueing reads the playlist on its own, and refuses
+one that holds no tracks or more than the limit before the speaker is asked. Playing the whole
 library at random is not in what is agreed; if it is wanted later, the way is a random draw of
 album containers, not that playlist.
 
@@ -230,6 +245,8 @@ A radio stream was started on the Garage for a few seconds.
   duration is zero.
 - The speaker allows `Play` and `Stop` only: no `Pause`, no `Next`. `Next` fails with UPnP
   error 701.
+- The play mode cannot be shuffled: with a stream set as the source, not played,
+  `SHUFFLE_NOREPEAT` failed with UPnP error 712 (Play mode not supported) and `NORMAL` was taken.
 - A Plex track allows `Play`, `Pause`, `Stop` and `Next`, and `Previous` from the second track
   on.
 
@@ -263,8 +280,12 @@ first and title second. Section 5 stores a favourite accordingly.
 
 - **Plex gives every item a `thumb` path**, `/library/metadata/<rating key>/thumb/<stamp>`, and a
   playlist a `composite`, `/playlists/<rating key>/composite/<stamp>`. A track's `thumb` is its
-  album's, so an album's tracks share one picture. One album of 853 and two artists of 94 have
-  none.
+  album's cover, so an album's tracks share one picture. An album without a cover carries its
+  artist's picture as its `thumb`, and its tracks carry none: 41 of the first 3,000 tracks have
+  no `thumb`. One album of 853 and two artists of 94 have no picture at all.
+- **A playlist's stamp is the time it was last read on its own**, not its picture's: every read
+  of `/playlists/<rating key>` gives its `composite` a new stamp, and the list of playlists
+  carries the latest.
 - **The source is large**: an album cover came as a 1000 × 1000 JPEG of 839 KB.
 - **Plex resizes**: `/photo/:/transcode?url=<thumb>&width=W&height=H&minSize=1&upscale=1` answers
   a JPEG in about 65 ms (`format=png` gives PNG). With `minSize=1` the picture covers the box and
@@ -298,13 +319,15 @@ first and title second. Section 5 stores a favourite accordingly.
 
 ## 2. The backend around the API
 
-- **The backend mirrors, and does not own, the speakers' state.** A singleton service holds, per
-  speaker, what the events report, and re-reads a speaker in full when it subscribes or
-  subscribes again. A `GET` answers from this mirror, and asks Plex only for the picture of a
-  Plex track (3.7). The mirror changes on the speakers' events and on its own reads of the
-  layout, never on a command: after a command a `GET` answers the old state until the speaker's
-  event arrives (1.1). Nothing of it is stored: after a restart the backend reads the speakers
-  again, and the music has played on.
+- **The backend mirrors, and does not own, the speakers' state.** A singleton service subscribes
+  to every room's five services (1.1), holds, per speaker, what the events report, and re-reads a
+  speaker in full when it subscribes or subscribes again. A `GET` of a speaker or its playback
+  answers from this mirror, and asks Plex only for the picture of a Plex track (3.7). The queue
+  is not mirrored: its `GET` reads the speaker (3.4), and the mirror passes on that it changed.
+  The mirror changes on the speakers' events and on its own reads of the layout, never on a
+  command: after a command a `GET` answers the old state until the speaker's event arrives (1.1).
+  Nothing of it is stored: after a restart the backend reads the speakers again, and the music
+  has played on.
 - **Speakers are found from configured addresses.** `SONOS_SEED_HOSTS` lists one or more
   speakers; any one that answers gives the household's layout and the addresses of the rest.
 - **The subscriptions heal themselves.** SoCo renews them. On a failed renewal, a speaker that
@@ -315,17 +338,35 @@ first and title second. Section 5 stores a favourite accordingly.
   number, and a room that did not answer before. When no speaker answers at the app's start, the
   app starts with an empty mirror, which fills once one does. This is one background service on
   the template's lifecycle hooks, and the reason the app runs as one replica.
+- **Layouts are applied on the mirror's own thread**, one at a time: those it reads and those the
+  speakers send, of which it applies the latest it was handed. The thread that delivers the
+  speakers' events makes no call to a speaker, so a room that takes seconds to fail holds up the
+  layouts after it and the rooms read with it, and no other room's events.
+- **A room that does not answer is left out**, and the rest of the household is served. A room
+  the mirror does not hold and cannot subscribe to and read is not listed, and neither is a held
+  room that now leads a group and cannot be read again. What a group plays and its volume are its
+  coordinator's, so a group whose coordinator is left out is left out whole, its members with it;
+  a group that is served lists only rooms that are served. A room left out is tried again at the
+  next layout. A held room whose subscriptions cannot be renewed keeps what is held of it until it
+  is read again.
 - **Plex is read directly**, with `PLEX_URL` and `PLEX_TOKEN`, for the library, for the order of
   an artist, for favourites and for artwork. The token also sees a server shared by someone
-  else; the configured address settles which server is meant.
+  else; the configured address settles which server is meant. A queue entry is a track of the
+  library only when it carries that server's machine identifier (1.3). The Plex client holds the
+  identifier from Plex's first answer; until Plex has answered once, an entry of the Plex service
+  is served with neither `track_id` nor `artwork_id`, which is logged.
 - **Text is Unicode NFC.** Every string from Plex or a speaker is normalised before it leaves the
   API. The display's fonts hold composed characters only.
 - **Readiness**: the Sonos and the Plex service each register a check of their own, neither
-  critical (READY-1, READY-2). Sonos's passes when a speaker answers, Plex's when Plex answers
-  and has the music library. The app serves favourites without either.
+  critical (READY-1, READY-2). Sonos's passes when a seed speaker answers; its probes of all the
+  seeds share half a second, so a seed that does not answer leaves the next its turn within
+  readyz's wait of 0.8 s. Plex's passes when Plex answers and has the music library. The app
+  serves favourites without either.
 - **Failures** of a speaker or of Plex are `ExternalServiceException`, a `502` in the template's
   envelope (BE-3). Its message is the client's own wording, which names no address and never the
-  token.
+  token. A queueing task's failure carries that message alone, without a traceback (3.4). A
+  transport command the speaker refuses because it does not allow it now (UPnP error 701 or 711)
+  is no failure of the speaker: it is a `409` (3.2).
 
 ## 3. The API
 
@@ -373,7 +414,8 @@ Conventions that hold for every endpoint:
 - `id` is what a display stores as its choice. It is the device's own and does not change with
   the room's name or address.
 - Hidden devices are not listed (1.2). The list is sorted by name, and empty while no speaker
-  answers.
+  answers. A room that does not answer is left out, and so is every room of a group it leads
+  (2).
 - An unknown `speaker_id` is a `404` with code `SPEAKER_NOT_FOUND`, here and below, in a join's
   body as in its path.
 - **A join or a leave goes to the room in the path alone** (1.2). A join's body names the group by
@@ -382,8 +424,9 @@ Conventions that hold for every endpoint:
   holding `speaker_id`, a string, and nothing else is a `400`.
 - A join to the group the room already plays in, and a leave by a room alone, send the speakers
   nothing and answer `204`. Which group a room plays in is read from the mirror (2), and the new
-  groups arrive as `speakers_changed`, with `volume_changed` for every room whose group changed
-  and `playback_changed` for every room that now plays something else (4).
+  groups arrive as `speakers_changed`, with `volume_changed` for every room whose group changed,
+  and `playback_changed` and `queue_changed` for every room that now follows another coordinator
+  and so plays something else, from another queue (4).
 
 ### 3.2 Playback
 
@@ -422,13 +465,16 @@ group's coordinator.
 - `actions`: what the speaker allows now, of `play`, `pause`, `next`, `previous`; `pause` is
   there when the speaker allows a pause or a stop (1.7). A command that is not among them is a
   `409` with code `ACTION_NOT_AVAILABLE`. The check reads the mirror, so a command the speaker
-  stopped allowing before its event arrived goes to the speaker, which refuses it: a `502`.
+  stopped allowing before its event arrived goes to the speaker, which refuses it with UPnP error
+  701 or 711: the same `409`, naming the action asked.
 - `queue_position` is 1-based and `null` when the source is not the queue, and for an empty
   queue. `queue_length` is `null` when the source is not the queue.
 - `track` is `null` when nothing is loaded. For a radio stream the title is what the stream
   reports as playing, the station until it reports anything, and the artist is the station.
   `album`, `duration_ms` and `artwork_id` are `null` when the source gives none, as a radio
-  stream does. `track_id` is the Plex track when the queue entry is one (1.3), else `null`.
+  stream does. `track_id` is the Plex track when the queue entry is a track of the configured
+  Plex server (1.3, 2), else `null`; a track of another Plex server has the picture its speaker
+  serves, as anything else that is not from the library does (3.7).
 - There is no elapsed time (1.1) and no repeat.
 
 ### 3.3 Volume
@@ -455,12 +501,13 @@ speaker (3.1).
 
 | Endpoint | Does |
 |---|---|
-| `GET /api/speakers/{speaker_id}/queue` | The queue, paged. |
+| `GET /api/speakers/{speaker_id}/queue` | The queue of the room's group, paged, read from the speaker at every request. |
 | `POST /api/speakers/{speaker_id}/queue` | Play, shuffle or add an item of the library. Answers `202` with a task. |
-| `DELETE /api/speakers/{speaker_id}/queue` | Clears the queue. |
+| `DELETE /api/speakers/{speaker_id}/queue` | Clears the queue. Answers `204`. |
 
-**Reading.** `sort_by` is `position`, the only value. `locate=current` answers the page that
-holds the current track, whatever `page` says; `meta.page` tells which page it is.
+**Reading.** `sort_by` is `position` and `sort_dir` is `asc`, the only values. `locate=current`
+answers the page that holds the current track, whatever `page` says; `meta.page` tells which
+page it is. Without a current track it answers the page asked.
 
 ```json
 {
@@ -482,11 +529,18 @@ holds the current track, whatever `page` says; `meta.page` tells which page it i
 
 - The queue is listed as the speaker gives it. With shuffle on, that is the order in which it
   will play (1.5).
-- `current_position` is `null` when the source is not the queue.
-- `artwork_id` for the Plex tracks of a page comes from one Plex call for the whole page
-  (`/library/metadata/<key>,<key>,…`, 21 ms for four items; a key Plex does not have is left out
-  of the answer). An entry that is not from Plex has `null`.
+- `current_position` is the playback's `queue_position` (3.2), read from the mirror: `null` when
+  the source is not the queue, and for an empty queue. After a change made elsewhere the page is
+  the speaker's at once, and `current_position` follows the speaker's event.
+- `track_id` and `artwork_id` are set for an entry that is a track of the configured Plex server
+  (1.3, 2), and `null` for every other entry. The pictures of a page's tracks come from one Plex
+  call for the whole page (`/library/metadata/<key>,<key>,…`, 21 ms for four items; a key Plex
+  does not have is left out of the answer). Once Plex has answered, a failure of that call is a
+  `502`.
+- `album` and `duration_ms` are `null` where the entry gives none.
 - A page of 100 costs the speaker 0.12 s (1.6).
+- **Clear** empties the queue of the group; a group that plays from it stops. It ends no queueing
+  task: what a task still running on the group has left to queue lands after the Clear.
 
 **Queueing.**
 
@@ -501,26 +555,39 @@ holds the current track, whatever `page` says; `meta.page` tells which page it i
   - `add` appends and changes nothing else: not the mode, not what plays.
 - `order`: `newest_first` (the default) or `oldest_first`. It is read for an artist with `play`
   or `add`, and ignored otherwise.
+- A track is played or added, never shuffled: `shuffle` with a track is a `400`, as is a body
+  with a field that is not one of the four.
 
-The endpoint checks the speaker and the item, then starts a task and answers `202` with the
-template's `TaskStartResponse` (API-2): a large artist takes 33 seconds to queue, and a display
-gives a request five. The task does what 1.4 and 1.5 found:
+The endpoint checks the speaker in the mirror and the item in Plex, as it is now, then starts a
+task and answers `202` with the template's `TaskStartResponse` (API-2): a large artist takes 33
+seconds to queue, and a display gives a request five. The task reads what it queues from Plex
+before the queue changes, then does what 1.4, 1.5 and 1.7 found:
 
 | Action | Steps on the coordinator |
 |---|---|
-| `play` | Clear. Set `NORMAL`. Queue the first container. Play from the first track. Queue the rest. |
-| `shuffle` | Clear. Set `SHUFFLE_NOREPEAT`. Queue the item as one container. Play from the first track. |
+| `play` | Clear. Make the queue the source. Set `NORMAL`. Queue the first container. Play from the first track. Queue the rest. |
+| `shuffle` | Clear. Make the queue the source. Set `SHUFFLE_NOREPEAT`. Queue the item as one container. Play from the first track. |
 | `add` | Queue the containers at the end. |
 
 - An artist with `play` or `add` is its album containers in release order, the first alone and
   the rest 16 a call. Everything else is one container.
 - Music starts about half a second into the task. The queue grows behind it, and each step
   reaches the clients as `queue_changed`.
-- A task that fails reports it through the template's task events, to every connection. A
-  display watches for the id it was given and shows the error. A failed `play` leaves the queue
-  as far as it got, which may be empty.
-- Refused before any task starts: an item Plex does not have (`404`, `ITEM_NOT_FOUND`), and a
-  playlist over `PLAYLIST_MAX_TRACKS` or with no tracks (`409`, `PLAYLIST_NOT_PLAYABLE`).
+- **A group's queueing tasks take their turns**, one at a time in the order asked, in a lane of
+  the coordinator the room's group has when the task is asked. An `add` lands after everything
+  asked before it. A `play` or `shuffle` ends every task asked before it on the group: one still
+  waiting makes no call, and the one under way stops before its next call to the speaker, so
+  nothing of an earlier item lands after the new one. A task that was ended reports
+  `task_completed`, as one that is done.
+- A task that fails reports `task_failed` through the template's task events, to every
+  connection, with `{"error": …}`: the failure in words a client can show (2). A display watches
+  for the id it was given and shows the error. A failure in Plex, an artist Plex no longer has
+  and an artist without albums leave the queue as it was; a failure of the speaker leaves the
+  queue as far as it got, which for `play` and `shuffle` may be empty.
+- Refused before any task starts: a speaker the mirror does not hold (`404`,
+  `SPEAKER_NOT_FOUND`), an item Plex does not have (`404`, `ITEM_NOT_FOUND`), and a playlist that
+  holds no tracks or more than `PLAYLIST_MAX_TRACKS` (`409`, `PLAYLIST_NOT_PLAYABLE`). A Plex
+  that fails is a `502`.
 
 Playing from a chosen place in the queue, removing one entry and reordering are not in what is
 agreed and are left out.
@@ -532,23 +599,23 @@ Read from Plex on each request; the backend keeps no copy. The whole artist list
 
 | Endpoint | Gives |
 |---|---|
-| `GET /api/library/artists` | Artists, paged, by sort title. |
+| `GET /api/library/artists` | Artists, paged. `sort_by=sort_title`, the only value. |
 | `GET /api/library/artists/{artist_id}` | One artist. |
 | `GET /api/library/artists/{artist_id}/albums` | The artist's albums, paged. `sort_by=release` (default) or `title`; `sort_dir` defaults to `desc`, newest first, the order Play uses. |
 | `GET /api/library/albums/{album_id}` | One album. |
-| `GET /api/library/albums/{album_id}/tracks` | The album's tracks, paged, in disc and track order. |
-| `GET /api/library/playlists` | The playlists that can be played (1.6), paged, by title. |
-| `GET /api/library/playlists/{playlist_id}` | One playlist. |
+| `GET /api/library/albums/{album_id}/tracks` | The album's tracks, paged. `sort_by=position`, the only value: disc and track order. |
+| `GET /api/library/playlists` | The playlists that can be played (1.6), paged. `sort_by=title`, the only value. |
+| `GET /api/library/playlists/{playlist_id}` | One playlist, as it is now: also one the list leaves out. |
 
 An artist, an album, a track and a playlist:
 
 ```json
-{ "id": "37059", "title": "…", "index_letter": "R", "artwork_id": "…", "favourite_id": null }
+{ "id": "37059", "title": "…", "index_letter": "R", "artwork_id": "…" }
 ```
 
 ```json
 { "id": "37060", "title": "…", "artist_id": "37059", "artist": "…", "year": 2001,
-  "track_count": 11, "artwork_id": "…", "favourite_id": 4 }
+  "track_count": 11, "artwork_id": "…" }
 ```
 
 ```json
@@ -557,17 +624,24 @@ An artist, an album, a track and a playlist:
 ```
 
 ```json
-{ "id": "43830", "title": "…", "track_count": 148, "duration_ms": 37610000, "artwork_id": "…",
-  "favourite_id": null }
+{ "id": "43830", "title": "…", "track_count": 148, "duration_ms": 37610000, "artwork_id": "…" }
 ```
 
+- Every list's order ends in the rating key, so its pages cut one sequence. `sort_dir` defaults
+  to `asc` but for the albums. Titles are compared without accents and in one case.
 - `index_letter` is the letter the artist files under: `A` to `Z` from the sort title with
-  accents folded, and `#` for anything else. The A–Z bar jumps to the first row with the letter,
-  and the display folds no accents itself.
-- `favourite_id` is the favourite that marks this item, or `null`. The toggle deletes that
-  favourite or creates one.
-- `year` is `null` for an album without a date.
+  accents folded, and `#` for anything else, a letter that folds to none of them (`Ø`, `Æ`)
+  included. The artists are listed by letter, those under `#` first, and by sort title within a
+  letter. The A–Z bar jumps to the first row with the letter, and the display folds no accents
+  itself.
+- `year` is `null` for an album without a date. A track's `disc`, `number` and `duration_ms` are
+  `null` where Plex has none; a track without a disc or a number comes before those that have
+  one.
 - A track's `artist` is the track's own where Plex has one, as on a compilation.
+- An album without a cover has its artist's picture, and its tracks have none (1.9). A
+  playlist's `artwork_id` is new after every `GET` of that playlist, and the list carries the
+  latest (1.9, 3.7).
+- An id Plex does not have, or one of another kind, is a `404` with code `ITEM_NOT_FOUND`.
 - The tracks of a playlist are not listed. The display plays a playlist and does not open it.
 - There is no search.
 
@@ -593,6 +667,8 @@ An artist, an album, a track and a playlist:
 ```
 
 - `kind`: `artist`, `album` or `playlist`.
+- An artist, an album and a playlist of the library (3.5) carry `favourite_id`: the favourite
+  that marks the item, or `null`. The toggle deletes that favourite or creates one.
 - `item_id` is where the item is in Plex **now**: what to pass to the queue and the library. It
   is `null`, and `available` is `false`, when Plex no longer has the item. The favourite is kept
   and shown as unavailable, and comes back when the item does.
@@ -606,14 +682,15 @@ An artist, an album, a track and a playlist:
 
 - **An artwork id names one picture.** Every object above that has a picture carries its
   `artwork_id`, and `null` when it has none. Two objects with the same picture carry the same id,
-  as an album and its tracks do. When the picture changes, the id does. A client can therefore
-  keep a picture by id and size for as long as it likes, and the answer says so
+  as an album and its tracks do. When the picture changes, the id does; a playlist's also
+  changes at every read of the playlist on its own, its picture the same (1.9). A client can
+  therefore keep a picture by id and size for as long as it likes, and the answer says so
   (`Cache-Control: public, max-age=31536000, immutable`).
 - **The id is the backend's to shape.** For a library item it encodes Plex's `thumb` or
-  `composite` path with its stamp (1.9). For something that plays from another source it names
-  the group's coordinator and a digest of the track's address and of its picture's, and the
-  picture is the one that speaker serves (`/getaa`), answered only while that track is the one
-  the coordinator has loaded.
+  `composite` path with its stamp (1.9). For something that plays from another source, a track
+  of another Plex server included (1.3), it names the group's coordinator and a digest of the
+  track's address and of its picture's, and the picture is the one that speaker serves
+  (`/getaa`), answered only while that track is the one the coordinator has loaded.
 - **`size`** is the side of a square in pixels. The picture is scaled to cover the square and
   cropped at the centre.
 - **`format=jpeg`** (the default), 16 to 1024 pixels: `image/jpeg`. This is the ordinary image,
@@ -626,7 +703,9 @@ An artist, an album, a track and a playlist:
 - **An unknown id is a `404`** with code `RECORD_NOT_FOUND`, and so is a speaker's picture once
   its track is no longer loaded. A client shows its placeholder. Plex ignores the stamp (1.9), so
   the id of a Plex picture that has since changed answers the picture as it is now.
-- **A source that fails** (Plex, the speaker, or bytes that are no picture) is a `502`.
+- **A source that fails** (Plex, the speaker, or bytes that are no picture) is a `502`. So is a
+  speaker's picture of the loaded track while that track is of the Plex service and Plex has
+  never answered: whether it is a track of the library is not known (2).
 
 How it is made: Plex resizes its own picture first (`/photo/:/transcode` with `minSize=1`),
 Pillow scales what it has to cover the square and crops it at the centre, and for `lvgl` the
@@ -650,7 +729,7 @@ ids and no replay.
 | `playback_changed` | `{"speaker_id": …}` | `GET /api/speakers/{speaker_id}/playback` |
 | `queue_changed` | `{"speaker_id": …}` | `GET /api/speakers/{speaker_id}/queue`, when it shows the queue |
 | `favourites_changed` | `{}` | `GET /api/favourites` |
-| `task_event` | the template's | Nothing: it reports the queueing task (3.4). |
+| `task_event` | the task's `event_type`, `task_id`, `timestamp` and `data` | Nothing: it reports the queueing task (3.4). |
 
 - **Events name what changed and carry no state.** A client fetches, so there is one way to read
   each state and nothing to keep in step.
@@ -659,6 +738,9 @@ ids and no replay.
   sense of SSE-2. A client ignores the speakers it does not show. There are no channels and no
   subscriptions to renew.
 - **Group events go out for every member**, since each display follows its own room.
+- **`queue_changed`** is sent when a group's coordinator reports a change of its queue, a change
+  of play mode included, and for a room that follows another coordinator after a regrouping. A
+  follower's own queue events are dropped, as its playback's are.
 - **After `ready` a client fetches what it shows.** That covers the first connection and every
   reconnection, so the backend sends no snapshot.
 - **The backend coalesces**: at most one event of a type for a speaker in 250 ms, with the last
@@ -738,7 +820,7 @@ erDiagram
 | `PLEX_URL` | The Plex server's address, plain HTTP on the local network. |
 | `PLEX_TOKEN` | The Plex token. A secret. |
 | `PLEX_LIBRARY` | The music library's name. Optional when the server has one music library. |
-| `PLAYLIST_MAX_TRACKS` | The largest playlist that is shown and queued. Default 1000. |
+| `PLAYLIST_MAX_TRACKS` | The largest playlist, in tracks, that is shown and queued: 1 or more. Default 1000. |
 
 None of these values is in this repository: it is public. The addresses are in the deployment's
 configuration, the token in its secret.

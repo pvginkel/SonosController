@@ -198,9 +198,9 @@ def list_playlists(
     """The playlists of music that can be played, by title.
 
     A playlist is listed when it holds at least one track and no more than
-    a speaker takes at once, 1000 unless the backend is set otherwise. That
-    leaves out the empty playlists and the ones too large to queue, Plex's
-    own among them. A smart playlist is listed by the count Plex last
+    the backend queues, 1000 unless it is set otherwise: a size well inside
+    what a speaker takes at once. That leaves out the empty playlists and
+    the ones too large to queue, Plex's own among them. A smart playlist is listed by the count Plex last
     stored for it, which can differ from what it holds now.
 
     The tracks of a playlist are not listed.
