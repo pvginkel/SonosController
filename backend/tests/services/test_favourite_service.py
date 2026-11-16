@@ -995,6 +995,29 @@ class TestFavouritesChanged:
         assert (len(listed), total) == (1, 1)
         assert stream.events() == [CHANGED]
 
+    def test_a_listing_that_removed_the_one_it_found_again_is_announced(
+        self, service, session, library, connect
+    ):
+        # Stored in one transaction, after it: its id decides.
+        store(session, ItemKind.ARTIST, RADIOHEAD, "Radiohead")
+        store(session, ItemKind.ARTIST, "9999", "Radiohead", guid="local://9999")
+        stream = connect()
+
+        listed, total = service.list_favourites(query())
+        commit(session)
+
+        assert ([f.item_id for f in listed], total) == ([RADIOHEAD], 1)
+        assert stored(session) == [
+            (
+                ItemKind.ARTIST,
+                f"plex://artist/{RADIOHEAD}",
+                RADIOHEAD,
+                "Radiohead",
+                None,
+            )
+        ]
+        assert stream.events() == [CHANGED]
+
     def test_a_listing_that_changed_nothing_is_not_announced(
         self, service, session, library, connect
     ):

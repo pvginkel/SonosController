@@ -723,6 +723,19 @@ class TestFavouritesChanged:
         assert stream.events() == [CHANGED]
         assert stored(session) == 1
 
+    def test_a_listing_that_removed_the_one_it_found_again_is_sent(
+        self, client, session, library, connect
+    ):
+        # Put in one transaction, after it: its id decides.
+        marked = put(session, ItemKind.ARTIST, RADIOHEAD, "Radiohead")
+        put(session, ItemKind.ARTIST, "9999", "Radiohead", guid="local://9999")
+        stream = connect()
+
+        assert [body["id"] for body in listed(client)] == [marked.id]
+
+        assert stream.events() == [CHANGED]
+        assert stored(session) == 1
+
     def test_a_listing_while_plex_does_not_answer_sends_nothing(
         self, client, session, library, connect
     ):
