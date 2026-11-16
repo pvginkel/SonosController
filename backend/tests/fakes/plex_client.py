@@ -14,7 +14,8 @@ another stamp answers the picture as it is now. Like plexapi, it holds which
 server it is from Plex's first answer.
 
 A test builds its library with ``add_artist()``, ``add_album()``,
-``add_track()`` and ``add_playlist()``.
+``add_track()`` and ``add_playlist()``. ``served_tracks()`` is what the Plex
+service linked in Sonos gives the fake household for a container of it.
 """
 
 from __future__ import annotations
@@ -88,6 +89,20 @@ class _Playlist:
     rating_key: str
     title: str
     track_count: int
+    duration_ms: int | None
+    # The tracks the Plex service queues for it; None for one a test gave a
+    # count alone.
+    track_keys: list[str] | None
+
+
+@dataclass(frozen=True)
+class ServedTrack:
+    """A track as the Plex service linked in Sonos gives it to a speaker."""
+
+    rating_key: str
+    title: str
+    artist: str
+    album: str
     duration_ms: int | None
 
 
@@ -194,12 +209,22 @@ class FakePlexClient(PlexClient):
         track_count: int,
         size: tuple[int, int] = (1000, 1000),
         colour: tuple[int, int, int] = (90, 30, 160),
+        *,
+        track_keys: Iterable[str] | None = None,
     ) -> None:
         """Add a playlist of so many tracks: the operator's or Plex's own,
         which nothing tells apart. One without tracks has no picture and no
-        duration."""
+        duration.
+
+        ``track_keys`` are its tracks, in its own order, as many as
+        ``track_count``. A playlist given a count of tracks alone cannot be
+        queued on the fake household.
+        """
+        keys = None if track_keys is None else list(track_keys)
+        if keys is not None and len(keys) != track_count:
+            raise ValueError(f"Playlist {rating_key} has {len(keys)} track keys")
         self._playlists[rating_key] = _Playlist(
-            rating_key, title, track_count, track_count * _TRACK_MS or None
+            rating_key, title, track_count, track_count * _TRACK_MS or None, keys
         )
         if track_count:
             self.set_picture(rating_key, size, colour)
@@ -226,6 +251,70 @@ class FakePlexClient(PlexClient):
             )
         self._pictures[rating_key] = _Picture(image, self._next_stamp)
         self._next_stamp += 1
+
+    # ------------------------------------------------------------------
+    # The Plex service linked in Sonos
+    # ------------------------------------------------------------------
+
+    def served_tracks(self, kind: str, rating_key: str) -> list[ServedTrack] | None:
+        """The tracks the Plex service gives a speaker for a container of an
+        item of the library (``track``, ``album``, ``artist`` or
+        ``playlist``), in the order ``docs/api-design.md`` sections 1.3 and
+        1.4 found: an album in disc and track order, an artist's albums
+        newest first, a playlist in its own order. None for an item the
+        library does not have."""
+        if kind == "track":
+            track = self._tracks.get(rating_key)
+            return None if track is None else [self._served(track)]
+        if kind == "album":
+            if rating_key not in self._albums:
+                return None
+            return self._served_album(rating_key)
+        if kind == "artist":
+            if rating_key not in self._artists:
+                return None
+            albums = [
+                self._album(album)
+                for album in self._albums.values()
+                if album.artist == rating_key
+            ]
+            return [
+                served
+                for album in in_release_order(albums, newest_first=True)
+                for served in self._served_album(album.rating_key)
+            ]
+        if kind == "playlist":
+            playlist = self._playlists.get(rating_key)
+            if playlist is None:
+                return None
+            if playlist.track_keys is None:
+                if playlist.track_count:
+                    raise AssertionError(
+                        f"The fake Plex's playlist {rating_key} has no tracks to "
+                        "queue: add it with track_keys"
+                    )
+                return []
+            return [self._served(self._tracks[key]) for key in playlist.track_keys]
+        raise ValueError(f"The Plex service has no {kind} containers")
+
+    def _served_album(self, rating_key: str) -> list[ServedTrack]:
+        return [self._served(track) for track in self._album_tracks(rating_key)]
+
+    def _album_tracks(self, rating_key: str) -> list[_Track]:
+        """An album's tracks in disc and track order."""
+        tracks = [track for track in self._tracks.values() if track.album == rating_key]
+        tracks.sort(key=lambda track: (track.disc or 0, track.number or 0))
+        return tracks
+
+    def _served(self, track: _Track) -> ServedTrack:
+        album = self._albums[track.album]
+        return ServedTrack(
+            rating_key=track.rating_key,
+            title=track.title,
+            artist=track.artist or self._artists[album.artist].title,
+            album=album.title,
+            duration_ms=track.duration_ms,
+        )
 
     # ------------------------------------------------------------------
     # PlexClient
@@ -284,11 +373,7 @@ class FakePlexClient(PlexClient):
         self._asked(f"read the tracks of Plex album {rating_key}")
         if rating_key not in self._albums:
             return None
-        tracks = [
-            track for track in self._tracks.values() if track.album == rating_key
-        ]
-        tracks.sort(key=lambda track: (track.disc or 0, track.number or 0))
-        return [self._track(track) for track in tracks]
+        return [self._track(track) for track in self._album_tracks(rating_key)]
 
     def read_track(self, rating_key: str) -> PlexTrack | None:
         self._asked(f"read Plex track {rating_key}")

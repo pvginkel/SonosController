@@ -4,6 +4,7 @@ import re
 import threading
 import time
 from collections.abc import Callable, Generator
+from dataclasses import dataclass
 from ipaddress import IPv4Address
 from typing import Any
 
@@ -12,19 +13,26 @@ import pytest
 from app.core_exceptions import ExternalServiceException
 from app.exceptions import CommandRefusedException
 from app.services.health_service import CheckStatus, HealthService
+from app.services.plex_client import PlexapiPlexClient
 from app.services.sonos_client import (
     UNREPORTED,
     GroupVolumeChanged,
     HouseholdChanged,
     Playback,
     PlaybackChanged,
+    PlexItem,
+    PlexItemKind,
+    QueuePage,
     SoCoSonosClient,
     SonosService,
+    Track,
     TransportAction,
     TransportState,
     Volume,
     VolumeChanged,
 )
+from app.utils.plex_library import PlexAlbum, PlexArtist, PlexPlaylist
+from app.utils.plex_queue_entry import parse_plex_queue_entry
 
 pytestmark = pytest.mark.live
 
@@ -429,3 +437,264 @@ class TestLiveSubscriptions:
         assert stopped.actions is None
         assert stopped.track == sonos.read_playback(garage).track
         assert stopped.queue_position == sonos.read_playback(garage).queue_position
+
+
+# The most tracks an item the queueing tests take holds: a queue that size
+# reads in one call and is cleared at once.
+_MOST_TRACKS = 100
+
+
+@dataclass(frozen=True)
+class _Library:
+    """The items of the real library the queueing tests queue."""
+
+    machine_identifier: str
+    section_id: str
+    artist: PlexArtist
+    # The artist's albums, newest first.
+    albums: list[PlexAlbum]
+    playlist: PlexPlaylist
+
+    def item(self, kind: PlexItemKind, rating_key: str, title: str) -> PlexItem:
+        return PlexItem(
+            kind, self.machine_identifier, self.section_id, rating_key, title
+        )
+
+    def album(self, album: PlexAlbum) -> PlexItem:
+        return self.item(PlexItemKind.ALBUM, album.rating_key, album.title)
+
+
+@pytest.fixture(scope="module")
+def library(live_plex: PlexapiPlexClient) -> _Library:
+    """An artist of two albums or more and a playlist, each of 100 tracks or
+    fewer."""
+    for artist in live_plex.read_artists():
+        albums = live_plex.read_artist_albums(artist.rating_key, newest_first=True)
+        if len(albums) >= 2 and sum(a.track_count for a in albums) <= _MOST_TRACKS:
+            break
+    else:
+        pytest.fail(
+            f"No artist has two albums or more and {_MOST_TRACKS} tracks or fewer"
+        )
+    # Plex lists a smart playlist with a count it stored earlier: its own read
+    # has the count it has now.
+    playlists = (
+        live_plex.read_playlist(p.rating_key) for p in live_plex.read_playlists()
+    )
+    playlist = next(
+        (p for p in playlists if p is not None and 1 <= p.track_count <= _MOST_TRACKS),
+        None,
+    )
+    assert playlist is not None, f"No playlist holds 1 to {_MOST_TRACKS} tracks"
+    return _Library(
+        live_plex.machine_identifier(), live_plex.section_id(), artist, albums, playlist
+    )
+
+
+def _incomplete(page: QueuePage) -> list[Track]:
+    """The entries that lack a title, an artist, an album, a duration or a
+    picture."""
+    return [
+        track
+        for track in page.tracks
+        if not (
+            track.title
+            and track.artist
+            and track.album
+            and track.duration_seconds > 0
+            and track.picture.startswith("/getaa?")
+        )
+    ]
+
+
+def _keys(page: QueuePage) -> list[str]:
+    """The rating keys of a page's entries, each a Plex track."""
+    entries = [parse_plex_queue_entry(track.uri) for track in page.tracks]
+    assert None not in entries
+    return [entry.rating_key for entry in entries if entry is not None]
+
+
+def _carrying_the_token(page: QueuePage, token: str) -> list[str]:
+    """The titles of the entries whose address or picture holds the token:
+    the token itself is never printed."""
+    return [
+        track.title
+        for track in page.tracks
+        if token in track.uri or token in track.picture
+    ]
+
+
+class TestLiveQueue:
+    def test_a_page_of_the_queue_and_its_size(self, sonos, garage):
+        whole = sonos.read_queue(garage, 0, 1000)
+
+        page = sonos.read_queue(garage, 1, 2)
+
+        assert page.total == whole.total == sonos.read_playback(garage).queue_length
+        assert page.tracks == whole.tracks[1:3]
+        assert sonos.read_queue(garage, whole.total, 10).tracks == ()
+
+    def test_an_album_is_queued_in_one_call_with_every_entry_complete(
+        self, sonos, garage, kept_queue, library, plex, live_settings
+    ):
+        album = library.albums[0]
+        sonos.clear_queue(garage)
+
+        sonos.add_to_queue(garage, library.album(album))
+
+        page = sonos.read_queue(garage, 0, 1000)
+        tracks = plex.read_album_tracks(album.rating_key)
+        assert _keys(page) == [track.rating_key for track in tracks]
+        assert _incomplete(page) == []
+        assert {track.album for track in page.tracks} == {album.title}
+        assert {
+            parse_plex_queue_entry(track.uri).machine_identifier
+            for track in page.tracks
+        } == {library.machine_identifier}
+        assert _carrying_the_token(page, live_settings.plex_token) == []
+        # The speaker serves each entry's picture.
+        picture = sonos.read_picture(garage, page.tracks[0].picture)
+        assert picture.startswith(b"\xff\xd8")
+
+    def test_a_playlist_is_queued_in_one_call_with_every_entry_complete(
+        self, sonos, garage, kept_queue, library, live_settings
+    ):
+        playlist = library.playlist
+        sonos.clear_queue(garage)
+
+        sonos.add_to_queue(
+            garage,
+            library.item(PlexItemKind.PLAYLIST, playlist.rating_key, playlist.title),
+        )
+
+        page = sonos.read_queue(garage, 0, 1000)
+        assert page.total == playlist.track_count
+        assert len(_keys(page)) == playlist.track_count
+        assert _incomplete(page) == []
+        assert _carrying_the_token(page, live_settings.plex_token) == []
+
+    def test_an_artist_is_queued_in_one_call_with_every_entry_complete(
+        self, sonos, garage, kept_queue, library, plex, live_settings
+    ):
+        artist = library.artist
+        sonos.clear_queue(garage)
+
+        sonos.add_to_queue(
+            garage, library.item(PlexItemKind.ARTIST, artist.rating_key, artist.title)
+        )
+
+        page = sonos.read_queue(garage, 0, 1000)
+        tracks = [
+            track.rating_key
+            for album in library.albums
+            for track in plex.read_album_tracks(album.rating_key)
+        ]
+        assert sorted(_keys(page)) == sorted(tracks)
+        assert _incomplete(page) == []
+        assert _carrying_the_token(page, live_settings.plex_token) == []
+
+    def test_albums_are_queued_in_one_call_in_the_order_given(
+        self, sonos, garage, kept_queue, library, plex
+    ):
+        oldest_first = list(reversed(library.albums))[:16]
+        sonos.clear_queue(garage)
+
+        sonos.add_many_to_queue(garage, [library.album(a) for a in oldest_first])
+
+        page = sonos.read_queue(garage, 0, 1000)
+        assert _keys(page) == [
+            track.rating_key
+            for album in oldest_first
+            for track in plex.read_album_tracks(album.rating_key)
+        ]
+        assert _incomplete(page) == []
+
+    def test_add_appends_and_changes_nothing_else(
+        self, sonos, garage, kept_queue, library, plex
+    ):
+        found = sonos.read_playback(garage)
+        album = library.albums[0]
+
+        sonos.add_to_queue(garage, library.album(album))
+
+        assert sonos.read_queue(garage, 0, kept_queue.total).tracks == (
+            kept_queue.tracks
+        )
+        added = sonos.read_queue(garage, kept_queue.total, 1000)
+        assert _keys(added) == [
+            track.rating_key for track in plex.read_album_tracks(album.rating_key)
+        ]
+        left = sonos.read_playback(garage)
+        assert left.queue_length == kept_queue.total + album.track_count
+        assert (
+            left.transport_state,
+            left.queue_position,
+            left.track,
+            left.shuffle,
+        ) == (
+            found.transport_state,
+            found.queue_position,
+            found.track,
+            found.shuffle,
+        )
+
+    def test_shuffle_presents_the_queue_in_play_order(
+        self, sonos, garage, quiet, kept_queue, library
+    ):
+        # quiet before kept_queue: the Garage stops before its volume is put
+        # back.
+        album = max(library.albums, key=lambda a: a.track_count)
+        assert album.track_count >= 2
+        sonos.clear_queue(garage)
+        sonos.add_to_queue(garage, library.album(album))
+        in_order = sonos.read_queue(garage, 0, 1000)
+
+        sonos.set_shuffle(garage, True)
+
+        shuffled = sonos.read_queue(garage, 0, 1000)
+        assert sonos.read_playback(garage).shuffle is True
+        assert sorted(_keys(shuffled)) == sorted(_keys(in_order))
+        # The current track stays first.
+        assert shuffled.tracks[0] == in_order.tracks[0]
+
+        sonos.play_from_start(garage)
+        playing = _wait_for(
+            lambda: sonos.read_playback(garage),
+            lambda p: p.transport_state is TransportState.PLAYING,
+        )
+        assert (playing.queue_position, playing.track) == (1, shuffled.tracks[0])
+        sonos.next(garage)
+        moved = _wait_for(
+            lambda: sonos.read_playback(garage), lambda p: p.queue_position == 2
+        )
+        assert moved.track == shuffled.tracks[1]
+        sonos.stop(garage)
+
+        sonos.set_shuffle(garage, False)
+
+        assert sonos.read_queue(garage, 0, 1000) == in_order
+        assert sonos.read_playback(garage).shuffle is False
+
+    def test_a_container_the_service_does_not_have_is_refused_in_the_clients_words(
+        self, sonos, garage, kept_queue, library
+    ):
+        with pytest.raises(ExternalServiceException) as raised:
+            sonos.add_to_queue(
+                garage, library.item(PlexItemKind.ALBUM, "999999999", "No Album")
+            )
+
+        assert raised.value.cause == "the speaker answered UPnP error 800"
+        assert sonos.read_queue(garage, 0, 1000) == kept_queue
+
+    def test_playing_an_empty_queue_from_the_start_fails_in_the_clients_words(
+        self, sonos, garage, kept_queue
+    ):
+        sonos.clear_queue(garage)
+
+        with pytest.raises(ExternalServiceException) as raised:
+            sonos.play_from_start(garage)
+
+        assert raised.value.cause == (
+            "the speaker answered UPnP error 711 (Illegal seek target)"
+        )
+        assert sonos.read_playback(garage).transport_state is TransportState.STOPPED

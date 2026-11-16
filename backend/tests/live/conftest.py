@@ -11,13 +11,16 @@ It runs on the settings ``kc project setup`` writes to the git-ignored
 ``.env``; no address and no token is in this repository. The standing rules
 (``docs/change-discipline.md``): the Garage speaker only, at low volume, its
 queue, position, volume and grouping left as found. Every other room is only
-read, and so is Plex. The Plex token is never printed: a test asserts on
-nothing that holds it.
+read, and so is Plex. A test that changes the Garage's queue takes
+``kept_queue``, which puts the queue back as it was found. The Plex token is
+never printed: a test asserts on nothing that holds it.
 
 Before the first test it checks that the Garage and Plex can take the suite,
 and stops the run with how to fix it where they cannot (TEST-2).
 """
 
+import time
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
@@ -31,6 +34,11 @@ from app.exceptions import ConfigurationError
 from app.services.health_service import CheckStatus
 from app.services.plex_client import PlexapiPlexClient
 from app.services.sonos_client import (
+    ADD_MANY_LIMIT,
+    Playback,
+    PlexItem,
+    PlexItemKind,
+    QueuePage,
     SoCoSonosClient,
     TransportAction,
     TransportState,
@@ -40,6 +48,11 @@ from app.utils.plex_queue_entry import PlexQueueEntry, parse_plex_queue_entry
 _ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
 GARAGE = "Garage"
+
+# The most entries of the Garage's queue the suite puts back after a test
+# that changes it: one track at a time, about 0.33 s each
+# (docs/api-design.md section 1.3).
+QUEUE_LIMIT = 100
 
 
 @pytest.fixture(scope="session")
@@ -147,6 +160,25 @@ def garage(live_client: SoCoSonosClient) -> str:
             "track in the Sonos app and stop it.",
             returncode=1,
         )
+    # The tests that queue put the queue back as it is listed, which shuffle
+    # would draw into another order.
+    if playback.shuffle:
+        pytest.exit(
+            f"The {GARAGE} plays shuffled, and the live suite puts its queue back "
+            "in the order it is listed. Turn shuffle off in the Sonos app.",
+            returncode=1,
+        )
+    queue = live_client.read_queue(speaker_id, 0, QUEUE_LIMIT)
+    if queue.total > QUEUE_LIMIT or any(
+        parse_plex_queue_entry(track.uri) is None for track in queue.tracks
+    ):
+        pytest.exit(
+            f"The live suite puts the {GARAGE}'s queue back one Plex track at a "
+            f"time, and can for a queue of {QUEUE_LIMIT} tracks or fewer, all "
+            f"from Plex; it holds {queue.total}. Queue an album of the Plex "
+            "library from the Sonos app and stop it.",
+            returncode=1,
+        )
     return speaker_id
 
 
@@ -175,6 +207,59 @@ def plex_entry(
             returncode=1,
         )
     return entry
+
+
+@pytest.fixture
+def kept_queue(live_client: SoCoSonosClient, garage: str) -> Generator[QueuePage]:
+    """The Garage's queue, for one test that changes it; then the Garage as
+    it was found: its queue, position and play mode, stopped.
+
+    The queue is put back as the Plex service's containers of its tracks,
+    from which the speaker makes the entries it held.
+    """
+    found = live_client.read_queue(garage, 0, QUEUE_LIMIT)
+    playback = live_client.read_playback(garage)
+    try:
+        yield found
+    finally:
+        _put_back(live_client, garage, found, playback)
+
+
+def _put_back(
+    sonos: SoCoSonosClient, garage: str, found: QueuePage, playback: Playback
+) -> None:
+    if sonos.read_playback(garage).transport_state is not TransportState.STOPPED:
+        sonos.stop(garage)
+    # The mode first: what is queued while shuffle is on is drawn into the
+    # play order.
+    sonos.set_shuffle(garage, playback.shuffle)
+    sonos.clear_queue(garage)
+    tracks = []
+    for track in found.tracks:
+        entry = parse_plex_queue_entry(track.uri)
+        assert entry is not None
+        tracks.append(
+            PlexItem(
+                PlexItemKind.TRACK,
+                entry.machine_identifier,
+                entry.section_id,
+                entry.rating_key,
+                track.title,
+            )
+        )
+    for start in range(0, len(tracks), ADD_MANY_LIMIT):
+        sonos.add_many_to_queue(garage, tracks[start : start + ADD_MANY_LIMIT])
+    # The queue starts at its first track, and next moves a stopped
+    # transport without playing.
+    for _ in range(playback.queue_position - 1):
+        sonos.next(garage)
+    deadline = time.perf_counter() + 15.0
+    left = sonos.read_playback(garage)
+    while left != playback and time.perf_counter() < deadline:
+        time.sleep(0.2)
+        left = sonos.read_playback(garage)
+    assert left == playback
+    assert sonos.read_queue(garage, 0, QUEUE_LIMIT) == found
 
 
 @pytest.fixture(scope="session")

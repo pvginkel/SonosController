@@ -105,14 +105,15 @@ def test_app_settings() -> AppSettings:
 
 
 @pytest.fixture(autouse=True)
-def sonos(app: Flask) -> Generator[FakeSonosClient]:
-    """The household every test runs against: the in-memory fake, empty.
+def sonos(app: Flask, plex: FakePlexClient) -> Generator[FakeSonosClient]:
+    """The household every test runs against: the in-memory fake, empty, its
+    Plex service serving the test's Plex.
 
     It overrides the container's Sonos client for every test, so that no test
     reaches a speaker; ``session_app_isolation`` undoes the override. The live
     suite replaces this fixture with the real client.
     """
-    fake = FakeSonosClient(health_service=app.container.health_service())
+    fake = FakeSonosClient(health_service=app.container.health_service(), plex=plex)
     app.container.sonos_client.override(fake)
     try:
         yield fake

@@ -6,6 +6,7 @@ speakers.
 """
 
 import io
+from datetime import date
 
 import pytest
 from PIL import Image
@@ -14,11 +15,14 @@ from app.app_config import AppSettings
 from app.core_exceptions import ExternalServiceException
 from app.exceptions import CommandRefusedException
 from app.services.sonos_client import (
+    ADD_MANY_LIMIT,
     UNREPORTED,
     Group,
     GroupVolumeChanged,
     HouseholdChanged,
     PlaybackChanged,
+    PlexItem,
+    PlexItemKind,
     SoCoSonosClient,
     SonosService,
     TransportAction,
@@ -26,7 +30,14 @@ from app.services.sonos_client import (
     Volume,
     VolumeChanged,
 )
-from tests.fakes.sonos_client import FakeSonosClient, picture_colour, queue_track
+from app.utils.plex_queue_entry import PlexQueueEntry, parse_plex_queue_entry
+from tests.fakes.plex_client import MACHINE_IDENTIFIER, SECTION_ID, FakePlexClient
+from tests.fakes.sonos_client import (
+    CONTAINER_LIMIT,
+    FakeSonosClient,
+    picture_colour,
+    queue_track,
+)
 
 GARAGE = "RINCON_FAKE0000000101400"
 LOUNGE = "RINCON_FAKE0000000201400"
@@ -74,6 +85,25 @@ class _Listener:
 
     def on_lost(self) -> None:
         self.lost += 1
+
+
+def _item(kind: PlexItemKind, rating_key: str) -> PlexItem:
+    """An item of the fake Plex's library, as the Plex service queues it."""
+    return PlexItem(
+        kind, MACHINE_IDENTIFIER, SECTION_ID, rating_key, f"Item {rating_key}"
+    )
+
+
+def _album(rating_key: str) -> PlexItem:
+    return _item(PlexItemKind.ALBUM, rating_key)
+
+
+def _keys(sonos: FakeSonosClient, speaker_id: str) -> list[str]:
+    """The rating keys of the group's queue, as the speaker presents it."""
+    return [
+        parse_plex_queue_entry(track.uri).rating_key
+        for track in sonos.read_queue(speaker_id, 0, 1000).tracks
+    ]
 
 
 def _subscribe(sonos: FakeSonosClient, speaker_id: str, service: SonosService):
@@ -706,6 +736,409 @@ class TestSonosClientGroups:
         )
         assert raised.value.cause == f"speaker {member_id} is not in the household"
         assert household.read_household() == layout
+
+
+class TestSonosClientQueue:
+    @pytest.fixture
+    def library(self, plex: FakePlexClient) -> FakePlexClient:
+        """An artist of two albums, a second artist's album and a playlist.
+
+        Album 10 (2001) holds 101 to 103, and album 20 (2010) 201 and 202,
+        both of artist 1; album 30, of artist 3, holds 301 to 310. Playlist 40
+        holds 202, 101 and 301.
+        """
+        plex.add_artist("1", "Artist One")
+        plex.add_album(
+            "10", ["101", "102", "103"], artist="1", released=date(2001, 5, 1)
+        )
+        plex.add_album("20", [], artist="1", title="Later", released=date(2010, 1, 1))
+        # On two discs, added out of order.
+        plex.add_track("20", "202", disc=2, number=1)
+        plex.add_track("20", "201", disc=1, number=1)
+        plex.add_artist("3", "Artist Three")
+        plex.add_album("30", [str(key) for key in range(301, 311)], artist="3")
+        plex.add_playlist("40", "A Mix", 3, track_keys=["202", "101", "301"])
+        return plex
+
+    def test_read_queue_answers_a_page_and_the_queues_size(self, household):
+        page = household.read_queue(GARAGE, 1, 1)
+
+        assert page.tracks == (queue_track(2),)
+        assert page.total == 3
+        assert household.read_queue(GARAGE, 0, 100).tracks == (
+            queue_track(1),
+            queue_track(2),
+            queue_track(3),
+        )
+        assert household.read_queue(GARAGE, 3, 100).tracks == ()
+        assert household.read_queue(LOUNGE, 0, 100).total == 0
+
+    def test_an_album_becomes_its_tracks_in_disc_and_track_order(
+        self, household, library
+    ):
+        household.add_to_queue(LOUNGE, _album("20"))
+
+        [first, second] = household.read_queue(LOUNGE, 0, 100).tracks
+        assert parse_plex_queue_entry(first.uri) == PlexQueueEntry(
+            MACHINE_IDENTIFIER, SECTION_ID, "201"
+        )
+        assert parse_plex_queue_entry(second.uri).rating_key == "202"
+        # Every entry is complete, as the speaker's are.
+        assert (first.title, first.artist, first.album) == (
+            "Track 201",
+            "Artist One",
+            "Later",
+        )
+        assert first.duration_seconds == 180
+        assert first.picture == f"/getaa?s=1&u={first.uri}"
+
+    def test_an_artist_becomes_their_albums_newest_first(self, household, library):
+        household.add_to_queue(LOUNGE, _item(PlexItemKind.ARTIST, "1"))
+
+        assert _keys(household, LOUNGE) == ["201", "202", "101", "102", "103"]
+
+    def test_a_playlist_becomes_its_tracks_in_its_own_order(self, household, library):
+        household.add_to_queue(LOUNGE, _item(PlexItemKind.PLAYLIST, "40"))
+
+        assert _keys(household, LOUNGE) == ["202", "101", "301"]
+        assert [track.album for track in household.read_queue(LOUNGE, 0, 3).tracks] == [
+            "Later",
+            "Album 10",
+            "Album 30",
+        ]
+
+    def test_a_track_becomes_itself(self, household, library):
+        household.add_to_queue(LOUNGE, _item(PlexItemKind.TRACK, "102"))
+
+        assert _keys(household, LOUNGE) == ["102"]
+
+    def test_add_appends_and_changes_nothing_else(self, household, library):
+        household.next(GARAGE)
+        household.play(GARAGE)
+        before = household.read_playback(GARAGE)
+
+        household.add_to_queue(GARAGE, _album("10"))
+
+        after = household.read_playback(GARAGE)
+        assert household.read_queue(GARAGE, 0, 100).tracks[:3] == (
+            queue_track(1),
+            queue_track(2),
+            queue_track(3),
+        )
+        assert _keys(household, GARAGE)[3:] == ["101", "102", "103"]
+        assert after.queue_length == 6
+        assert (after.transport_state, after.queue_position, after.track) == (
+            before.transport_state,
+            before.queue_position,
+            before.track,
+        )
+
+    def test_adding_to_an_empty_queue_makes_its_first_track_current(
+        self, household, library
+    ):
+        household.add_to_queue(LOUNGE, _album("10"))
+
+        playback = household.read_playback(LOUNGE)
+        assert playback.transport_state is TransportState.STOPPED
+        assert (playback.queue_position, playback.queue_length) == (1, 3)
+        assert parse_plex_queue_entry(playback.track.uri).rating_key == "101"
+
+    def test_add_many_queues_each_container_in_the_order_given(
+        self, household, library
+    ):
+        household.add_many_to_queue(LOUNGE, [_album("30"), _album("10"), _album("20")])
+
+        assert _keys(household, LOUNGE) == [
+            *(str(key) for key in range(301, 311)),
+            "101",
+            "102",
+            "103",
+            "201",
+            "202",
+        ]
+
+    @pytest.mark.parametrize("count", [0, ADD_MANY_LIMIT + 1])
+    def test_add_many_takes_1_to_16_items(self, household, library, count):
+        with pytest.raises(ValueError, match=f"takes 1 to 16 items, not {count}"):
+            household.add_many_to_queue(LOUNGE, [_album("10")] * count)
+
+        assert household.read_queue(LOUNGE, 0, 100).total == 0
+
+    @pytest.mark.parametrize(
+        "item",
+        [
+            _album("99"),
+            # An artist's key named as an album.
+            _album("1"),
+            PlexItem(PlexItemKind.ALBUM, "anotherserver", SECTION_ID, "10", "Album 10"),
+        ],
+    )
+    def test_a_container_the_service_does_not_have_is_refused_and_queues_nothing(
+        self, household, library, item
+    ):
+        with pytest.raises(ExternalServiceException) as raised:
+            household.add_to_queue(GARAGE, item)
+        with pytest.raises(ExternalServiceException):
+            household.add_many_to_queue(GARAGE, [_album("10"), item])
+
+        assert raised.value.operation == (
+            f"add Plex album {item.rating_key} to the queue of speaker {GARAGE}"
+        )
+        assert raised.value.cause == "the speaker answered UPnP error 800"
+        assert household.read_queue(GARAGE, 0, 100).total == 3
+
+    def test_a_call_beyond_what_the_speaker_fetches_is_refused_and_queues_nothing(
+        self, household, plex
+    ):
+        half = CONTAINER_LIMIT // 2 + 1
+        plex.add_album("50", [str(100_000 + n) for n in range(half)])
+        plex.add_album("60", [str(200_000 + n) for n in range(half)])
+        plex.add_album("70", [str(300_000 + n) for n in range(CONTAINER_LIMIT + 1)])
+
+        with pytest.raises(ExternalServiceException) as raised:
+            household.add_to_queue(LOUNGE, _album("70"))
+        with pytest.raises(ExternalServiceException) as many:
+            household.add_many_to_queue(LOUNGE, [_album("50"), _album("60")])
+
+        assert raised.value.cause == "the speaker answered UPnP error 800"
+        assert (
+            many.value.operation == f"add 2 Plex items to the queue of speaker {LOUNGE}"
+        )
+        assert many.value.cause == "the speaker answered UPnP error 800"
+        assert household.read_queue(LOUNGE, 0, 100).total == 0
+        household.add_to_queue(LOUNGE, _album("50"))
+        assert household.read_queue(LOUNGE, 0, 100).total == half
+
+    def test_a_household_without_the_plex_service_queues_nothing(
+        self, household, library
+    ):
+        household.plex_linked = False
+
+        with pytest.raises(ExternalServiceException) as raised:
+            household.add_to_queue(GARAGE, _album("10"))
+
+        assert raised.value.cause == "the speaker lists no Plex service"
+        assert household.read_queue(GARAGE, 0, 100).total == 3
+
+    def test_clear_empties_the_queue_and_stops(self, household):
+        household.play(GARAGE)
+
+        household.clear_queue(GARAGE)
+
+        playback = household.read_playback(GARAGE)
+        assert playback.transport_state is TransportState.STOPPED
+        assert playback.transport_uri == f"x-rincon-queue:{GARAGE}#0"
+        assert (playback.queue_position, playback.queue_length) == (0, 0)
+        assert playback.track is None
+        assert playback.actions == frozenset()
+        assert household.read_queue(GARAGE, 0, 100).total == 0
+
+    def test_clear_leaves_a_stream_playing(self, household):
+        household.start_stream(GARAGE, "Radio One")
+
+        household.clear_queue(GARAGE)
+
+        playback = household.read_playback(GARAGE)
+        assert playback.transport_state is TransportState.PLAYING
+        assert playback.transport_title == "Radio One"
+        assert household.read_queue(GARAGE, 0, 100).total == 0
+
+    def test_shuffle_presents_the_queue_in_play_order_from_the_current_track(
+        self, household
+    ):
+        tracks = [queue_track(n) for n in range(1, 11)]
+        household.load_queue(GARAGE, tracks)
+        household.next(GARAGE)
+        household.next(GARAGE)
+
+        household.set_shuffle(GARAGE, True)
+
+        shuffled = household.read_queue(GARAGE, 0, 100).tracks
+        playback = household.read_playback(GARAGE)
+        assert playback.shuffle is True
+        assert (playback.queue_position, playback.track) == (1, queue_track(3))
+        assert shuffled[0] == queue_track(3)
+        assert sorted(shuffled, key=tracks.index) == tracks
+        assert list(shuffled) != [queue_track(3), *tracks[:2], *tracks[3:]]
+
+        # Next counts along the play order.
+        household.next(GARAGE)
+        assert household.read_playback(GARAGE).track == shuffled[1]
+
+        household.set_shuffle(GARAGE, False)
+
+        playback = household.read_playback(GARAGE)
+        assert household.read_queue(GARAGE, 0, 100).tracks == tuple(tracks)
+        assert playback.shuffle is False
+        assert playback.track == shuffled[1]
+        assert playback.queue_position == tracks.index(shuffled[1]) + 1
+
+    def test_what_is_queued_with_shuffle_on_is_drawn_into_the_play_order(
+        self, household, library
+    ):
+        household.set_shuffle(LOUNGE, True)
+        household.add_to_queue(LOUNGE, _album("30"))
+
+        drawn = _keys(household, LOUNGE)
+        assert sorted(drawn) == [str(key) for key in range(301, 311)]
+        assert drawn != sorted(drawn)
+        playback = household.read_playback(LOUNGE)
+        assert parse_plex_queue_entry(playback.track.uri).rating_key == drawn[0]
+
+        # Added later, it lands after the current track, mixed into the rest.
+        household.add_to_queue(LOUNGE, _album("10"))
+
+        mixed = _keys(household, LOUNGE)
+        assert mixed[0] == drawn[0]
+        assert [key for key in mixed if key.startswith("3")] == drawn
+        assert sorted(mixed[1:]) == sorted([*drawn[1:], "101", "102", "103"])
+        household.set_shuffle(LOUNGE, False)
+        assert _keys(household, LOUNGE) == [
+            *(str(key) for key in range(301, 311)),
+            "101",
+            "102",
+            "103",
+        ]
+
+    def test_shuffle_of_an_empty_queue_sets_the_mode(self, household):
+        household.set_shuffle(LOUNGE, True)
+
+        assert household.read_playback(LOUNGE).shuffle is True
+        assert household.read_queue(LOUNGE, 0, 100).total == 0
+
+    def test_play_from_start_plays_the_first_track(self, household):
+        household.next(GARAGE)
+        household.next(GARAGE)
+
+        household.play_from_start(GARAGE)
+
+        playback = household.read_playback(GARAGE)
+        assert playback.transport_state is TransportState.PLAYING
+        assert (playback.queue_position, playback.track) == (1, queue_track(1))
+
+    def test_play_from_start_takes_the_queue_from_a_stream(self, household):
+        household.start_stream(GARAGE, "Radio One")
+
+        household.play_from_start(GARAGE)
+
+        playback = household.read_playback(GARAGE)
+        assert playback.transport_uri == f"x-rincon-queue:{GARAGE}#0"
+        assert playback.transport_state is TransportState.PLAYING
+        assert playback.track == queue_track(1)
+
+    def test_play_from_start_of_an_empty_queue_fails(self, household):
+        with pytest.raises(ExternalServiceException) as raised:
+            household.play_from_start(LOUNGE)
+
+        # As the Garage answered: the seek to the first track fails.
+        assert (
+            raised.value.operation == f"play from the first track on speaker {LOUNGE}"
+        )
+        assert raised.value.cause == (
+            "the speaker answered UPnP error 711 (Illegal seek target)"
+        )
+        assert household.read_playback(LOUNGE).transport_state is (
+            TransportState.STOPPED
+        )
+
+    def test_a_queue_call_goes_to_the_coordinator_of_the_group(
+        self, household, library
+    ):
+        household.join(LOUNGE, GARAGE)
+
+        household.add_to_queue(LOUNGE, _album("10"))
+        household.set_shuffle(LOUNGE, True)
+
+        assert household.read_queue(LOUNGE, 0, 100) == household.read_queue(
+            GARAGE, 0, 100
+        )
+        assert household.read_queue(GARAGE, 0, 100).total == 6
+        assert household.read_playback(GARAGE).shuffle is True
+        household.clear_queue(LOUNGE)
+        assert household.read_queue(GARAGE, 0, 100).total == 0
+
+    @pytest.mark.parametrize(
+        ("call", "operation"),
+        [
+            (lambda s, room: s.read_queue(room, 0, 10), "read the queue of"),
+            (lambda s, room: s.clear_queue(room), "clear the queue of"),
+            (lambda s, room: s.set_shuffle(room, True), "set the play mode of"),
+            (
+                lambda s, room: s.add_to_queue(room, _album("10")),
+                "add Plex album 10 to the queue of",
+            ),
+            (
+                lambda s, room: s.add_many_to_queue(room, [_album("10")]),
+                "add 1 Plex items to the queue of",
+            ),
+            (lambda s, room: s.play_from_start(room), "play from the first track on"),
+        ],
+    )
+    def test_a_queue_call_fails_when_the_coordinator_does_not_answer(
+        self, household, library, call, operation
+    ):
+        household.join(LOUNGE, GARAGE)
+        household.silence_room(GARAGE)
+
+        with pytest.raises(ExternalServiceException) as raised:
+            call(household, LOUNGE)
+
+        assert raised.value.operation == f"{operation} speaker {LOUNGE}"
+        assert raised.value.cause == "the speaker did not answer (ConnectTimeout)"
+
+        household.answer_again(GARAGE)
+        household.reachable = False
+        with pytest.raises(ExternalServiceException, match="none of the seed"):
+            call(household, LOUNGE)
+
+    def test_a_queue_change_arrives_as_a_playback_event(self, household, library):
+        listener, _ = _subscribe(household, LOUNGE, SonosService.AV_TRANSPORT)
+
+        household.add_to_queue(LOUNGE, _album("10"))
+        household.play_from_start(LOUNGE)
+        household.clear_queue(LOUNGE)
+        household.settle()
+
+        events = listener.events
+        lengths = [e.queue_length for e in events if e.queue_length is not None]
+        states = [e.transport_state for e in events if e.transport_state is not None]
+        tracks = [e.track for e in events if e.track is not UNREPORTED]
+        assert lengths[0] == 3
+        assert TransportState.PLAYING in states
+        assert (lengths[-1], states[-1], tracks[-1]) == (
+            0,
+            TransportState.STOPPED,
+            None,
+        )
+
+    def test_the_soco_client_fails_queue_calls_in_its_own_words(self, app):
+        client = SoCoSonosClient(
+            settings=AppSettings(
+                sonos_seed_hosts=["192.0.2.6"],
+                sonos_event_advertise_host="sonos-events.invalid",
+                plex_url="http://192.0.2.1:32400",
+                plex_token="the-suites-plex-token",
+            ),
+            health_service=app.container.health_service(),
+        )
+
+        with pytest.raises(ExternalServiceException) as reading:
+            client.read_queue(GARAGE, 0, 100)
+        with pytest.raises(ExternalServiceException) as adding:
+            client.add_many_to_queue(GARAGE, [_album("10"), _album("20")])
+
+        assert reading.value.operation == f"read the queue of speaker {GARAGE}"
+        assert adding.value.operation == (
+            f"add 2 Plex items to the queue of speaker {GARAGE}"
+        )
+        for raised in (reading, adding):
+            assert raised.value.cause.startswith(
+                "none of the 1 seed speakers answered (the speaker did not answer ("
+            )
+            assert "192.0.2" not in raised.value.message
+        # More than one call takes is refused before any speaker is asked.
+        with pytest.raises(ValueError, match="takes 1 to 16 items, not 17"):
+            client.add_many_to_queue(GARAGE, [_album("10")] * 17)
 
 
 class TestSonosClientPicture:

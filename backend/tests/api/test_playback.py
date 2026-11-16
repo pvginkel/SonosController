@@ -185,7 +185,10 @@ class TestGetPlayback:
         assert (answer["state"], answer["shuffle"]) == ("playing", True)
         assert (answer["queue_position"], answer["queue_length"]) == (2, 3)
         assert answer["actions"] == ["play", "pause", "next", "previous"]
-        assert answer["track"]["track_id"] == "1002"
+        # The second track of the play order: shuffle draws it.
+        [second] = household.read_queue(GARAGE, 1, 1).tracks
+        assert answer["track"]["title"] == second.title
+        assert answer["track"]["track_id"] in ("1002", "1003")
 
         household.start_buffering(GARAGE)
         household.settle()

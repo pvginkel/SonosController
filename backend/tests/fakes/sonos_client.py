@@ -7,6 +7,13 @@ sends events the way ``docs/api-design.md`` section 1.1 found the speakers
 send them: a service's state in full when a subscription starts, then partial
 events, several for one change, on a thread of their own.
 
+A room's queue is kept the way ``docs/api-design.md`` sections 1.3 to 1.6
+found the speakers keep one. A container of the Plex service becomes the
+tracks the fake Plex serves for it; a container the service does not have, or
+one beyond what a speaker fetches in time, is refused with UPnP error 800 and
+queues nothing. With shuffle on, the queue is presented in play order, and
+tracks added then are mixed into what plays after the current one.
+
 A test builds its household with ``add_room()`` and ``load_queue()``. A change
 made "elsewhere", as the Sonos app makes one, is the same call a display's
 would be (``play()``, ``set_volume()``, ``join()``) or one of the methods
@@ -23,9 +30,10 @@ from __future__ import annotations
 
 import hashlib
 import io
+import random
 import threading
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, urlsplit
 
@@ -35,12 +43,15 @@ from app.core_exceptions import ExternalServiceException
 from app.exceptions import CommandRefusedException
 from app.services.health_service import CheckResult, CheckStatus, HealthService
 from app.services.sonos_client import (
+    ADD_MANY_LIMIT,
     Group,
     GroupVolumeChanged,
     Household,
     HouseholdChanged,
     Playback,
     PlaybackChanged,
+    PlexItem,
+    QueuePage,
     Room,
     SonosClient,
     SonosEvent,
@@ -52,10 +63,14 @@ from app.services.sonos_client import (
     Volume,
     VolumeChanged,
 )
-from tests.fakes.plex_client import MACHINE_IDENTIFIER
+from tests.fakes.plex_client import MACHINE_IDENTIFIER, FakePlexClient, ServedTrack
 
 # What a speaker allows on a stream that cannot pause (section 1.7).
 _STREAM_ACTIONS = frozenset({TransportAction.PLAY, TransportAction.STOP})
+
+# The most tracks one call queues: about what a speaker fetches from the Plex
+# service in the 10 seconds it waits (section 1.6: 1,243 tracks in 4.9 s).
+CONTAINER_LIMIT = 2500
 
 # The side of the picture a speaker serves for a track (section 1.9).
 _PICTURE_SIZE = 300
@@ -99,6 +114,23 @@ def app_track(number: int) -> Track:
     )
 
 
+def _entry(item: PlexItem, track: ServedTrack) -> Track:
+    """A queue entry of a track the Plex service served for a container."""
+    uri = (
+        f"x-sonos-http:{item.machine_identifier}%3a{item.section_id}"
+        f"%3a{track.rating_key}%3atrack.mp3?sid=212&flags=8300&sn=1"
+    )
+    return Track(
+        title=track.title,
+        artist=track.artist,
+        album=track.album,
+        stream_content="",
+        duration_seconds=(track.duration_ms or 0) // 1000,
+        uri=uri,
+        picture=f"/getaa?s=1&u={uri}",
+    )
+
+
 def picture_colour(picture: str) -> tuple[int, int, int]:
     """The one colour of the picture a speaker serves at an address, unless a
     test had it serve something else there."""
@@ -120,7 +152,10 @@ class _Room:
     # The room's own transport: what plays when it coordinates its group.
     state: TransportState = TransportState.STOPPED
     shuffle: bool = False
+    # The queue as the speaker presents it, and each entry's place in the
+    # queue's normal order: with shuffle off, 0, 1, 2 and so on.
     queue: list[Track] = field(default_factory=list)
+    normal: list[int] = field(default_factory=list)
     position: int = 0
     # A stream replaces the queue as the transport, and the queue stays.
     stream: Track | None = None
@@ -178,8 +213,14 @@ class _FakeSubscription(SonosSubscription):
 class FakeSonosClient(SonosClient):
     """A household in memory."""
 
-    def __init__(self, health_service: HealthService) -> None:
+    def __init__(self, health_service: HealthService, plex: FakePlexClient) -> None:
         super().__init__(health_service)
+        # The Plex the household's Plex service serves.
+        self._plex = plex
+        # False: the speakers list no Plex service.
+        self.plex_linked = True
+        # The speakers' shuffle, the same in every test.
+        self._random = random.Random(0)
         self._rooms: dict[str, _Room] = {}
         self._subscriptions: list[_FakeSubscription] = []
         self._next_address = 1
@@ -241,9 +282,11 @@ class FakeSonosClient(SonosClient):
         self._send_household()
 
     def load_queue(self, speaker_id: str, tracks: list[Track]) -> None:
-        """Replace the queue of the room's group; the first track is current."""
+        """Replace the queue of the room's group, as presented; the first
+        track is current."""
         room = self._coordinator(speaker_id)
         room.queue = list(tracks)
+        room.normal = list(range(len(tracks)))
         room.position = 1 if tracks else 0
         room.stream = None
         room.state = TransportState.STOPPED
@@ -297,12 +340,6 @@ class FakeSonosClient(SonosClient):
         """The room's group waits for what it is to play: ``TRANSITIONING``."""
         room = self._coordinator(speaker_id)
         room.state = TransportState.TRANSITIONING
-        self._send_playback(room)
-
-    def set_shuffle(self, speaker_id: str, shuffle: bool) -> None:
-        """Set the play mode of the room's group, as the Sonos app does."""
-        room = self._coordinator(speaker_id)
-        room.shuffle = shuffle
         self._send_playback(room)
 
     # ------------------------------------------------------------------
@@ -587,6 +624,74 @@ class FakeSonosClient(SonosClient):
             return
         self._move(room, room)
 
+    def read_queue(self, speaker_id: str, offset: int, limit: int) -> QueuePage:
+        room = self._coordinator(speaker_id, "read the queue of")
+        return QueuePage(
+            tracks=tuple(room.queue[offset : offset + limit]), total=len(room.queue)
+        )
+
+    def clear_queue(self, speaker_id: str) -> None:
+        room = self._coordinator(speaker_id, "clear the queue of")
+        room.queue = []
+        room.normal = []
+        room.position = 0
+        if not room.stream:
+            room.state = TransportState.STOPPED
+        self._send_playback(room)
+
+    def set_shuffle(self, speaker_id: str, shuffle: bool) -> None:
+        room = self._coordinator(speaker_id, "set the play mode of")
+        # A queue that holds tracks is at one of them.
+        if shuffle != room.shuffle and room.queue:
+            current = room.position - 1
+            if shuffle:
+                # The current track stays first, and the rest follow drawn.
+                rest = [index for index in range(len(room.queue)) if index != current]
+                self._random.shuffle(rest)
+                order = [current, *rest]
+            else:
+                order = sorted(range(len(room.queue)), key=room.normal.__getitem__)
+            room.queue = [room.queue[index] for index in order]
+            room.normal = [room.normal[index] for index in order]
+            room.position = order.index(current) + 1
+        room.shuffle = shuffle
+        self._send_playback(room)
+
+    def add_to_queue(self, speaker_id: str, item: PlexItem) -> None:
+        self._add(
+            speaker_id,
+            f"add Plex {item.kind} {item.rating_key} to the queue of",
+            [item],
+        )
+
+    def add_many_to_queue(self, speaker_id: str, items: Sequence[PlexItem]) -> None:
+        if not 1 <= len(items) <= ADD_MANY_LIMIT:
+            raise ValueError(
+                f"add_many_to_queue() takes 1 to {ADD_MANY_LIMIT} items, "
+                f"not {len(items)}"
+            )
+        self._add(speaker_id, f"add {len(items)} Plex items to the queue of", items)
+
+    def play_from_start(self, speaker_id: str) -> None:
+        operation = "play from the first track on"
+        room = self._coordinator(speaker_id, operation)
+        # The speaker takes the queue as its transport before it seeks.
+        transport_changed = room.stream is not None
+        room.stream = None
+        if not room.queue:
+            if transport_changed:
+                room.state = TransportState.STOPPED
+                self._send_playback(room, full=True)
+            raise ExternalServiceException(
+                f"{operation} speaker {speaker_id}",
+                "the speaker answered UPnP error 711 (Illegal seek target)",
+            )
+        room.position = 1
+        room.state = TransportState.PLAYING
+        self._send_playback(
+            room, full=transport_changed, via=TransportState.TRANSITIONING
+        )
+
     def read_picture(self, speaker_id: str, picture: str) -> bytes:
         self._coordinator(speaker_id, "read the picture served by")
         # A speaker serves /getaa for the address it is given, whatever plays.
@@ -680,6 +785,46 @@ class FakeSonosClient(SonosClient):
                 f"the speaker answered UPnP error {refusal}",
             )
         return room
+
+    def _add(self, speaker_id: str, operation: str, items: Sequence[PlexItem]) -> None:
+        """Append the tracks the Plex service serves for the items' containers."""
+        room = self._coordinator(speaker_id, operation)
+        described = f"{operation} speaker {speaker_id}"
+        if not self.plex_linked:
+            raise ExternalServiceException(
+                described, "the speaker lists no Plex service"
+            )
+        tracks: list[Track] = []
+        for item in items:
+            served = (
+                self._plex.served_tracks(item.kind, item.rating_key)
+                if item.machine_identifier == MACHINE_IDENTIFIER
+                else None
+            )
+            if served is None:
+                # As the Garage answered a container of no item of the library.
+                raise ExternalServiceException(
+                    described, "the speaker answered UPnP error 800"
+                )
+            tracks.extend(_entry(item, track) for track in served)
+        if len(tracks) > CONTAINER_LIMIT:
+            raise ExternalServiceException(
+                described, "the speaker answered UPnP error 800"
+            )
+        normal = range(len(room.queue), len(room.queue) + len(tracks))
+        for track, index in zip(tracks, normal, strict=True):
+            # In play order, what is added while shuffle is on lands anywhere
+            # after the current track.
+            place = (
+                self._random.randint(room.position, len(room.queue))
+                if room.shuffle
+                else len(room.queue)
+            )
+            room.queue.insert(place, track)
+            room.normal.insert(place, index)
+        if tracks and not room.position:
+            room.position = 1
+        self._send_playback(room)
 
     def _members(self, coordinator: _Room) -> list[_Room]:
         return [
@@ -854,9 +999,7 @@ class FakeSonosClient(SonosClient):
 
     def _send_track_change(self, room: _Room) -> None:
         playing = room.state is TransportState.PLAYING
-        self._send_playback(
-            room, via=TransportState.TRANSITIONING if playing else None
-        )
+        self._send_playback(room, via=TransportState.TRANSITIONING if playing else None)
 
     def _send_group_volume(self, coordinator: _Room) -> None:
         group = self._group_volume(coordinator)
@@ -875,9 +1018,7 @@ class FakeSonosClient(SonosClient):
                 and subscription.service is SonosService.ZONE_GROUP_TOPOLOGY
             ):
                 event = HouseholdChanged(subscription.speaker_id, household)
-                self._enqueue(
-                    lambda s=subscription, e=event: self._deliver_to(s, e)
-                )
+                self._enqueue(lambda s=subscription, e=event: self._deliver_to(s, e))
 
     def _send(
         self, speaker_id: str, event: SonosEvent, service: SonosService | None = None

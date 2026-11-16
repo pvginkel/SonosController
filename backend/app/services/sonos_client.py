@@ -2,9 +2,9 @@
 
 ``SonosClient`` is what the rest of the backend sees: the household's layout,
 a room's and its group's state, the transport, volume and group commands,
-the speakers' event subscriptions and the picture a speaker serves for what
-it plays. ``SoCoSonosClient`` implements it on SoCo, and this is the only module
-that imports SoCo. pytest overrides the container's provider with an in-memory
+a group's queue, the speakers' event subscriptions and the picture a speaker
+serves for what it plays. ``SoCoSonosClient`` implements it on SoCo, and this
+is the only module that imports SoCo. pytest overrides the container's provider with an in-memory
 fake of the same base class.
 
 A room is addressed by its Sonos id (``RINCON_…``), the id of its one visible
@@ -17,11 +17,13 @@ import queue
 import re
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, StrEnum
 from typing import Any
+from urllib.parse import quote
+from xml.etree import ElementTree
 from xml.etree.ElementTree import ParseError
 
 import requests
@@ -29,7 +31,14 @@ import soco.config
 import soco.events
 from soco import SoCo
 from soco.core import PLAY_MODES
-from soco.data_structures import DidlObject
+from soco.data_structures import (
+    DidlMusicAlbum,
+    DidlMusicArtist,
+    DidlMusicTrack,
+    DidlObject,
+    DidlPlaylistContainer,
+    to_didl_string,
+)
 from soco.data_structures_entry import from_didl_string
 from soco.exceptions import SoCoException, SoCoUPnPException
 
@@ -99,7 +108,8 @@ class Household:
 
 @dataclass(frozen=True)
 class Track:
-    """The track a transport has loaded, as its metadata gives it.
+    """The track a transport has loaded, or an entry of a queue, as its
+    metadata gives it.
 
     A text the metadata lacks is empty. ``stream_content`` is what a radio
     stream reports as playing; ``picture`` is the address of the picture the
@@ -132,6 +142,42 @@ class Playback:
     queue_position: int
     queue_length: int
     track: Track | None
+
+
+@dataclass(frozen=True)
+class QueuePage:
+    """Entries of a group's queue, as the speaker presents them, and the
+    number of entries the queue holds."""
+
+    tracks: tuple[Track, ...]
+    total: int
+
+
+class PlexItemKind(StrEnum):
+    """A kind of item of the Plex library, in the Plex service's words."""
+
+    TRACK = "track"
+    ALBUM = "album"
+    ARTIST = "artist"
+    PLAYLIST = "playlist"
+
+
+@dataclass(frozen=True)
+class PlexItem:
+    """An item of the Plex library, as the Plex service linked in Sonos
+    queues it: by the machine identifier of the Plex server, the section id
+    of its music library and the item's rating key."""
+
+    kind: PlexItemKind
+    machine_identifier: str
+    section_id: str
+    rating_key: str
+    title: str
+
+
+# The items one add_many_to_queue() takes: what one AddMultipleURIsToQueue
+# takes (docs/api-design.md section 1.3).
+ADD_MANY_LIMIT = 16
 
 
 @dataclass(frozen=True)
@@ -229,9 +275,9 @@ class SonosClient(ABC):
     Every method that reaches a speaker raises ``ExternalServiceException``
     when the speaker fails, does not answer, or is not in the household. Its
     message names no address: a ``502`` carries it to the API's clients.
-    Playback is a group's: a transport read or command for a room goes to the
-    coordinator of the room's group. A join or a leave goes to the room that
-    moves.
+    Playback and the queue are a group's: a transport or queue read or
+    command for a room goes to the coordinator of the room's group. A join or
+    a leave goes to the room that moves.
 
     A transport command (``play``, ``pause``, ``stop``, ``next``,
     ``previous``) that the speaker refuses because it does not allow the
@@ -331,6 +377,43 @@ class SonosClient(ABC):
         """Make the room leave its group and play alone."""
 
     @abstractmethod
+    def read_queue(self, speaker_id: str, offset: int, limit: int) -> QueuePage:
+        """At most ``limit`` entries of the group's queue from the 0-based
+        ``offset``, and its size.
+
+        The entries are in the order the speaker presents them: with shuffle
+        on, the order in which they play.
+        """
+
+    @abstractmethod
+    def clear_queue(self, speaker_id: str) -> None:
+        """Empty the group's queue."""
+
+    @abstractmethod
+    def set_shuffle(self, speaker_id: str, shuffle: bool) -> None:
+        """Set the group's play mode: shuffle without repeat, or normal."""
+
+    @abstractmethod
+    def add_to_queue(self, speaker_id: str, item: PlexItem) -> None:
+        """Append an item of the Plex library to the group's queue, as one
+        container of the Plex service linked in Sonos: the speaker fetches
+        its tracks from the service.
+
+        A container the speaker cannot fetch in time is refused, and nothing
+        of it is queued.
+        """
+
+    @abstractmethod
+    def add_many_to_queue(self, speaker_id: str, items: Sequence[PlexItem]) -> None:
+        """Append 1 to ``ADD_MANY_LIMIT`` items of the Plex library to the
+        group's queue in one call to the speaker, each as ``add_to_queue()``
+        queues it."""
+
+    @abstractmethod
+    def play_from_start(self, speaker_id: str) -> None:
+        """Play the group's queue from its first track."""
+
+    @abstractmethod
     def read_picture(self, speaker_id: str, picture: str) -> bytes:
         """The picture at a ``Track.picture`` of the room's group, as served."""
 
@@ -377,12 +460,35 @@ _SEED_TIMEOUT_SECONDS = 2.0
 # so a seed that answers is reached after every seed that does not.
 _READINESS_SECONDS = 0.5
 
+# The speaker answers a container it cannot fetch in time with UPnP error
+# 800 after about 10 seconds (docs/api-design.md section 1.6): a queueing
+# call waits past that.
+_QUEUE_TIMEOUT_SECONDS = 20.0
+
 _INSTANCE = [("InstanceID", 0)]
 _DURATION = re.compile(r"(\d+):(\d\d):(\d\d)")
 
+# The name the Plex service has in a speaker's ListAvailableServices.
+_PLEX_SERVICE = "Plex"
+# The Plex service's prefix of a container's id, and the DIDL class of its
+# metadata, by the kind of item (docs/api-design.md section 1.3).
+_PLEX_PREFIXES = {
+    PlexItemKind.TRACK: "10036020",
+    PlexItemKind.ALBUM: "1004206c",
+    PlexItemKind.ARTIST: "1005004c",
+    PlexItemKind.PLAYLIST: "1006206c",
+}
+_PLEX_CLASSES: dict[PlexItemKind, type[DidlObject]] = {
+    PlexItemKind.TRACK: DidlMusicTrack,
+    PlexItemKind.ALBUM: DidlMusicAlbum,
+    PlexItemKind.ARTIST: DidlMusicArtist,
+    PlexItemKind.PLAYLIST: DidlPlaylistContainer,
+}
+
 
 class _HouseholdError(Exception):
-    """No seed answers, or the household has no such room."""
+    """No seed answers, the household has no such room, or a speaker lists no
+    Plex service."""
 
 
 _SPEAKER_ERRORS = (
@@ -569,6 +675,78 @@ class SoCoSonosClient(SonosClient):
     def unjoin(self, speaker_id: str) -> None:
         with _speaker_call(f"ungroup speaker {speaker_id}"):
             self._room(speaker_id).unjoin()
+
+    def read_queue(self, speaker_id: str, offset: int, limit: int) -> QueuePage:
+        with _speaker_call(f"read the queue of speaker {speaker_id}"):
+            queue = self._coordinator(speaker_id).get_queue(
+                start=offset, max_items=limit
+            )
+            return QueuePage(
+                tracks=tuple(_queue_entry(item) for item in queue),
+                total=int(queue.total_matches),
+            )
+
+    def clear_queue(self, speaker_id: str) -> None:
+        with _speaker_call(f"clear the queue of speaker {speaker_id}"):
+            self._coordinator(speaker_id).clear_queue()
+
+    def set_shuffle(self, speaker_id: str, shuffle: bool) -> None:
+        with _speaker_call(f"set the play mode of speaker {speaker_id}"):
+            self._coordinator(speaker_id).play_mode = (
+                "SHUFFLE_NOREPEAT" if shuffle else "NORMAL"
+            )
+
+    def add_to_queue(self, speaker_id: str, item: PlexItem) -> None:
+        with _speaker_call(
+            f"add Plex {item.kind} {item.rating_key} to the queue of speaker {speaker_id}"
+        ):
+            coordinator = self._coordinator(speaker_id)
+            uri, metadata = _plex_container(item, _plex_service_id(coordinator))
+            coordinator.avTransport.AddURIToQueue(
+                [
+                    ("InstanceID", 0),
+                    ("EnqueuedURI", uri),
+                    ("EnqueuedURIMetaData", metadata),
+                    ("DesiredFirstTrackNumberEnqueued", 0),
+                    ("EnqueueAsNext", 0),
+                ],
+                timeout=_QUEUE_TIMEOUT_SECONDS,
+            )
+
+    def add_many_to_queue(self, speaker_id: str, items: Sequence[PlexItem]) -> None:
+        if not 1 <= len(items) <= ADD_MANY_LIMIT:
+            raise ValueError(
+                f"add_many_to_queue() takes 1 to {ADD_MANY_LIMIT} items, not {len(items)}"
+            )
+        with _speaker_call(
+            f"add {len(items)} Plex items to the queue of speaker {speaker_id}"
+        ):
+            coordinator = self._coordinator(speaker_id)
+            service_id = _plex_service_id(coordinator)
+            containers = [_plex_container(item, service_id) for item in items]
+            # Joined with plain spaces: encoded ones in the metadata make the
+            # speaker drop every title (docs/api-design.md section 1.3).
+            coordinator.avTransport.AddMultipleURIsToQueue(
+                [
+                    ("InstanceID", 0),
+                    ("UpdateID", 0),
+                    ("NumberOfURIs", len(items)),
+                    ("EnqueuedURIs", " ".join(uri for uri, _ in containers)),
+                    (
+                        "EnqueuedURIsMetaData",
+                        " ".join(metadata for _, metadata in containers),
+                    ),
+                    ("ContainerURI", ""),
+                    ("ContainerMetaData", ""),
+                    ("DesiredFirstTrackNumberEnqueued", 0),
+                    ("EnqueueAsNext", 0),
+                ],
+                timeout=_QUEUE_TIMEOUT_SECONDS,
+            )
+
+    def play_from_start(self, speaker_id: str) -> None:
+        with _speaker_call(f"play from the first track on speaker {speaker_id}"):
+            self._coordinator(speaker_id).play_from_queue(0)
 
     def read_picture(self, speaker_id: str, picture: str) -> bytes:
         with _speaker_call(f"read the picture speaker {speaker_id} serves"):
@@ -808,6 +986,41 @@ def _household(device: Any) -> Household:
     )
 
 
+def _plex_service_id(device: Any) -> str:
+    """The id of the Plex service among those the speaker lists."""
+    answer = device.musicServices.ListAvailableServices()
+    services = ElementTree.fromstring(answer["AvailableServiceDescriptorList"])
+    for service in services.iter("Service"):
+        if service.get("Name") == _PLEX_SERVICE:
+            return str(service.attrib["Id"])
+    raise _HouseholdError("the speaker lists no Plex service")
+
+
+def _plex_container(item: PlexItem, service_id: str) -> tuple[str, str]:
+    """The address and the metadata of an item as a container of the Plex
+    service. Neither carries the Plex token: the speaker has the account."""
+    item_id = _PLEX_PREFIXES[item.kind] + quote(
+        f"{item.machine_identifier}:{item.section_id}:{item.rating_key}:{item.kind}"
+    )
+    # The service's type as the speaker's account tokens name it.
+    service_type = int(service_id) * 256 + 7
+    metadata = _PLEX_CLASSES[item.kind](
+        title=item.title,
+        parent_id=item_id,
+        item_id=item_id,
+        desc=f"SA_RINCON{service_type}_X_#Svc{service_type}-0-Token",
+    )
+    return (
+        f"x-rincon-cpcontainer:{item_id}?sid={service_id}&flags=8300&sn=0",
+        to_didl_string(metadata),
+    )
+
+
+def _queue_entry(item: DidlObject) -> Track:
+    resource = item.resources[0]
+    return _described_track(item, resource.uri, resource.duration or "")
+
+
 def _didl(metadata: str) -> DidlObject | None:
     """The object of a metadata document; None where the speaker gives none."""
     if not metadata.startswith("<DIDL-Lite"):
@@ -821,8 +1034,10 @@ def _title(metadata: DidlObject | None) -> str:
 
 
 def _track(metadata: DidlObject | None, uri: str, duration: str) -> Track | None:
-    if metadata is None:
-        return None
+    return None if metadata is None else _described_track(metadata, uri, duration)
+
+
+def _described_track(metadata: DidlObject, uri: str, duration: str) -> Track:
     fields = metadata.to_dict()
     return Track(
         title=str(fields.get("title") or ""),
