@@ -154,6 +154,11 @@ class _FakeSubscription(SonosSubscription):
             f"{self.speaker_id}",
         )
 
+    @property
+    def lease_seconds(self) -> int:
+        # What a speaker grants the real client.
+        return 300
+
 
 class FakeSonosClient(SonosClient):
     """A household in memory."""

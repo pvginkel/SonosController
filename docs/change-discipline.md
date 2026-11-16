@@ -79,7 +79,12 @@ never a skip (TEST-2). `docs/slice-test-plan.md`, step 3, has how it is run.
 Live rules, standing for every session: use the **Garage** speaker only, at low volume, and leave its
 queue, position, volume and grouping as found. **Zitkuil** (a room of three devices) is a living
 space and is never touched. The Plex token reaches the environment as `LIVE_PLEX_TOKEN`: never print
-it, test presence with `[ -n "${LIVE_PLEX_TOKEN:+x}" ]`.
+it, test presence with `[ -n "${LIVE_PLEX_TOKEN:+x}" ]`. A session that subscribes to a speaker's
+events unsubscribes before it ends, and a probe that subscribes other than through the app's Sonos
+client asks a lease of minutes (SoCo's `requested_timeout`, UPnP's `TIMEOUT: Second-300`). A
+subscription left behind whose callback no longer answers holds up the speaker's notifications to
+every subscriber, prd's backend included, until its lease runs out, 24 hours when none is asked;
+the speaker then refuses its `UNSUBSCRIBE` (`docs/api-design.md` 1.1).
 
 ## Never hand-edit generated artifacts
 

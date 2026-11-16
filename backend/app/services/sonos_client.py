@@ -216,6 +216,12 @@ class SonosSubscription(ABC):
     def unsubscribe(self) -> None:
         """End the subscription. Its handlers are not called after this returns."""
 
+    @property
+    @abstractmethod
+    def lease_seconds(self) -> int:
+        """How long the speaker holds the subscription without a renewal, as
+        it granted it."""
+
 
 class SonosClient(ABC):
     """What the backend asks of the speakers.
@@ -341,6 +347,13 @@ _SOCO_SERVICES = {
 }
 
 _REQUEST_TIMEOUT_SECONDS = 5.0
+# The lease asked for a subscription; SoCo renews it at 85%. A subscription
+# whose callback stopped answering (a killed process, a stopped environment)
+# holds up the speaker's notifications to every subscriber, seconds to tens of
+# seconds on and off, until its lease runs out: 24 hours when none is asked.
+# Once a delivery to it has failed, the speaker refuses its UNSUBSCRIBE with
+# 412, so only the lease ends it.
+_SUBSCRIPTION_LEASE_SECONDS = 300
 _SEED_TIMEOUT_SECONDS = 2.0
 _READINESS_TIMEOUT_SECONDS = 1.0
 
@@ -394,6 +407,10 @@ class _SoCoSubscription(SonosSubscription):
         self._client._forget(self._subscription.sid)
         with _speaker_call(f"end the subscription to {self._described}"):
             self._subscription.unsubscribe()
+
+    @property
+    def lease_seconds(self) -> int:
+        return int(self._subscription.timeout)
 
 
 class SoCoSonosClient(SonosClient):
@@ -547,7 +564,9 @@ class SoCoSonosClient(SonosClient):
             # subscription when it takes that event.
             with self._lock:
                 subscription = getattr(device, _SOCO_SERVICES[service]).subscribe(
-                    auto_renew=True, event_queue=self._events
+                    requested_timeout=_SUBSCRIPTION_LEASE_SECONDS,
+                    auto_renew=True,
+                    event_queue=self._events,
                 )
                 sid = subscription.sid
                 self._subscriptions[sid] = _Subscribed(

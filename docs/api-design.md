@@ -53,7 +53,16 @@ delivered their first event at once and kept delivering for the whole test sessi
 
 What follows from the detail:
 
-- **The speaker grants 24 hours** (`Second-86400`) whatever is asked. SoCo renews at 85% of that.
+- **The speaker grants the lease asked**, and 24 hours (`Second-86400`) when none is asked. SoCo
+  renews at 85% of it. The backend asks 5 minutes, for the reason below.
+- **A subscription whose callback no longer answers holds up the speaker's notifications to every
+  subscriber, until its lease runs out.** With one such subscription in place, the callback of a
+  stopped KubeCoder environment, about a third of the Garage's volume changes reached the backend
+  2.5 to 15 s late, on and off, and the rest at once; the delays ended with its lease. Once a
+  delivery to it has failed, the speaker answers its `UNSUBSCRIBE` with 412 and keeps it. So only
+  the lease ends a subscription its subscriber left behind (a killed process, a stopped
+  environment): the backend asks 5 minutes, and a session that subscribes unsubscribes before it
+  ends (`docs/change-discipline.md`, the live rules).
 - **SoCo advertises the port it binds.** It has an advertised address (`EVENT_ADVERTISE_IP`, which
   also takes a name) but no advertised port. So the Service's port and the container's port are
   the same number, 1400.
@@ -753,7 +762,7 @@ configuration, the token in its secret.
   the leaving room's queue holds afterwards.
 - **A favourite across a rescan** (1.8): the lookup by `guid` is proven; that a `guid` survives a
   rescan is from Plex's forum, not from a rescan of this library.
-- **A subscription across a day** on the real speakers: renewal after 24 hours, a speaker that
+- **A subscription across a day** on the real speakers: renewals for a day, a speaker that
   restarts, and a speaker whose address changes were not waited for. The healing in section 2 is
   built for them, and the suite shows each case on the in-memory fake of the Sonos client.
 - **A speaker's own picture** (1.9) has not gone through the artwork endpoint on a real speaker:

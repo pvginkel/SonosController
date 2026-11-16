@@ -326,6 +326,24 @@ class TestLiveSubscriptions:
         assert layout == HouseholdChanged(garage, sonos.read_household())
         assert listener.lost == 0
 
+    def test_the_speaker_grants_a_lease_of_minutes(self, sonos, garage):
+        # A subscription left behind whose callback does not answer holds up
+        # the speaker's notifications to every subscriber until its lease runs
+        # out: 24 hours when none is asked.
+        listener = _Listener()
+        subscription = sonos.subscribe(
+            garage, SonosService.RENDERING_CONTROL, listener.on_event, listener.on_lost
+        )
+        try:
+            lease = subscription.lease_seconds
+            subscription.renew()
+            renewed = subscription.lease_seconds
+        finally:
+            subscription.unsubscribe()
+
+        assert lease == 300
+        assert renewed == 300
+
     def test_a_subscription_delivers_changes_and_renews(self, sonos, garage, quiet):
         listener = _Listener()
         subscription = sonos.subscribe(
@@ -371,12 +389,14 @@ class TestLiveSubscriptions:
             sonos.play(garage)
             listener.take(lambda e: e.transport_state is TransportState.PLAYING)
         finally:
-            sonos.stop(garage)
-            stopped = listener.take(
-                lambda e: e.transport_state is TransportState.STOPPED
-                and e.transport_uri is None
-            )
-            subscription.unsubscribe()
+            try:
+                sonos.stop(garage)
+                stopped = listener.take(
+                    lambda e: e.transport_state is TransportState.STOPPED
+                    and e.transport_uri is None
+                )
+            finally:
+                subscription.unsubscribe()
         # A partial event: the track and its place, and no actions.
         assert stopped.actions is None
         assert stopped.track == sonos.read_playback(garage).track
