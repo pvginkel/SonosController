@@ -2,6 +2,7 @@
 
 import logging
 import time
+from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
@@ -19,7 +20,15 @@ from app.schemas.favourite_schema import FavouriteListQuerySchema
 from app.schemas.library_schema import PlaylistListQuerySchema
 from app.services.container import ServiceContainer
 from app.services.favourite_service import FavouriteService, ServedFavourite
+from app.utils.after_commit import (
+    clear_after_commit_callbacks,
+    run_after_commit_callbacks,
+)
 from tests.fakes.plex_client import FakePlexClient
+
+# What a change of the favourites sends leaves no event behind for a later
+# test's connections.
+pytestmark = pytest.mark.usefixtures("sender")
 
 RADIOHEAD = "5001"
 BJORK = "5002"
@@ -49,6 +58,8 @@ SIGUR_ROS_COMPOSED = "Sigur R\u00f3s"
 # Small pictures: the fake's default ones are large (card SCTL-14).
 SMALL = (16, 16)
 
+CHANGED = {"type": "favourites_changed", "payload": {}}
+
 
 @pytest.fixture
 def library(plex: FakePlexClient) -> FakePlexClient:
@@ -72,8 +83,22 @@ def library(plex: FakePlexClient) -> FakePlexClient:
 
 
 @pytest.fixture
-def service(container: ServiceContainer) -> FavouriteService:
-    return container.favourite_service()
+def service(container: ServiceContainer) -> Generator[FavouriteService]:
+    """The container's favourite service, on the test's session. What its
+    calls left to run after a commit is dropped after the test: off a
+    request, no teardown drops it."""
+    try:
+        yield container.favourite_service()
+    finally:
+        clear_after_commit_callbacks()
+
+
+def commit(session: Session) -> None:
+    """Commit as a request's teardown does: the session, then what waits for
+    its commit."""
+    session.commit()
+    run_after_commit_callbacks()
+    clear_after_commit_callbacks()
 
 
 def stored(session: Session) -> list[tuple[object, ...]]:
@@ -849,7 +874,11 @@ class TestMarkingAtOnce:
                 )
             )
             first.flush()
-            service = FavouriteService(db_session=second, plex_client=committed_plex)
+            service = FavouriteService(
+                db_session=second,
+                plex_client=committed_plex,
+                event_sender=committed_app.container.event_sender(),
+            )
 
             marking = aside.submit(service.mark, ItemKind.ARTIST, RADIOHEAD)
             wait_until_a_query_waits_for_a_lock(engine)
@@ -863,3 +892,132 @@ class TestMarkingAtOnce:
         finally:
             first.close()
             second.close()
+
+
+class TestFavouritesChanged:
+    """A change of the store is announced, as ``favourites_changed``, once
+    its transaction has committed (``docs/api-design.md`` section 4). A test
+    puts what it starts from in the store itself, so that no event of its
+    own making waits to be sent when it connects."""
+
+    def test_a_mark_that_made_a_favourite_is_announced_once_committed(
+        self, service, session, library, connect
+    ):
+        stream = connect()
+
+        _, created = service.mark(ItemKind.ARTIST, RADIOHEAD)
+
+        assert created
+        assert stream.events() == []
+        commit(session)
+        assert stream.events() == [CHANGED]
+
+    def test_an_unmark_is_announced_once_committed(
+        self, service, session, library, connect
+    ):
+        favourite = store(session, ItemKind.ARTIST, RADIOHEAD, "Radiohead")
+        stream = connect()
+
+        service.unmark(favourite.id)
+
+        assert stream.events() == []
+        commit(session)
+        assert stream.events() == [CHANGED]
+
+    @pytest.mark.parametrize(
+        "rating_key", [AMNESIAC, AMNESIAC_AGAIN], ids=["the item", "its other copy"]
+    )
+    def test_a_mark_answered_with_its_favourite_is_not_announced(
+        self, service, session, library, connect, rating_key
+    ):
+        store(
+            session,
+            ItemKind.ALBUM,
+            AMNESIAC,
+            "Amnesiac",
+            guid=AMNESIAC_GUID,
+            artist_title="Radiohead",
+        )
+        stream = connect()
+
+        _, created = service.mark(ItemKind.ALBUM, rating_key)
+        commit(session)
+
+        assert not created
+        assert stream.events() == []
+
+    def test_a_mark_or_an_unmark_that_failed_is_not_announced(
+        self, service, session, library, connect
+    ):
+        stream = connect()
+
+        with pytest.raises(ItemNotFoundException):
+            service.mark(ItemKind.ALBUM, TRACK)
+        with pytest.raises(RecordNotFoundException):
+            service.unmark(2**31 - 1)
+        library.reachable = False
+        with pytest.raises(ExternalServiceException):
+            service.mark(ItemKind.ARTIST, RADIOHEAD)
+        commit(session)
+
+        assert stream.events() == []
+
+    def test_a_listing_that_brought_favourites_up_to_date_is_announced_once(
+        self, service, session, library, connect
+    ):
+        store(session, ItemKind.ARTIST, RADIOHEAD, "Radiohead")
+        store(session, ItemKind.PLAYLIST, ROAD_TRIP, "Road trip")
+        library.move(RADIOHEAD, MOVED)
+        library.move(ROAD_TRIP, "5902")
+        stream = connect()
+
+        service.list_favourites(query())
+
+        assert stream.events() == []
+        commit(session)
+        assert stream.events() == [CHANGED]
+        # The listing made in answer finds both at their rating keys.
+        listed, _ = service.list_favourites(query())
+        commit(session)
+        assert [favourite.item_id for favourite in listed] == [MOVED, "5902"]
+        assert stream.events() == []
+
+    def test_a_listing_that_removed_a_second_mark_of_an_item_is_announced(
+        self, service, session, library, connect
+    ):
+        store(session, ItemKind.ARTIST, "9999", "Radiohead", guid="local://9999")
+        store(session, ItemKind.ARTIST, RADIOHEAD, "Radiohead")
+        stream = connect()
+
+        listed, total = service.list_favourites(query())
+        commit(session)
+
+        assert (len(listed), total) == (1, 1)
+        assert stream.events() == [CHANGED]
+
+    def test_a_listing_that_changed_nothing_is_not_announced(
+        self, service, session, library, connect
+    ):
+        # At its rating key; and found nowhere.
+        store(session, ItemKind.ARTIST, RADIOHEAD, "Radiohead")
+        store(session, ItemKind.ALBUM, "9999", "Vespertine", artist_title="Björk")
+        stream = connect()
+
+        listed, _ = service.list_favourites(query())
+        commit(session)
+
+        assert [favourite.available for favourite in listed] == [True, False]
+        assert stream.events() == []
+
+    def test_a_listing_while_plex_fails_is_not_announced(
+        self, service, session, library, connect
+    ):
+        store(session, ItemKind.ARTIST, RADIOHEAD, "Radiohead")
+        library.move(RADIOHEAD, MOVED)
+        library.reachable = False
+        stream = connect()
+
+        service.list_favourites(query())
+        commit(session)
+
+        assert stream.events() == []

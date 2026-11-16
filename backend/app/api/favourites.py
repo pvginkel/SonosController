@@ -41,7 +41,8 @@ def list_favourites(
     A favourite is `available` when Plex has its item. One whose item Plex
     has moved, as a rescan may, is found again by the item's guid or its
     titles and listed where the item is now; where another favourite marks
-    that item, the one marked later is removed. One whose item Plex does
+    that item, the one marked later is removed. Such a change is announced
+    on the event stream as `favourites_changed`. One whose item Plex does
     not have is listed with its title and subtitle, without `item_id` and
     `artwork_id`, and is kept. While Plex fails the favourites are still
     listed, none of them `available`.
@@ -89,7 +90,8 @@ def mark_favourite(
     The item is read from Plex as it is at this request. Marking an item
     that is marked already is no error, so that two clients may mark one
     item at once: the answer is the favourite that marks it. The two copies
-    of a release the library holds twice share one favourite.
+    of a release the library holds twice share one favourite. A new
+    favourite is announced on the event stream as `favourites_changed`.
     """
     marking = FavouriteRequestSchema.model_validate(request.get_json())
     favourite, created = favourite_service.mark(ItemKind(marking.kind), marking.item_id)
@@ -113,6 +115,9 @@ def unmark_favourite(
     favourite_id: int,
     favourite_service: FavouriteService = Provide[ServiceContainer.favourite_service],
 ) -> tuple[str, int]:
-    """Remove a favourite: the mark on its item. Plex is not asked."""
+    """Remove a favourite: the mark on its item. Plex is not asked.
+
+    The removal is announced on the event stream as `favourites_changed`.
+    """
     favourite_service.unmark(favourite_id)
     return "", 204

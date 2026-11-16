@@ -35,7 +35,7 @@ from flask import Flask
 
 from app.app_config import AppSettings
 from app.services.artwork_service import ArtworkService
-from app.services.event_sender import COALESCE_SECONDS
+from app.services.event_sender import COALESCE_SECONDS, EventSender
 from app.services.household_mirror import CHECK_SECONDS, HouseholdMirror
 from app.services.sse_connection_manager import SSEConnection
 from app.services.task_service import TaskService
@@ -208,6 +208,24 @@ def mirror(
         coordinator.unregister_lifecycle_notification(mirror._on_lifecycle_event)
         coordinator.unregister_lifecycle_notification(sender._on_lifecycle_event)
         container.household_mirror.reset()
+        container.event_sender.reset()
+
+
+@pytest.fixture
+def sender(app: Flask) -> Generator[EventSender]:
+    """The container's event sender, one of its own for the test, stopped
+    after it: no event it holds back reaches a later test's connections. A
+    test that sends the app's events without the mirror uses it."""
+    container = app.container
+    container.event_sender.reset()
+    sender = container.event_sender()
+    try:
+        yield sender
+    finally:
+        sender.stop()
+        container.lifecycle_coordinator().unregister_lifecycle_notification(
+            sender._on_lifecycle_event
+        )
         container.event_sender.reset()
 
 

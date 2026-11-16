@@ -102,6 +102,24 @@ class QueueChangedEvent(BaseModel):
     payload: SpeakerPayload = Field(description="The speaker whose queue changed.")
 
 
+class FavouritesChangedEvent(BaseModel):
+    """The favourites changed: one was marked or unmarked, or a listing found
+    one whose item Plex had moved and brought it up to date, or removed it
+    as a second mark of that item. A client that shows the favourites
+    fetches `GET /api/favourites`.
+    """
+
+    model_config = _EVENT
+
+    type: Literal["favourites_changed"] = Field(
+        default="favourites_changed", description="The event's type."
+    )
+    payload: EmptyPayload = Field(
+        default_factory=EmptyPayload,
+        description="Empty: the event is about the favourites, not one speaker.",
+    )
+
+
 class TaskEventPayload(TaskEvent):
     """What a task reports: that it started, its progress, that it completed
     or that it failed."""
@@ -136,7 +154,11 @@ class TaskStreamEvent(BaseModel):
 
 
 _CHANGE_EVENTS = (
-    SpeakersChangedEvent | VolumeChangedEvent | PlaybackChangedEvent | QueueChangedEvent
+    SpeakersChangedEvent
+    | VolumeChangedEvent
+    | PlaybackChangedEvent
+    | QueueChangedEvent
+    | FavouritesChangedEvent
 )
 
 # What EventSender sends.

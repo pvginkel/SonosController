@@ -4,6 +4,10 @@ the Plex library (``docs/api-design.md`` sections 3.6 and 5).
 A favourite is the store's record of which item is meant; the item itself is
 read from Plex. What leaves here is ready to serve: every string is Unicode
 NFC, and a picture is the artwork id the library carries for the item.
+
+Every change to the store is announced to every client, as
+``favourites_changed``, once the transaction that made it has committed
+(section 4).
 """
 
 import logging
@@ -22,7 +26,10 @@ from app.database import scoped_savepoint
 from app.exceptions import ItemNotFoundException, RecordNotFoundException
 from app.models import Favourite, ItemKind
 from app.schemas.favourite_schema import FavouriteListQuerySchema
+from app.schemas.stream_event_schema import FavouritesChangedEvent
+from app.services.event_sender import EventSender
 from app.services.plex_client import PlexClient
+from app.utils.after_commit import after_commit
 from app.utils.artwork_id import plex_artwork_id
 from app.utils.pagination import apply_sorting
 from app.utils.plex_library import PlexAlbum, PlexArtist, PlexPlaylist
@@ -64,9 +71,12 @@ class ServedFavourite:
 class FavouriteService:
     """The favourites, kept in the store and shared by every client."""
 
-    def __init__(self, db_session: Session, plex_client: PlexClient) -> None:
+    def __init__(
+        self, db_session: Session, plex_client: PlexClient, event_sender: EventSender
+    ) -> None:
         self._db = db_session
         self._plex = plex_client
+        self._events = event_sender
 
     def list_favourites(
         self, query: FavouriteListQuerySchema
@@ -83,7 +93,8 @@ class FavouriteService:
         One found that way is brought up to date with its item's rating key,
         ``guid`` and titles, so that the next listing finds it at its rating
         key; and where another favourite marks that item, the one marked
-        first stays and the other is removed, and not listed. One found
+        first stays and the other is removed, and not listed. A listing that
+        brought one up to date or removed one is announced. One found
         nowhere is served as it is stored, not available, and kept.
 
         While Plex fails, the page is served from the store alone, none of it
@@ -129,7 +140,7 @@ class FavouriteService:
         item of a kind and ``guid``: the item marked already, or the other
         copy of a release the library holds twice, is answered with the
         favourite that marks it, as is a mark that meets another of the same
-        item stored first.
+        item stored first. Only a mark that made the favourite is announced.
 
         Raises:
             ItemNotFoundException: Plex has no item of this kind with this
@@ -162,10 +173,11 @@ class FavouriteService:
             # A mark of the item made at the same time committed first.
             stored_first = self._db.scalars(_marking(kind, item.guid)).one()
             return _served(stored_first, item), False
+        self._announce()
         return _served(favourite, item), True
 
     def unmark(self, favourite_id: int) -> None:
-        """Remove a favourite. Plex is not asked.
+        """Remove a favourite, and announce it. Plex is not asked.
 
         Raises:
             RecordNotFoundException: The store holds no favourite with this
@@ -181,6 +193,15 @@ class FavouriteService:
             is None
         ):
             raise RecordNotFoundException("Favourite", favourite_id)
+        self._announce()
+
+    def _announce(self) -> None:
+        """Send ``favourites_changed`` once this transaction has committed;
+        once, however many changes it holds."""
+        after_commit(self._send_favourites_changed)
+
+    def _send_favourites_changed(self) -> None:
+        self._events.send(FavouritesChangedEvent())
 
     def _look_for(
         self, page: Sequence[Favourite]
@@ -228,6 +249,7 @@ class FavouriteService:
         not, as a second mark of an item is answered with the favourite
         marked first.
         """
+        self._announce()
         # Statements, not the session's unit of work: a listing at the same
         # time may have changed or removed these rows, which the unit of work
         # refuses.

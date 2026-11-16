@@ -2,6 +2,7 @@
 store."""
 
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
@@ -13,7 +14,12 @@ from sqlalchemy.orm import Session
 from app.models import Favourite, ItemKind
 from app.services.artwork_service import ArtworkService
 from tests.api.documents import json_schema, schema_of, undescribed
+from tests.conftest import EventStream
 from tests.fakes.plex_client import FakePlexClient
+
+# What a change of the favourites sends leaves no event behind for a later
+# test's connections.
+pytestmark = pytest.mark.usefixtures("sender")
 
 FAVOURITES = "/api/favourites"
 FAVOURITE = "/api/favourites/{favourite_id}"
@@ -28,6 +34,8 @@ ROAD_TRIP = "5301"
 EMPTY = "5302"
 # Where Plex has an item it sees as new.
 MOVED = "5901"
+
+AMNESIAC_GUID = "plex://album/5d07amnesiac"
 
 # "Björk" as Plex may give it: the letter, then its accent.
 BJORK_DECOMPOSED = "Björk"
@@ -47,6 +55,8 @@ REFUSED_QUERIES = [
     "sort_by=kind",
     "sort_by=",
 ]
+
+CHANGED = {"type": "favourites_changed", "payload": {}}
 
 FIELDS = [
     "artwork_id",
@@ -73,7 +83,7 @@ def library(plex: FakePlexClient) -> FakePlexClient:
             size=SMALL,
             artist=RADIOHEAD,
             title="Amnesiac",
-            guid="plex://album/5d07amnesiac",
+            guid=AMNESIAC_GUID,
         )
     plex.add_track(AMNESIAC, TRACK)
     plex.add_album(HOMOGENIC, [], size=None, artist=BJORK, title="Homogenic")
@@ -137,6 +147,43 @@ def meta(total: int, sort_by: str = "created_at", **paging: object) -> dict:
 def unavailable(body: dict) -> dict:
     """A favourite as it is listed while its item cannot be given."""
     return body | {"item_id": None, "artwork_id": None, "available": False}
+
+
+def put(
+    session: Session,
+    kind: ItemKind,
+    rating_key: str,
+    title: str,
+    guid: str | None = None,
+    artist_title: str | None = None,
+) -> Favourite:
+    """A favourite put in the store as a mark would leave it, its guid the
+    fake's default for an item of its kind at this rating key, without the
+    mark's event."""
+    default_guid = {
+        ItemKind.ARTIST: f"plex://artist/{rating_key}",
+        ItemKind.ALBUM: f"plex://album/{rating_key}",
+        ItemKind.PLAYLIST: f"com.plexapp.agents.none://{rating_key}",
+    }[kind]
+    favourite = Favourite(
+        item_kind=kind,
+        guid=guid or default_guid,
+        rating_key=rating_key,
+        title=title,
+        artist_title=artist_title,
+    )
+    session.add(favourite)
+    session.flush()
+    return favourite
+
+
+def connect_to(app: Flask) -> EventStream:
+    """A connection to the event stream of an app other than the session's,
+    as the stream's route opens one; the app's disposal closes it."""
+    connection = app.container.sse_connection_manager().on_connect(
+        f"test-{uuid.uuid4()}", "local-user", local_admin=True
+    )
+    return EventStream(connection)
 
 
 class TestMarkFavourite:
@@ -534,6 +581,8 @@ class TestMarkingAtOnce:
 
         monkeypatch.setattr(committed_plex, "read_items", read_together)
 
+        stream = connect_to(committed_app)
+
         marks = [
             aside.submit(mark, committed_app.test_client(), "album", AMNESIAC)
             for _ in range(2)
@@ -544,6 +593,176 @@ class TestMarkingAtOnce:
         assert answers[0].get_json() == answers[1].get_json()
         with committed_app.container.session_maker()() as session:
             assert stored(session) == 1
+        # Only the mark that made the favourite changed the favourites.
+        assert stream.events() == [CHANGED]
+
+
+class TestFavouritesChanged:
+    """``favourites_changed``, sent to every connection for a request that
+    changed the favourites, once it has committed (``docs/api-design.md``
+    section 4). A test puts what it starts from in the store itself, so that
+    no event of its own making waits to be sent when it connects."""
+
+    def test_a_mark_that_made_a_favourite_is_sent_to_every_connection(
+        self, client, library, connect
+    ):
+        first, second = connect(), connect()
+
+        assert mark(client, "playlist", ROAD_TRIP).status_code == 201
+
+        assert first.events() == [CHANGED]
+        assert second.events() == [CHANGED]
+
+    def test_an_unmark_is_sent(self, client, session, library, connect):
+        marked = put(session, ItemKind.ARTIST, RADIOHEAD, "Radiohead")
+        stream = connect()
+
+        assert unmark(client, marked.id).status_code == 204
+
+        assert stream.events() == [CHANGED]
+
+    @pytest.mark.parametrize(
+        ("method", "path", "body", "status"),
+        [
+            pytest.param(
+                "post",
+                FAVOURITES,
+                {"kind": "album", "item_id": AMNESIAC},
+                200,
+                id="a mark of a marked item",
+            ),
+            pytest.param(
+                "post",
+                FAVOURITES,
+                {"kind": "album", "item_id": AMNESIAC_AGAIN},
+                200,
+                id="a mark of the other copy of a release",
+            ),
+            pytest.param(
+                "post",
+                FAVOURITES,
+                {"kind": "album", "item_id": TRACK},
+                404,
+                id="a mark of a track",
+            ),
+            pytest.param(
+                "post",
+                FAVOURITES,
+                {"kind": "album"},
+                400,
+                id="a mark without an item",
+            ),
+            pytest.param(
+                "delete",
+                FAVOURITE.format(favourite_id=2**31 - 1),
+                None,
+                404,
+                id="an unmark of an id the store does not hold",
+            ),
+            pytest.param(
+                "get",
+                FAVOURITES,
+                None,
+                200,
+                id="a listing that finds each at its rating key",
+            ),
+        ],
+    )
+    def test_a_request_that_changed_nothing_sends_nothing(
+        self, client, session, library, connect, method, path, body, status
+    ):
+        put(
+            session,
+            ItemKind.ALBUM,
+            AMNESIAC,
+            "Amnesiac",
+            guid=AMNESIAC_GUID,
+            artist_title="Radiohead",
+        )
+        stream = connect()
+
+        assert client.open(path, method=method, json=body).status_code == status
+
+        assert stream.events() == []
+
+    def test_a_mark_while_plex_does_not_answer_sends_nothing(
+        self, client, library, connect
+    ):
+        library.reachable = False
+        stream = connect()
+
+        assert mark(client, "artist", RADIOHEAD).status_code == 502
+
+        assert stream.events() == []
+
+    def test_a_listing_that_brought_favourites_up_to_date_is_sent_once(
+        self, client, session, library, connect
+    ):
+        put(session, ItemKind.ARTIST, RADIOHEAD, "Radiohead")
+        put(session, ItemKind.PLAYLIST, ROAD_TRIP, "Road trip")
+        library.move(RADIOHEAD, MOVED)
+        library.move(ROAD_TRIP, "5902")
+        stream = connect()
+
+        listed(client)
+
+        assert stream.events() == [CHANGED]
+        # The listing made in answer finds both where they are now.
+        assert [body["item_id"] for body in listed(client)] == [MOVED, "5902"]
+        assert stream.events() == []
+
+    def test_a_listing_that_removed_a_second_mark_of_an_item_is_sent(
+        self, client, session, library, connect
+    ):
+        put(session, ItemKind.ARTIST, "9999", "Radiohead", guid="local://9999")
+        put(session, ItemKind.ARTIST, RADIOHEAD, "Radiohead")
+        stream = connect()
+
+        listed(client)
+
+        assert stream.events() == [CHANGED]
+        assert stored(session) == 1
+
+    def test_a_listing_while_plex_does_not_answer_sends_nothing(
+        self, client, session, library, connect
+    ):
+        put(session, ItemKind.ARTIST, RADIOHEAD, "Radiohead")
+        library.move(RADIOHEAD, MOVED)
+        library.reachable = False
+        stream = connect()
+
+        listed(client)
+
+        assert stream.events() == []
+
+    def test_a_change_is_sent_once_it_is_committed(
+        self,
+        committed_app: Flask,
+        committed_plex: FakePlexClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        committed_plex.add_artist(RADIOHEAD, "Radiohead", size=None)
+        manager = committed_app.container.sse_connection_manager()
+        open_session = committed_app.container.session_maker()
+        send_event = manager.send_event
+        found: list[int] = []
+
+        def fetched_on_sending(*args, **kwargs):
+            # What a client that fetches on the event finds: the store as
+            # another connection to it sees it.
+            with open_session() as session:
+                found.append(stored(session))
+            send_event(*args, **kwargs)
+
+        monkeypatch.setattr(manager, "send_event", fetched_on_sending)
+        stream = connect_to(committed_app)
+        client = committed_app.test_client()
+
+        marked = mark(client, "artist", RADIOHEAD).get_json()
+        unmark(client, marked["id"])
+
+        assert stream.events() == [CHANGED, CHANGED]
+        assert found == [1, 0]
 
 
 class TestFavouritesDocument:
@@ -647,6 +866,17 @@ class TestFavouritesDocument:
         assert "marked already is no error" in description
         assert "two copies of a release" in description
         assert "track" in operation["responses"]["400"]["description"]
+
+    @pytest.mark.parametrize(
+        ("path", "method"),
+        [(FAVOURITES, "get"), (FAVOURITES, "post"), (FAVOURITE, "delete")],
+    )
+    def test_each_route_says_what_it_announces(self, openapi_document, path, method):
+        description = openapi_document["paths"][path][method]["description"]
+
+        assert "announced on the event stream as `favourites_changed`" in " ".join(
+            description.split()
+        )
 
     def test_marking_takes_a_described_item(self, openapi_document):
         body = openapi_document["paths"][FAVOURITES]["post"]["requestBody"]

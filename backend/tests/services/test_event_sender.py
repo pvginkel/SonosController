@@ -26,18 +26,6 @@ def volume_changed(speaker_id: str) -> VolumeChangedEvent:
     return VolumeChangedEvent(payload=SpeakerPayload(speaker_id=speaker_id))
 
 
-@pytest.fixture
-def sender(app):
-    """The container's event sender, one of its own for the test."""
-    app.container.event_sender.reset()
-    sender = app.container.event_sender()
-    try:
-        yield sender
-    finally:
-        sender.stop()
-        app.container.event_sender.reset()
-
-
 class TestEventSender:
     def test_an_event_is_an_unnamed_message_of_type_and_payload(self, sender, connect):
         stream = connect()

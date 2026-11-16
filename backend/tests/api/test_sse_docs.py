@@ -9,6 +9,7 @@ does.
 import pytest
 
 from app.schemas.stream_event_schema import (
+    FavouritesChangedEvent,
     PlaybackChangedEvent,
     QueueChangedEvent,
     SpeakerPayload,
@@ -63,14 +64,16 @@ class TestEventStreamDocument:
             "`volume_changed`",
             "`playback_changed`",
             "`queue_changed`",
+            "`favourites_changed`",
             "`task_event`",
         ]
         assert "`GET /api/speakers`" in rows[1]
         assert "`GET /api/speakers/{speaker_id}`" in rows[2]
         assert "`GET /api/speakers/{speaker_id}/playback`" in rows[3]
         assert "`GET /api/speakers/{speaker_id}/queue`" in rows[4]
-        assert "Nothing" in rows[5]
-        assert "`POST /api/speakers/{speaker_id}/queue`" in rows[5]
+        assert "`GET /api/favourites`" in rows[5]
+        assert "Nothing" in rows[6]
+        assert "`POST /api/speakers/{speaker_id}/queue`" in rows[6]
 
     def test_the_request_id_is_a_required_query_parameter(self, document):
         (parameter,) = document["paths"]["/api/sse/stream"]["get"]["parameters"]
@@ -89,32 +92,38 @@ class TestEventStreamDocument:
         assert message["description"]
         assert message["discriminator"]["propertyName"] == "type"
         assert sorted(message["discriminator"]["mapping"]) == [
+            "favourites_changed",
             "playback_changed",
             "queue_changed",
             "speakers_changed",
             "task_event",
             "volume_changed",
         ]
-        assert len(message["oneOf"]) == 5
+        assert len(message["oneOf"]) == 6
 
     @pytest.mark.parametrize(
-        ("event_type", "payload_properties"),
+        ("event_type", "payload_properties", "fetched"),
         [
-            ("speakers_changed", []),
-            ("volume_changed", ["speaker_id"]),
-            ("playback_changed", ["speaker_id"]),
-            ("queue_changed", ["speaker_id"]),
+            ("speakers_changed", [], "`GET /api/speakers`"),
+            ("volume_changed", ["speaker_id"], "`GET /api/speakers/{speaker_id}`"),
+            (
+                "playback_changed",
+                ["speaker_id"],
+                "`GET /api/speakers/{speaker_id}/playback`",
+            ),
+            ("queue_changed", ["speaker_id"], "`GET /api/speakers/{speaker_id}/queue`"),
+            ("favourites_changed", [], "`GET /api/favourites`"),
         ],
     )
     def test_each_event_has_its_payloads_schema_with_every_field_described(
-        self, document, event_type, payload_properties
+        self, document, event_type, payload_properties, fetched
     ):
         responses = document["paths"]["/api/sse/stream"]["get"]["responses"]
         message = schema(document, responses["200"]["content"]["text/event-stream"]["schema"])
         event = schema(document, {"$ref": message["discriminator"]["mapping"][event_type]})
 
         assert "A client" in event["description"]
-        assert "fetches `GET /api/speakers" in " ".join(event["description"].split())
+        assert f"fetches {fetched}" in " ".join(event["description"].split())
         assert sorted(event["required"]) == ["payload", "type"]
         assert event["properties"]["type"]["const"] == event_type
         assert event["properties"]["type"]["description"]
@@ -246,6 +255,27 @@ class TestEventStream:
             "task_completed",
         ]
         assert reported[1].data == {}
+
+    def test_a_change_of_the_favourites_is_sent_as_the_document_says(
+        self, client, plex, sender
+    ):
+        plex.add_artist("5001", "Radiohead", size=None)
+
+        response = client.get("/api/sse/stream?request_id=favourites", buffered=False)
+        try:
+            frames = response.iter_encoded()
+            assert next(frames) == b"event: ready\ndata:\n\n"
+            marked = client.post(
+                "/api/favourites", json={"kind": "artist", "item_id": "5001"}
+            )
+            assert marked.status_code == 201
+            frame = next(frames).decode()
+        finally:
+            response.close()
+
+        assert frame == 'data: {"type":"favourites_changed","payload":{}}\n\n'
+        event = StreamMessage.model_validate_json(frame.removeprefix("data: ")).root
+        assert event == FavouritesChangedEvent()
 
     def test_a_request_without_a_request_id_is_rejected_as_documented(self, client):
         response = client.get("/api/sse/stream")

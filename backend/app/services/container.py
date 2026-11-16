@@ -163,6 +163,7 @@ class ServiceContainer(containers.DeclarativeContainer):
         FavouriteService,
         db_session=db_session,
         plex_client=plex_client,
+        event_sender=event_sender,
     )
 
     # Speaker service - playback and volume commands to the speakers
