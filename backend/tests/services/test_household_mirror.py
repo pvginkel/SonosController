@@ -1939,6 +1939,28 @@ class TestHouseholdMirrorChecks:
         assert household.subscription_count(LOUNGE) == 5
         assert stream.events() == [speakers_changed()]
 
+    def test_a_group_whose_coordinator_does_not_answer_is_mirrored_once_it_leaves(
+        self, household, mirror, connect
+    ):
+        household.join(LOUNGE, GARAGE)
+        household.silence_room(GARAGE)
+        mirror.start()
+        stream = connect()
+        assert mirror.speakers() == []
+
+        household.remove_room(GARAGE)
+        eventually(lambda: len(mirror.speakers()) == 1)
+
+        assert mirror.speaker(LOUNGE).group == SpeakerGroup(
+            coordinator_id=LOUNGE, member_ids=(LOUNGE,), volume=40, muted=False
+        )
+        assert household.subscription_count(LOUNGE) == 5
+        assert stream.events() == [speakers_changed()]
+
+        household.set_volume(LOUNGE, 41)
+        household.settle()
+        assert mirror.speaker(LOUNGE).volume == 41
+
     def test_a_held_room_is_mirrored_again_once_the_coordinator_it_joined_answers(
         self, started, household
     ):
