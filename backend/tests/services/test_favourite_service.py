@@ -357,6 +357,24 @@ class TestListFavourites:
         assert (album.title, album.subtitle) == (HOMOGENIC_COMPOSED, BJORK_COMPOSED)
         assert all(favourite.available for favourite in listed)
 
+    def test_a_favourite_shows_the_titles_plex_gives_now_not_the_stored_ones(
+        self, service, session, library
+    ):
+        # Marked as "Homogenic" by "Bjork"; Plex has renamed the album and its
+        # artist since, at the same rating key and guid.
+        favourite = store(
+            session, ItemKind.ALBUM, HOMOGENIC, "Homogenic", artist_title="Bjork"
+        )
+
+        (listed,), _ = service.list_favourites(query())
+
+        assert (listed.id, listed.item_id, listed.available) == (
+            favourite.id,
+            HOMOGENIC,
+            True,
+        )
+        assert (listed.title, listed.subtitle) == (HOMOGENIC_COMPOSED, BJORK_COMPOSED)
+
     def test_a_playlist_carries_the_artwork_id_the_list_of_playlists_carries(
         self, service, container, library
     ):
