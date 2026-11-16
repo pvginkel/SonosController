@@ -8,6 +8,7 @@ what it refuses to ask, and a Plex that does not answer.
 
 import io
 import socket
+from datetime import date
 
 import pytest
 from PIL import Image
@@ -16,7 +17,13 @@ from app.app_config import AppSettings
 from app.core_exceptions import ExternalServiceException
 from app.services.health_service import CheckStatus
 from app.services.plex_client import PlexapiPlexClient
-from tests.fakes.plex_client import MACHINE_IDENTIFIER, FakePlexClient
+from app.utils.plex_library import PlexAlbum, PlexArtist, PlexPlaylist, PlexTrack
+from tests.fakes.plex_client import (
+    ARTIST,
+    MACHINE_IDENTIFIER,
+    SECTION_ID,
+    FakePlexClient,
+)
 
 ALBUM = "2001"
 TRACKS = ("2002", "2003", "2004")
@@ -25,8 +32,28 @@ OTHER_TRACK = "2102"
 BARE_ALBUM = "2201"
 BARE_TRACK = "2202"
 
+BEATLES = "3001"
+ABBA = "3002"
+BJORK = "3003"
+BARE_ARTIST = "3004"
+
+REVOLVER = "3101"
+HELP = "3102"
+ANTHOLOGY = "3103"
+BOOTLEG = "3104"
+DEMOS = "3105"
+ARRIVAL = "3106"
+
+REVOLVER_TRACKS = ("3201", "3202")
+ANTHOLOGY_TRACKS = ("3211", "3212", "3213", "3214", "3215")
+
+MIX = "3301"
+EMPTY = "3302"
+EVERYTHING = "3303"
+
 RED = (200, 60, 30)
 BLUE = (20, 40, 200)
+GREEN = (30, 160, 60)
 
 TOKEN = "a-token-no-failure-may-carry"
 
@@ -38,6 +65,63 @@ NOT_A_PICTURE = [
     "/library/metadata/2001",
     "/library/metadata/2001/thumb/1700000000?url=http://192.0.2.1/",
     "/library/metadata/2001/thumb/1700000000/../../../../identity",
+    "/playlists",
+    "/playlists/3301",
+    "/playlists/3301/composite",
+    "/playlists/abc/composite/1700000000",
+    "/playlists/3301/composite/1700000000?url=http://192.0.2.1/",
+    "/playlists/3301/composite/1700000000/../../../identity",
+    "/playlists/3301/thumb/1700000000",
+    "/library/metadata/3301/composite/1700000000",
+]
+
+NOT_A_RATING_KEY = ["", "abc", "12/../../identity", "1,2", "12?x=1"]
+
+# Every read of the library, as (name, call, what the client says it does).
+READS = [
+    ("section_id", lambda plex: plex.section_id(), "read Plex's music library"),
+    (
+        "read_artists",
+        lambda plex: plex.read_artists(),
+        "read the artists of Plex's music library",
+    ),
+    ("read_artist", lambda plex: plex.read_artist(BEATLES), "read Plex artist 3001"),
+    (
+        "read_artist_albums",
+        lambda plex: plex.read_artist_albums(BEATLES, newest_first=True),
+        "read the albums of Plex artist 3001",
+    ),
+    ("read_album", lambda plex: plex.read_album(REVOLVER), "read Plex album 3101"),
+    (
+        "read_album_tracks",
+        lambda plex: plex.read_album_tracks(REVOLVER),
+        "read the tracks of Plex album 3101",
+    ),
+    ("read_track", lambda plex: plex.read_track("3201"), "read Plex track 3201"),
+    ("read_playlists", lambda plex: plex.read_playlists(), "read Plex's playlists"),
+    (
+        "read_playlist",
+        lambda plex: plex.read_playlist(MIX),
+        "read Plex playlist 3301",
+    ),
+    (
+        "read_track_pictures",
+        lambda plex: plex.read_track_pictures(["3201", "3202"]),
+        "read the pictures of 2 Plex tracks",
+    ),
+]
+
+# The reads of one item, by its rating key.
+READS_BY_KEY = [
+    ("read_artist", lambda plex, key: plex.read_artist(key)),
+    (
+        "read_artist_albums",
+        lambda plex, key: plex.read_artist_albums(key, newest_first=True),
+    ),
+    ("read_album", lambda plex, key: plex.read_album(key)),
+    ("read_album_tracks", lambda plex, key: plex.read_album_tracks(key)),
+    ("read_track", lambda plex, key: plex.read_track(key)),
+    ("read_playlist", lambda plex, key: plex.read_playlist(key)),
 ]
 
 
@@ -47,6 +131,53 @@ def library(plex: FakePlexClient) -> FakePlexClient:
     plex.add_album(ALBUM, TRACKS, size=(1000, 1000), colour=RED)
     plex.add_album(OTHER_ALBUM, [OTHER_TRACK], size=(1000, 600), colour=BLUE)
     plex.add_album(BARE_ALBUM, [BARE_TRACK], size=None)
+    return plex
+
+
+@pytest.fixture
+def music(plex: FakePlexClient) -> FakePlexClient:
+    """Three artists with albums and one without; albums with and without a
+    date, two of one date; a compilation on two discs; and three playlists,
+    one empty and one larger than a speaker takes."""
+    plex.add_artist(BEATLES, "The Beatles", sort_title="Beatles", colour=GREEN)
+    plex.add_artist(ABBA, "ABBA")
+    plex.add_artist(BJORK, "Björk", sort_title="Bjork")
+    plex.add_artist(BARE_ARTIST, "ZZ Top", size=None)
+
+    plex.add_album(
+        REVOLVER,
+        REVOLVER_TRACKS,
+        colour=RED,
+        artist=BEATLES,
+        title="Revolver",
+        released=date(1966, 8, 5),
+    )
+    plex.add_album(
+        HELP, ["3221"], artist=BEATLES, title="Help!", released=date(1965, 8, 6)
+    )
+    plex.add_album(
+        ANTHOLOGY, [], artist=BEATLES, title="Anthology", released=date(1966, 8, 5)
+    )
+    plex.add_album(BOOTLEG, ["3231"], size=None, artist=BEATLES, title="Bootleg")
+    plex.add_album(DEMOS, ["3241"], artist=BEATLES, title="Demos")
+    plex.add_album(
+        ARRIVAL, ["3251"], artist=ABBA, title="Arrival", released=date(1976, 10, 11)
+    )
+
+    first, second, third, fourth, fifth = ANTHOLOGY_TRACKS
+    plex.add_track(ANTHOLOGY, first, title="Second of two", disc=2, number=1)
+    plex.add_track(ANTHOLOGY, second, title="Tenth", disc=1, number=10)
+    plex.add_track(
+        ANTHOLOGY, third, title="Second", artist="Tony Sheridan", disc=1, number=2
+    )
+    plex.add_track(
+        ANTHOLOGY, fourth, title="Bare", disc=None, number=None, duration_ms=None
+    )
+    plex.add_track(ANTHOLOGY, fifth, title="First", disc=1, number=1, duration_ms=95_000)
+
+    plex.add_playlist(MIX, "Mix", 148, colour=BLUE)
+    plex.add_playlist(EMPTY, "Recently Added", 0)
+    plex.add_playlist(EVERYTHING, "All Music", 12_019)
     return plex
 
 
@@ -106,6 +237,17 @@ class TestPlexClientReadiness:
             "detail": "Plex did not answer (ConnectionError)",
         }
 
+    def test_a_plex_without_the_music_library_degrades(self, library, client):
+        library.has_library = False
+
+        body = client.get("/health/readyz").get_json()
+
+        assert body["checks"]["plex"] == {
+            "status": "error",
+            "critical": False,
+            "detail": "Plex has no music library named 'Music'",
+        }
+
     def test_the_container_provides_the_plexapi_client(self, app):
         assert app.container.plex_client.provides is PlexapiPlexClient
 
@@ -143,8 +285,14 @@ class TestPlexClientMachineIdentifier:
             lambda plex: plex.machine_identifier(),
             lambda plex: plex.read_track_picture(TRACKS[0]),
             lambda plex: plex.check_readiness(),
+            *(read for _, read, _ in READS),
         ],
-        ids=["machine_identifier", "read_track_picture", "check_readiness"],
+        ids=[
+            "machine_identifier",
+            "read_track_picture",
+            "check_readiness",
+            *(name for name, _, _ in READS),
+        ],
     )
     def test_it_is_held_from_plexs_first_answer(self, library, answered):
         answered(library)
@@ -169,6 +317,378 @@ class TestPlexClientMachineIdentifier:
             "Cannot read which server Plex is because external service "
             "failed: Plex did not answer (ConnectionError)"
         )
+
+
+class TestPlexClientLibrary:
+    """What every read of the library has in common."""
+
+    def test_the_section_id_is_the_music_librarys(self, music):
+        assert music.section_id() == SECTION_ID
+
+    @pytest.mark.parametrize(
+        ("read", "operation"),
+        [(read, operation) for _, read, operation in READS],
+        ids=[name for name, _, _ in READS],
+    )
+    def test_a_plex_that_does_not_answer_fails(self, music, read, operation):
+        music.reachable = False
+
+        with pytest.raises(ExternalServiceException) as raised:
+            read(music)
+
+        assert raised.value.operation == operation
+        assert raised.value.cause == "Plex did not answer (ConnectionError)"
+
+    @pytest.mark.parametrize(
+        ("read", "operation"),
+        [(read, operation) for _, read, operation in READS[:2] + READS[3:4]],
+        ids=["section_id", "read_artists", "read_artist_albums"],
+    )
+    def test_a_plex_without_the_music_library_fails(self, music, read, operation):
+        music.has_library = False
+
+        with pytest.raises(ExternalServiceException) as raised:
+            read(music)
+
+        assert raised.value.operation == operation
+        assert raised.value.cause == "Plex has no music library named 'Music'"
+
+    @pytest.mark.parametrize(
+        ("read", "operation"),
+        [(read, operation) for _, read, operation in READS],
+        ids=[name for name, _, _ in READS],
+    )
+    def test_the_plexapi_client_fails_without_the_token_or_the_address(
+        self, unanswered, read, operation
+    ):
+        with pytest.raises(ExternalServiceException) as raised:
+            read(unanswered)
+
+        assert raised.value.message == (
+            f"Cannot {operation} because external service failed: Plex did not "
+            "answer (ConnectionError)"
+        )
+
+    @pytest.mark.parametrize("rating_key", NOT_A_RATING_KEY)
+    @pytest.mark.parametrize(
+        "read",
+        [read for _, read in READS_BY_KEY],
+        ids=[name for name, _ in READS_BY_KEY],
+    )
+    def test_the_plexapi_client_asks_plex_for_a_rating_key_only(
+        self, unanswered, read, rating_key
+    ):
+        # Plex does not answer: a call that reached it would fail.
+        assert read(unanswered, rating_key) is None
+
+    def test_the_plexapi_client_asks_for_the_pictures_of_rating_keys_only(
+        self, unanswered
+    ):
+        # Plex does not answer: a call that reached it would fail.
+        assert unanswered.read_track_pictures(NOT_A_RATING_KEY) == {}
+        assert unanswered.read_track_pictures([]) == {}
+
+    def test_nothing_of_the_library_is_kept(self, music):
+        before = music.read_artists()
+
+        music.add_artist("3009", "Aerosmith")
+        music.add_album("3109", ["3209"], artist=ABBA, released=date(1977, 12, 12))
+        music.add_playlist("3309", "New", 3)
+
+        assert len(music.read_artists()) == len(before) + 1
+        assert len(music.read_artist_albums(ABBA, newest_first=True)) == 2
+        assert music.read_playlist("3309") is not None
+
+
+class TestPlexClientArtists:
+    def test_the_artists_come_as_plex_files_them(self, music):
+        artists = music.read_artists()
+
+        # The Beatles files under its sort title, ABBA under its title.
+        assert [artist.title for artist in artists] == [
+            "ABBA",
+            "The Beatles",
+            "Björk",
+            "ZZ Top",
+        ]
+        assert [artist.sort_title for artist in artists] == [
+            "ABBA",
+            "Beatles",
+            "Bjork",
+            "ZZ Top",
+        ]
+
+    def test_an_artist_has_its_picture(self, music):
+        artist = music.read_artist(BEATLES)
+
+        assert artist == PlexArtist(
+            rating_key=BEATLES,
+            title="The Beatles",
+            sort_title="Beatles",
+            picture=artist.picture,
+        )
+        assert artist.picture.startswith(f"/library/metadata/{BEATLES}/thumb/")
+        _assert_colour(_image(music.read_picture(artist.picture, 100)), GREEN)
+
+    def test_an_artist_without_a_picture_has_none(self, music):
+        assert music.read_artist(BARE_ARTIST).picture is None
+        [bare] = [a for a in music.read_artists() if a.rating_key == BARE_ARTIST]
+        assert bare.picture is None
+
+    def test_one_artist_is_the_one_listed(self, music):
+        for artist in music.read_artists():
+            assert music.read_artist(artist.rating_key) == artist
+
+    @pytest.mark.parametrize("rating_key", ["9999", REVOLVER, "3201", MIX])
+    def test_an_artist_plex_does_not_have_is_none(self, music, rating_key):
+        assert music.read_artist(rating_key) is None
+
+    def test_the_artist_of_an_album_added_without_one(self, library):
+        [artist] = library.read_artists()
+
+        assert artist.rating_key == ARTIST
+        assert artist.picture is None
+        assert len(library.read_artist_albums(ARTIST, newest_first=True)) == 3
+
+
+class TestPlexClientAlbums:
+    def test_newest_first(self, music):
+        albums = music.read_artist_albums(BEATLES, newest_first=True)
+
+        # Two of one date by title, the albums without a date last.
+        assert [album.title for album in albums] == [
+            "Revolver",
+            "Anthology",
+            "Help!",
+            "Demos",
+            "Bootleg",
+        ]
+
+    def test_oldest_first(self, music):
+        albums = music.read_artist_albums(BEATLES, newest_first=False)
+
+        assert [album.title for album in albums] == [
+            "Help!",
+            "Anthology",
+            "Revolver",
+            "Bootleg",
+            "Demos",
+        ]
+
+    def test_albums_of_one_date_and_title_are_in_rating_key_order(self, music):
+        music.add_album("3190", [], artist=ABBA, title="Arrival", released=date(1976, 10, 11))
+        music.add_album("3180", [], artist=ABBA, title="arrival", released=date(1976, 10, 11))
+
+        oldest = music.read_artist_albums(ABBA, newest_first=False)
+        newest = music.read_artist_albums(ABBA, newest_first=True)
+
+        assert [album.rating_key for album in oldest] == [ARRIVAL, "3180", "3190"]
+        assert [album.rating_key for album in newest] == ["3190", "3180", ARRIVAL]
+
+    def test_an_album_has_its_artist_year_track_count_and_picture(self, music):
+        album = music.read_album(REVOLVER)
+
+        assert album == PlexAlbum(
+            rating_key=REVOLVER,
+            title="Revolver",
+            artist_rating_key=BEATLES,
+            artist="The Beatles",
+            released=date(1966, 8, 5),
+            track_count=2,
+            picture=album.picture,
+        )
+        assert album.year == 1966
+        assert album.picture.startswith(f"/library/metadata/{REVOLVER}/thumb/")
+        _assert_colour(_image(music.read_picture(album.picture, 100)), RED)
+
+    def test_an_album_without_a_date_or_a_picture_has_none(self, music):
+        album = music.read_album(BOOTLEG)
+
+        assert album.released is None
+        assert album.year is None
+        assert album.picture is None
+
+    def test_one_album_is_the_one_listed(self, music):
+        for album in music.read_artist_albums(BEATLES, newest_first=True):
+            assert music.read_album(album.rating_key) == album
+
+    def test_an_artist_without_albums_has_none(self, music):
+        assert music.read_artist_albums(BJORK, newest_first=True) == []
+
+    @pytest.mark.parametrize("rating_key", ["9999", REVOLVER, "3201", MIX])
+    def test_the_albums_of_an_artist_plex_does_not_have_are_none(
+        self, music, rating_key
+    ):
+        assert music.read_artist_albums(rating_key, newest_first=True) is None
+
+    @pytest.mark.parametrize("rating_key", ["9999", BEATLES, "3201", MIX])
+    def test_an_album_plex_does_not_have_is_none(self, music, rating_key):
+        assert music.read_album(rating_key) is None
+
+
+class TestPlexClientTracks:
+    def test_an_albums_tracks_come_in_disc_and_track_order(self, music):
+        tracks = music.read_album_tracks(ANTHOLOGY)
+
+        assert [(track.disc, track.number, track.title) for track in tracks] == [
+            (None, None, "Bare"),
+            (1, 1, "First"),
+            (1, 2, "Second"),
+            (1, 10, "Tenth"),
+            (2, 1, "Second of two"),
+        ]
+
+    def test_a_track_has_its_own_artist_where_plex_has_one(self, music):
+        artists = {
+            track.title: track.artist for track in music.read_album_tracks(ANTHOLOGY)
+        }
+
+        assert artists["Second"] == "Tony Sheridan"
+        assert artists["First"] == "The Beatles"
+
+    def test_a_track_has_its_duration_and_its_albums_picture(self, music):
+        track = music.read_track(ANTHOLOGY_TRACKS[4])
+
+        assert track == PlexTrack(
+            rating_key=ANTHOLOGY_TRACKS[4],
+            title="First",
+            artist="The Beatles",
+            disc=1,
+            number=1,
+            duration_ms=95_000,
+            picture=music.read_album(ANTHOLOGY).picture,
+        )
+        assert track.picture == music.read_track_picture(ANTHOLOGY_TRACKS[4])
+
+    def test_a_track_without_a_disc_a_number_or_a_duration_has_none(self, music):
+        track = music.read_track(ANTHOLOGY_TRACKS[3])
+
+        assert (track.disc, track.number, track.duration_ms) == (None, None, None)
+
+    def test_a_track_of_an_album_without_a_picture_has_none(self, music):
+        [track] = music.read_album_tracks(BOOTLEG)
+
+        assert track.picture is None
+
+    def test_one_track_is_the_one_listed(self, music):
+        for track in music.read_album_tracks(ANTHOLOGY):
+            assert music.read_track(track.rating_key) == track
+
+    def test_the_tracks_added_with_an_album_are_numbered_in_the_order_given(
+        self, music
+    ):
+        tracks = music.read_album_tracks(REVOLVER)
+
+        assert [track.rating_key for track in tracks] == list(REVOLVER_TRACKS)
+        assert [(track.disc, track.number) for track in tracks] == [(1, 1), (1, 2)]
+
+    @pytest.mark.parametrize("rating_key", ["9999", BEATLES, "3201", MIX])
+    def test_the_tracks_of_an_album_plex_does_not_have_are_none(
+        self, music, rating_key
+    ):
+        assert music.read_album_tracks(rating_key) is None
+
+    @pytest.mark.parametrize("rating_key", ["9999", BEATLES, REVOLVER, MIX])
+    def test_a_track_plex_does_not_have_is_none(self, music, rating_key):
+        assert music.read_track(rating_key) is None
+
+
+class TestPlexClientPlaylists:
+    def test_every_playlist_is_listed(self, music):
+        playlists = {playlist.title: playlist for playlist in music.read_playlists()}
+
+        # The empty one and the one a speaker refuses too: which are shown
+        # is the library's to say.
+        assert {title: p.track_count for title, p in playlists.items()} == {
+            "Mix": 148,
+            "Recently Added": 0,
+            "All Music": 12_019,
+        }
+
+    def test_a_playlist_has_its_duration_and_its_picture(self, music):
+        playlist = music.read_playlist(MIX)
+
+        assert playlist == PlexPlaylist(
+            rating_key=MIX,
+            title="Mix",
+            track_count=148,
+            duration_ms=148 * 180_000,
+            picture=playlist.picture,
+        )
+        assert playlist.picture.startswith(f"/playlists/{MIX}/composite/")
+        assert playlist.picture.removeprefix(f"/playlists/{MIX}/composite/").isdigit()
+        _assert_colour(_image(music.read_picture(playlist.picture, 100)), BLUE)
+
+    def test_a_playlist_without_tracks_has_no_duration_and_no_picture(self, music):
+        playlist = music.read_playlist(EMPTY)
+
+        assert playlist.track_count == 0
+        assert playlist.duration_ms is None
+        assert playlist.picture is None
+
+    def test_one_playlist_is_the_one_listed_with_a_new_stamp_on_its_picture(
+        self, music
+    ):
+        listed = {playlist.rating_key: playlist for playlist in music.read_playlists()}
+
+        read = {key: music.read_playlist(key) for key in listed}
+
+        assert read[EMPTY] == listed[EMPTY]
+        for key in (MIX, EVERYTHING):
+            assert read[key].picture != listed[key].picture
+            assert read[key].picture.startswith(f"/playlists/{key}/composite/")
+            assert read[key] == PlexPlaylist(
+                rating_key=key,
+                title=listed[key].title,
+                track_count=listed[key].track_count,
+                duration_ms=listed[key].duration_ms,
+                picture=read[key].picture,
+            )
+        # The list has the stamp of the last read of the playlist on its own.
+        assert {p.rating_key: p for p in music.read_playlists()} == read
+
+    @pytest.mark.parametrize("rating_key", ["9999", BEATLES, REVOLVER, "3201"])
+    def test_a_playlist_plex_does_not_have_is_none(self, music, rating_key):
+        assert music.read_playlist(rating_key) is None
+
+
+class TestPlexClientTrackPictures:
+    def test_the_pictures_of_several_tracks(self, music):
+        first, second = REVOLVER_TRACKS
+
+        pictures = music.read_track_pictures([first, "3251", second])
+
+        assert pictures == {
+            first: music.read_track_picture(first),
+            second: music.read_track_picture(second),
+            "3251": music.read_track_picture("3251"),
+        }
+        assert pictures[first] == pictures[second] != pictures["3251"]
+
+    def test_a_rating_key_that_is_no_tracks_is_left_out(self, music):
+        first = REVOLVER_TRACKS[0]
+
+        pictures = music.read_track_pictures(["9999", first, REVOLVER, BEATLES, MIX])
+
+        assert list(pictures) == [first]
+
+    def test_a_track_without_a_picture_is_left_out(self, music):
+        assert music.read_track_pictures(["3231", "3241"]) == {
+            "3241": music.read_track_picture("3241")
+        }
+
+    def test_a_track_asked_twice_is_there_once(self, music):
+        first = REVOLVER_TRACKS[0]
+
+        assert list(music.read_track_pictures([first, first])) == [first]
+
+    def test_tracks_plex_does_not_have_have_no_pictures(self, music):
+        assert music.read_track_pictures(["9998", "9999"]) == {}
+
+    def test_no_tracks_are_not_asked_for(self, music):
+        music.reachable = False
+
+        assert music.read_track_pictures([]) == {}
 
 
 class TestPlexClientTrackPicture:
@@ -275,6 +795,38 @@ class TestPlexClientPicture:
                 abs(got - want) <= 8
                 for got, want in zip(image.getpixel(at), colour, strict=True)
             )
+
+    def test_a_playlists_picture_is_read(self, music):
+        picture = music.read_playlist(MIX).picture
+
+        image = _image(music.read_picture(picture, 160))
+
+        assert image.size == (160, 160)
+        _assert_colour(image, BLUE)
+
+    def test_a_playlists_new_picture_has_a_new_path(self, music):
+        [before] = [p.picture for p in music.read_playlists() if p.rating_key == MIX]
+
+        music.set_picture(MIX, (1000, 1000), RED)
+
+        [after] = [p.picture for p in music.read_playlists() if p.rating_key == MIX]
+        assert after != before
+        _assert_colour(_image(music.read_picture(before, 100)), RED)
+
+    def test_a_playlist_without_a_picture_has_none(self, music):
+        assert music.read_picture(f"/playlists/{EMPTY}/composite/1", 100) is None
+        assert music.read_picture("/playlists/9999/composite/1", 100) is None
+        # A playlist's picture is not at an item's path.
+        assert music.read_picture(f"/library/metadata/{MIX}/thumb/1", 100) is None
+
+    def test_an_artist_without_a_picture_has_none(self, music):
+        assert (
+            music.read_picture(f"/library/metadata/{BARE_ARTIST}/thumb/1", 100) is None
+        )
+
+    def test_a_picture_is_set_on_an_item_that_has_one_only(self, music):
+        with pytest.raises(KeyError):
+            music.set_picture("3201", (10, 10), RED)
 
     def test_an_item_without_a_picture_has_none(self, library):
         assert library.read_picture(f"/library/metadata/{BARE_ALBUM}/thumb/1", 100) is None
