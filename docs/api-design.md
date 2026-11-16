@@ -136,6 +136,18 @@ Every queue entry came out complete: title, artist, album, duration and artwork.
 - **`AddMultipleURIsToQueue` takes 16 items a call**, tracks or album containers. The metadata
   documents are joined with plain spaces, unencoded. Encoding the spaces inside them makes the
   speaker accept the addresses and drop every title.
+- **A failed fetch refuses the whole call** (SCTL-17, measured on the Garage on 2026-11-16). The
+  speaker fetches a call's containers from the service one by one, in order, about 0.4 s an album
+  whatever its size: 16 albums of 77 tracks took 6 to 7 s, and 16 of 1,094 tracks 9.5 to 13 s.
+  When one fetch fails it answers UPnP error 800 and queues nothing of the call, not even the
+  albums fetched before it: an album the service does not have was refused after 3.9 s ninth of
+  sixteen, and after 0.5 s first. Once, in the live suite, the Garage refused 16 albums with 800
+  and took the same call a minute later. 31 calls of 16 albums afterwards, right after a clear,
+  three seconds after one and appended to a full queue, were never refused, and one took 11.7 s
+  where the same call otherwise took 6.5. So the refusal is a fetch from the service that fails
+  now and then, not the call's size nor its timing after a clear, and a smaller call would not
+  fail less often. **The client makes a refused call again**, three calls in all, two seconds
+  apart, which is safe because a refused call queued nothing.
 - **Adding tracks one by one is slow.** The speaker fetches each track's details from the
   service, about 0.33 s a track however they are batched. A container costs about 0.01 s a track.
   So the backend queues containers and never lists of tracks.
@@ -580,7 +592,9 @@ before the queue changes, then does what 1.4, 1.5 and 1.7 found:
   nothing of an earlier item lands after the new one. A task that was ended reports
   `task_completed`, as one that is done.
 - A task that fails reports `task_failed` through the template's task events, to every
-  connection, with `{"error": …}`: the failure in words a client can show (2). A display watches
+  connection, with `{"error": …}`: the failure in words a client can show (2). A call the speaker
+  refuses for a fetch that failed is made again first (1.3), and fails the task only when its third
+  call is refused too. A display watches
   for the id it was given and shows the error. A failure in Plex, an artist Plex no longer has
   and an artist without albums leave the queue as it was; a failure of the speaker leaves the
   queue as far as it got, which for `play` and `shuffle` may be empty.

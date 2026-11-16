@@ -16,6 +16,7 @@ from app.services.health_service import CheckStatus, HealthService
 from app.services.plex_client import PlexapiPlexClient
 from app.services.sonos_client import (
     UNREPORTED,
+    FetchRefusedException,
     GroupVolumeChanged,
     HouseholdChanged,
     Playback,
@@ -728,12 +729,26 @@ class TestLiveQueue:
     def test_a_container_the_service_does_not_have_is_refused_in_the_clients_words(
         self, sonos, garage, kept_queue, library
     ):
-        with pytest.raises(ExternalServiceException) as raised:
+        # A refused fetch, asked again QUEUE_ATTEMPTS times in all.
+        with pytest.raises(FetchRefusedException) as raised:
             sonos.add_to_queue(
                 garage, library.item(PlexItemKind.ALBUM, "999999999", "No Album")
             )
 
         assert raised.value.cause == "the speaker answered UPnP error 800"
+        assert sonos.read_queue(garage, 0, 1000) == kept_queue
+
+    def test_a_refused_fetch_refuses_the_whole_call_and_queues_nothing(
+        self, sonos, garage, kept_queue, library
+    ):
+        # Fetched before the refused one, and still not queued: a refused
+        # call can be made again without queueing anything twice (SCTL-17).
+        fetched = [library.album(album) for album in library.albums[:2]]
+        unknown = library.item(PlexItemKind.ALBUM, "999999999", "No Album")
+
+        with pytest.raises(FetchRefusedException):
+            sonos.add_many_to_queue(garage, [*fetched, unknown])
+
         assert sonos.read_queue(garage, 0, 1000) == kept_queue
 
     def test_playing_an_empty_queue_from_the_start_fails_in_the_clients_words(

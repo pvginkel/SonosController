@@ -16,7 +16,9 @@ from app.core_exceptions import ExternalServiceException
 from app.exceptions import CommandRefusedException
 from app.services.sonos_client import (
     ADD_MANY_LIMIT,
+    QUEUE_ATTEMPTS,
     UNREPORTED,
+    FetchRefusedException,
     Group,
     GroupVolumeChanged,
     HouseholdChanged,
@@ -909,6 +911,54 @@ class TestSonosClientQueue:
         assert household.read_queue(LOUNGE, 0, 100).total == 0
         household.add_to_queue(LOUNGE, _album("50"))
         assert household.read_queue(LOUNGE, 0, 100).total == half
+
+    def test_a_call_refused_for_a_fetch_that_failed_is_made_again(
+        self, household, library
+    ):
+        reached: list[str] = []
+        household.before_call = reached.append
+        household.fail_fetches(1)
+
+        household.add_many_to_queue(LOUNGE, [_album("30"), _album("10")])
+
+        assert reached == [LOUNGE, LOUNGE]
+        # Queued once: a refused call queues nothing.
+        assert _keys(household, LOUNGE) == [
+            *(str(key) for key in range(301, 311)),
+            "101",
+            "102",
+            "103",
+        ]
+
+    def test_a_refusal_that_lasts_fails_in_the_clients_words_and_queues_nothing(
+        self, household, library
+    ):
+        reached: list[str] = []
+        household.before_call = reached.append
+        household.fail_fetches(QUEUE_ATTEMPTS)
+
+        with pytest.raises(FetchRefusedException) as raised:
+            household.add_to_queue(GARAGE, _album("10"))
+
+        assert raised.value.message == (
+            f"Cannot add Plex album 10 to the queue of speaker {GARAGE} because "
+            "external service failed: the speaker answered UPnP error 800"
+        )
+        assert reached == [GARAGE] * QUEUE_ATTEMPTS
+        assert household.read_queue(GARAGE, 0, 100).total == 3
+
+    def test_a_queueing_call_that_fails_otherwise_is_made_once(
+        self, household, library
+    ):
+        reached: list[str] = []
+        household.before_call = reached.append
+        household.plex_linked = False
+
+        with pytest.raises(ExternalServiceException) as raised:
+            household.add_many_to_queue(GARAGE, [_album("10")])
+
+        assert not isinstance(raised.value, FetchRefusedException)
+        assert reached == [GARAGE]
 
     def test_a_household_without_the_plex_service_queues_nothing(
         self, household, library

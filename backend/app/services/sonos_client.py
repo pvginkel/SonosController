@@ -16,6 +16,7 @@ import logging
 import queue
 import re
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -180,6 +181,21 @@ class PlexItem:
 # The items one add_many_to_queue() takes: what one AddMultipleURIsToQueue
 # takes (docs/api-design.md section 1.3).
 ADD_MANY_LIMIT = 16
+
+# The calls a queueing command makes in all while the speaker refuses it with
+# FetchRefusedException. A fetch from the Plex service fails now and then and
+# is fetched when asked again (docs/api-design.md section 1.3).
+QUEUE_ATTEMPTS = 3
+
+
+class FetchRefusedException(ExternalServiceException):
+    """The speaker refused a queueing call because its fetch of one of the
+    call's containers from the Plex service failed (UPnP error 800): nothing
+    of the call is queued.
+
+    A container the service does not have is refused so at once, and one it
+    is slow to serve after about ten seconds.
+    """
 
 
 @dataclass(frozen=True)
@@ -419,21 +435,61 @@ class SonosClient(ABC):
         While a stream is the source, a speaker refuses shuffle.
         """
 
-    @abstractmethod
+    # The pause before a queueing call the speaker refused is made again.
+    refetch_pause_seconds = 2.0
+
     def add_to_queue(self, speaker_id: str, item: PlexItem) -> None:
         """Append an item of the Plex library to the group's queue, as one
         container of the Plex service linked in Sonos: the speaker fetches
         its tracks from the service.
 
-        A container the speaker cannot fetch in time is refused, and nothing
-        of it is queued.
+        A call the speaker refuses because its fetch failed queues nothing,
+        and is made again, ``QUEUE_ATTEMPTS`` calls in all. A refusal that
+        lasts raises ``FetchRefusedException``.
         """
+        self._attempt(lambda: self._send_add(speaker_id, item))
 
-    @abstractmethod
     def add_many_to_queue(self, speaker_id: str, items: Sequence[PlexItem]) -> None:
         """Append 1 to ``ADD_MANY_LIMIT`` items of the Plex library to the
         group's queue in one call to the speaker, each as ``add_to_queue()``
-        queues it."""
+        queues it.
+
+        The speaker fetches the containers one by one, and a failed fetch
+        refuses the whole call: it is made again as ``add_to_queue()``'s
+        is.
+        """
+        if not 1 <= len(items) <= ADD_MANY_LIMIT:
+            raise ValueError(
+                f"add_many_to_queue() takes 1 to {ADD_MANY_LIMIT} items, not {len(items)}"
+            )
+        self._attempt(lambda: self._send_add_many(speaker_id, items))
+
+    def _attempt(self, send: Callable[[], None]) -> None:
+        """Make a queueing call, again while the speaker refuses it for a
+        failed fetch, ``QUEUE_ATTEMPTS`` calls in all."""
+        for attempt in range(1, QUEUE_ATTEMPTS + 1):
+            try:
+                send()
+                return
+            except FetchRefusedException as exc:
+                if attempt == QUEUE_ATTEMPTS:
+                    raise
+                logger.warning(
+                    "%s; asking again (%d of %d calls)",
+                    exc.message,
+                    attempt + 1,
+                    QUEUE_ATTEMPTS,
+                )
+                time.sleep(self.refetch_pause_seconds)
+
+    @abstractmethod
+    def _send_add(self, speaker_id: str, item: PlexItem) -> None:
+        """One call of ``add_to_queue()``, raising ``FetchRefusedException``
+        where the speaker refuses it for a failed fetch."""
+
+    @abstractmethod
+    def _send_add_many(self, speaker_id: str, items: Sequence[PlexItem]) -> None:
+        """One call of ``add_many_to_queue()``, as ``_send_add()``."""
 
     @abstractmethod
     def play_from_start(self, speaker_id: str) -> None:
@@ -735,8 +791,8 @@ class SoCoSonosClient(SonosClient):
                 "SHUFFLE_NOREPEAT" if shuffle else "NORMAL"
             )
 
-    def add_to_queue(self, speaker_id: str, item: PlexItem) -> None:
-        with _speaker_call(
+    def _send_add(self, speaker_id: str, item: PlexItem) -> None:
+        with _queueing_call(
             f"add Plex {item.kind} {item.rating_key} to the queue of speaker {speaker_id}"
         ):
             coordinator = self._coordinator(speaker_id)
@@ -752,12 +808,8 @@ class SoCoSonosClient(SonosClient):
                 timeout=_QUEUE_TIMEOUT_SECONDS,
             )
 
-    def add_many_to_queue(self, speaker_id: str, items: Sequence[PlexItem]) -> None:
-        if not 1 <= len(items) <= ADD_MANY_LIMIT:
-            raise ValueError(
-                f"add_many_to_queue() takes 1 to {ADD_MANY_LIMIT} items, not {len(items)}"
-            )
-        with _speaker_call(
+    def _send_add_many(self, speaker_id: str, items: Sequence[PlexItem]) -> None:
+        with _queueing_call(
             f"add {len(items)} Plex items to the queue of speaker {speaker_id}"
         ):
             coordinator = self._coordinator(speaker_id)
@@ -980,6 +1032,24 @@ def _transport_command(operation: str) -> Iterator[None]:
         except SoCoUPnPException as exc:
             if exc.error_code in _NOT_ALLOWED_NOW:
                 raise CommandRefusedException(operation, _cause(exc)) from exc
+            raise
+
+
+# The UPnP error a speaker answers a queueing call whose fetch from the Plex
+# service failed (docs/api-design.md section 1.3).
+_FETCH_FAILED = "800"
+
+
+@contextmanager
+def _queueing_call(operation: str) -> Iterator[None]:
+    """As ``_speaker_call()``, with the speaker's refusal of a fetch that
+    failed as a FetchRefusedException."""
+    with _speaker_call(operation):
+        try:
+            yield
+        except SoCoUPnPException as exc:
+            if exc.error_code == _FETCH_FAILED:
+                raise FetchRefusedException(operation, _cause(exc)) from exc
             raise
 
 

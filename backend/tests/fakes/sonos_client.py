@@ -12,7 +12,8 @@ A room's queue is kept the way ``docs/api-design.md`` sections 1.3 to 1.6
 found the speakers keep one. A container of the Plex service becomes the
 tracks the fake Plex serves for it; a container the service does not have, or
 one beyond what a speaker fetches in time, is refused with UPnP error 800 and
-queues nothing. With shuffle on, the queue is presented in play order, and
+queues nothing, as is a call while ``fail_fetches()`` has the service fail.
+The base class makes a refused call again, without the pause between calls. With shuffle on, the queue is presented in play order, and
 tracks added then are mixed into what plays after the current one.
 
 A test builds its household with ``add_room()`` and ``load_queue()``. A change
@@ -44,7 +45,7 @@ from app.core_exceptions import ExternalServiceException
 from app.exceptions import CommandRefusedException
 from app.services.health_service import CheckResult, CheckStatus, HealthService
 from app.services.sonos_client import (
-    ADD_MANY_LIMIT,
+    FetchRefusedException,
     Group,
     GroupVolumeChanged,
     Household,
@@ -215,6 +216,9 @@ class _FakeSubscription(SonosSubscription):
 class FakeSonosClient(SonosClient):
     """A household in memory."""
 
+    # A refused queueing call is made again at once.
+    refetch_pause_seconds = 0.0
+
     def __init__(self, health_service: HealthService, plex: FakePlexClient) -> None:
         super().__init__(health_service)
         # The Plex the household's Plex service serves.
@@ -236,6 +240,8 @@ class FakeSonosClient(SonosClient):
         self.before_call: Callable[[str], None] | None = None
         # False: no speaker answers, as when the household is switched off.
         self.reachable = True
+        # The queueing calls still to be refused for a fetch that failed.
+        self._failing_fetches = 0
         self._condition = threading.Condition()
         self._pending: deque[Callable[[], None]] = deque()
         # True from when a delivery is taken until what in_step_with() named
@@ -410,6 +416,15 @@ class FakeSonosClient(SonosClient):
     def answer_again(self, speaker_id: str) -> None:
         """The room's device answers again, after ``silence_room()``."""
         self._silent.remove(speaker_id)
+
+    def fail_fetches(self, calls: int) -> None:
+        """The Plex service fails the speakers' fetches for a while.
+
+        The next ``calls`` queueing calls, to any room, are refused with UPnP
+        error 800 and queue nothing, as the Garage refused one of 16 albums
+        that it queued when asked again (SCTL-17).
+        """
+        self._failing_fetches = calls
 
     def fail_renewals(self, speaker_id: str) -> None:
         """Every renewal of the room's subscriptions fails: each is lost."""
@@ -678,19 +693,14 @@ class FakeSonosClient(SonosClient):
             self._send_queue(room)
         self._send_playback(room)
 
-    def add_to_queue(self, speaker_id: str, item: PlexItem) -> None:
+    def _send_add(self, speaker_id: str, item: PlexItem) -> None:
         self._add(
             speaker_id,
             f"add Plex {item.kind} {item.rating_key} to the queue of",
             [item],
         )
 
-    def add_many_to_queue(self, speaker_id: str, items: Sequence[PlexItem]) -> None:
-        if not 1 <= len(items) <= ADD_MANY_LIMIT:
-            raise ValueError(
-                f"add_many_to_queue() takes 1 to {ADD_MANY_LIMIT} items, "
-                f"not {len(items)}"
-            )
+    def _send_add_many(self, speaker_id: str, items: Sequence[PlexItem]) -> None:
         self._add(speaker_id, f"add {len(items)} Plex items to the queue of", items)
 
     def play_from_start(self, speaker_id: str) -> None:
@@ -815,6 +825,11 @@ class FakeSonosClient(SonosClient):
             raise ExternalServiceException(
                 described, "the speaker lists no Plex service"
             )
+        if self._failing_fetches:
+            self._failing_fetches -= 1
+            raise FetchRefusedException(
+                described, "the speaker answered UPnP error 800"
+            )
         tracks: list[Track] = []
         for item in items:
             served = (
@@ -824,12 +839,12 @@ class FakeSonosClient(SonosClient):
             )
             if served is None:
                 # As the Garage answered a container of no item of the library.
-                raise ExternalServiceException(
+                raise FetchRefusedException(
                     described, "the speaker answered UPnP error 800"
                 )
             tracks.extend(_entry(item, track) for track in served)
         if len(tracks) > CONTAINER_LIMIT:
-            raise ExternalServiceException(
+            raise FetchRefusedException(
                 described, "the speaker answered UPnP error 800"
             )
         normal = range(len(room.queue), len(room.queue) + len(tracks))

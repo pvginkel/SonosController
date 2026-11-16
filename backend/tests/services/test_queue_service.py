@@ -25,6 +25,7 @@ from app.schemas.queue_schema import QueueListQuerySchema, QueueRequestSchema
 from app.services.household_mirror import HouseholdMirror
 from app.services.queue_service import QueueEntry, QueueingTask, QueueService
 from app.services.sonos_client import (
+    QUEUE_ATTEMPTS,
     PlexItem,
     PlexItemKind,
     SoCoSonosClient,
@@ -675,6 +676,28 @@ class TestQueueServiceQueue:
 
         assert keys(household, GARAGE) == [*NEW_TRACKS, *OLD_TRACKS, *UNDATED_TRACKS]
 
+    def test_a_play_holds_while_the_service_fails_a_fetch_now_and_then(
+        self, queue, household, tasks, monkeypatch
+    ):
+        add_many = household.add_many_to_queue
+
+        def failing(speaker_id: str, items: list[PlexItem]) -> None:
+            # The Garage refused 16 albums once, and took them when asked
+            # again (SCTL-17).
+            household.fail_fetches(1)
+            add_many(speaker_id, items)
+
+        monkeypatch.setattr(household, "add_many_to_queue", failing)
+        household.fail_fetches(1)
+
+        self.run(queue, tasks, GARAGE, asked("artist", BAND, "play"))
+
+        # Every album once, in order.
+        assert keys(household, GARAGE) == [*NEW_TRACKS, *OLD_TRACKS, *UNDATED_TRACKS]
+        assert household.read_playback(GARAGE).transport_state is (
+            TransportState.PLAYING
+        )
+
     def test_the_rest_of_an_artist_is_queued_sixteen_albums_a_call(
         self, queue, household, tasks, monkeypatch
     ):
@@ -1221,6 +1244,31 @@ class TestQueueServiceQueueFailures:
         assert data["error"].startswith(
             f"Cannot add 2 Plex items to the queue of speaker {GARAGE} because"
         )
+        assert keys(household, GARAGE) == NEW_TRACKS
+        assert household.read_playback(GARAGE).transport_state is (
+            TransportState.PLAYING
+        )
+
+    def test_a_refused_add_of_the_rest_fails_the_task_in_the_clients_words(
+        self, queue, household, tasks, monkeypatch
+    ):
+        add_many = household.add_many_to_queue
+
+        def refused(speaker_id: str, items: list[PlexItem]) -> None:
+            # The service fails every fetch of the call.
+            household.fail_fetches(QUEUE_ATTEMPTS)
+            add_many(speaker_id, items)
+
+        monkeypatch.setattr(household, "add_many_to_queue", refused)
+
+        data = self.failure(queue, tasks, asked("artist", BAND, "play"))
+
+        assert data == {
+            "error": (
+                f"Cannot add 2 Plex items to the queue of speaker {GARAGE} because "
+                "external service failed: the speaker answered UPnP error 800"
+            )
+        }
         assert keys(household, GARAGE) == NEW_TRACKS
         assert household.read_playback(GARAGE).transport_state is (
             TransportState.PLAYING
