@@ -19,6 +19,8 @@ enabled = true
 deploys = true
 
 # No [devlock]: with no dev instance, nothing contends over one.
-# No [migrations] yet: the backend has no migration file for its globs to
-# match; the first slice that adds one under backend/alembic/versions/ adds
-# the section with its `alembic heads` check.
+
+[migrations]
+paths = ["backend/alembic/versions/*.py"]
+# uv lives in the python sidecar, not on the dev container's PATH.
+check = "cd backend && test \"$(cexec python uv run alembic heads | wc -l)\" -eq 1"
