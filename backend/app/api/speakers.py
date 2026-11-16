@@ -149,8 +149,8 @@ def leave_group(
 ) -> tuple[str, int]:
     """Have the speaker leave its group and play alone.
 
-    The other speakers of the group go on as a group. A speaker that
-    already plays alone stays as it is.
+    The command goes to this speaker alone. A speaker that already plays
+    alone stays as it is.
 
     The answer says that the speaker took the command, not that the group
     has changed: `GET /api/speakers` shows the old groups until the speakers

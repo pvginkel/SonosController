@@ -374,7 +374,16 @@ Conventions that hold for every endpoint:
   the room's name or address.
 - Hidden devices are not listed (1.2). The list is sorted by name, and empty while no speaker
   answers.
-- An unknown `speaker_id` is a `404` with code `SPEAKER_NOT_FOUND`, here and below.
+- An unknown `speaker_id` is a `404` with code `SPEAKER_NOT_FOUND`, here and below, in a join's
+  body as in its path.
+- **A join or a leave goes to the room in the path alone** (1.2). A join's body names the group by
+  any of its rooms, its coordinator or another, and the group keeps its coordinator; a room alone
+  is a group of one, so this is also how two rooms start a group. A body that is not an object
+  holding `speaker_id`, a string, and nothing else is a `400`.
+- A join to the group the room already plays in, and a leave by a room alone, send the speakers
+  nothing and answer `204`. Which group a room plays in is read from the mirror (2), and the new
+  groups arrive as `speakers_changed`, with `volume_changed` for every room whose group changed
+  and `playback_changed` for every room that now plays something else (4).
 
 ### 3.2 Playback
 
@@ -764,8 +773,9 @@ configuration, the token in its secret.
 
 - **Joining and leaving a group** (1.2): the commands are SoCo's, and no live test could use a
   second room. Check on the real speakers when the speakers screen is built, with the operator's
-  leave to use Zitkuil: that the room joins, that the group's events and volume follow, and what
-  the leaving room's queue holds afterwards.
+  leave to use Zitkuil: that the room joins, that the group's events and volume follow, what the
+  leaving room's queue holds afterwards, and what becomes of the rest of a group when the room
+  that leads it leaves or joins another.
 - **A favourite across a rescan** (1.8): the lookup by `guid` is proven; that a `guid` survives a
   rescan is from Plex's forum, not from a rescan of this library.
 - **A subscription across a day** on the real speakers: renewals for a day, a speaker that
