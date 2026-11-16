@@ -19,6 +19,11 @@ Playback and the group volume are a group's: the mirror takes them from the
 events of the group's coordinator and serves them for every member. Every
 string it serves is Unicode NFC.
 
+A room the layout lists that the mirror could not subscribe to and read is
+not in the mirror, and neither is any room of a group whose coordinator is
+such a room: the mirror serves the rest of the household without them, and
+they join it once they answer a read of the layout.
+
 A track's ``artwork_id`` names its picture (section 3.7): Plex's for a track
 queued from Plex, which Plex is asked for whenever the playback is read, and
 otherwise the picture the group's coordinator serves.
@@ -276,6 +281,7 @@ class HouseholdMirror:
         # taken after _layout_lock where both are held.
         self._lock = threading.Lock()
         self._stopped = False
+        # The speakers' layout without the rooms the mirror leaves out of it.
         self._household = Household(rooms=(), groups=())
         # Every room of _household: its group, what is held of it, and the
         # feed that keeps it current.
@@ -296,8 +302,8 @@ class HouseholdMirror:
 
         Every room is subscribed to and read in full. A household that does
         not answer and a room that fails are logged, not raised: the mirror
-        holds nothing new then, and the layout is read again every
-        ``check_seconds`` until every room is mirrored.
+        holds the rooms that could be mirrored, and the layout is read again
+        every ``check_seconds``, which tries the others again.
         """
         self._heal()
         self._healer = threading.Thread(
@@ -330,7 +336,7 @@ class HouseholdMirror:
             raise failure
 
     def speakers(self) -> list[Speaker]:
-        """Every room of the household, by name."""
+        """Every room the mirror holds, by name."""
         with self._lock:
             speakers = [self._speaker(room) for room in self._household.rooms]
         return sorted(speakers, key=lambda speaker: (speaker.name.casefold(), speaker.id))
@@ -445,8 +451,8 @@ class HouseholdMirror:
     def _heal(self, household: Household | None = None) -> None:
         """Apply a layout: the one given, or the one a speaker gives now.
 
-        What fails stays as it was and is logged: the healing thread's next
-        read of the layout tries it again.
+        What fails is logged: the healing thread's next read of the layout
+        tries it again.
         """
         try:
             if household is None:
@@ -473,7 +479,8 @@ class HouseholdMirror:
             logger.info("The household is mirrored in full again")
 
     def _apply_layout(self, household: Household) -> None:
-        """Make the mirror's rooms and groups those of the layout.
+        """Make the mirror's rooms and groups those of the layout that can be
+        mirrored.
 
         A room the mirror does not hold is subscribed to and read in full.
         So is a room whose feed is stale, or whose device has another address
@@ -483,11 +490,18 @@ class HouseholdMirror:
         is read again: while it followed, its own device's events were not
         the group's. A room the layout no longer has is dropped.
 
+        A room that is not held and fails is left out, and so is a held room
+        that now coordinates and cannot be read again: the layout is applied
+        without it. What a group plays and its volume are its coordinator's,
+        so a group whose coordinator is left out is left out whole, and what
+        is held of its members is dropped. A room that is left out is not
+        held: the next layout tries it again.
+
         Raises:
-            ExternalServiceException: A room failed. A room that is new, or
-                that now coordinates, leaves the layout unapplied. A held
-                room that could not be subscribed to again keeps what is
-                held of it, and its feed is stale.
+            ExternalServiceException: A room failed: the first failure, once
+                the rest of the layout is applied. A held room that could not
+                be subscribed to again keeps what is held of it, and its feed
+                is stale.
         """
         events: list[StreamEvent] = []
         # The feeds this layout ends. Their subscriptions are ended outside
@@ -498,7 +512,7 @@ class HouseholdMirror:
             with self._layout_lock:
                 if self._stopped:
                     return
-                groups = {
+                reported = {
                     member_id: group
                     for group in household.groups
                     for member_id in group.member_ids
@@ -508,57 +522,91 @@ class HouseholdMirror:
                     stale = {
                         room_id for room_id, feed in self._feeds.items() if feed.stale
                     }
+                    followed = {
+                        room_id
+                        for room_id, group in self._groups.items()
+                        if group.coordinator_id != room_id
+                    }
                 feeds: dict[str, _Feed] = {}
                 read: dict[str, _RoomState] = {}
+                read_again: dict[str, tuple[Playback, Volume]] = {}
                 # The held rooms that could not be subscribed to again.
-                unanswered: list[str] = []
-                try:
-                    for room in household.rooms:
-                        known = held.get(room.id)
-                        if (
-                            known is not None
-                            and room.id not in stale
-                            and (room.address, room.boot_seq)
-                            == (known.address, known.boot_seq)
-                        ):
-                            continue
+                unanswered: set[str] = set()
+                # The rooms the layout is applied without.
+                left_out: set[str] = set()
+                # Coordinators first: no member of a group is asked once its
+                # coordinator is left out.
+                for room in sorted(
+                    household.rooms,
+                    key=lambda room: reported[room.id].coordinator_id != room.id,
+                ):
+                    coordinator_id = reported[room.id].coordinator_id
+                    if coordinator_id in left_out:
+                        left_out.add(room.id)
+                        continue
+                    known = held.get(room.id)
+                    if (
+                        known is None
+                        or room.id in stale
+                        or (room.address, room.boot_seq)
+                        != (known.address, known.boot_seq)
+                    ):
                         feed = _Feed()
                         try:
                             read[room.id] = self._subscribe_and_read(room, feed)
                         except ExternalServiceException as error:
                             ended.append(feed)
-                            if known is None:
-                                raise
-                            unanswered.append(room.id)
                             failure = failure or error
+                            if known is None:
+                                left_out.add(room.id)
+                            else:
+                                unanswered.add(room.id)
                         else:
                             feeds[room.id] = feed
-                    read_again = {
-                        room.id: (
-                            self._client.read_playback(room.id),
-                            self._client.read_group_volume(room.id),
-                        )
-                        for room in household.rooms
-                        if room.id in held
+                    if (
+                        room.id in followed
                         and room.id not in read
-                        and self._groups[room.id].coordinator_id != room.id
-                        and groups[room.id].coordinator_id == room.id
-                    }
-                except ExternalServiceException:
-                    ended.extend(feeds.values())
-                    with self._lock:
-                        for feed in ended:
-                            feed.ended = True
-                    raise
+                        and coordinator_id == room.id
+                    ):
+                        try:
+                            read_again[room.id] = (
+                                self._client.read_playback(room.id),
+                                self._client.read_group_volume(room.id),
+                            )
+                        except ExternalServiceException as error:
+                            failure = failure or error
+                            left_out.add(room.id)
+                applied = Household(
+                    rooms=tuple(
+                        room for room in household.rooms if room.id not in left_out
+                    ),
+                    groups=tuple(
+                        replace(
+                            group,
+                            member_ids=tuple(
+                                member_id
+                                for member_id in group.member_ids
+                                if member_id not in left_out
+                            ),
+                        )
+                        for group in household.groups
+                        if group.coordinator_id not in left_out
+                    ),
+                )
+                groups = {
+                    member_id: group
+                    for group in applied.groups
+                    for member_id in group.member_ids
+                }
 
                 with self._lock:
                     before = self._served()
                     for room_id in self._states.keys() - groups.keys():
                         del self._states[room_id]
                         ended.append(self._feeds.pop(room_id))
-                    self._household = household
+                    self._household = applied
                     self._groups = groups
-                    for room_id in unanswered:
+                    for room_id in unanswered - left_out:
                         self._feeds[room_id].stale = True
                     for room_id, state in read.items():
                         if room_id in held:

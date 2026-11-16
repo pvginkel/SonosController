@@ -247,6 +247,36 @@ class TestListSpeakers:
         assert response.status_code == 200
         assert response.get_json() == {"data": []}
 
+    def test_the_rooms_that_answer_are_listed_when_one_does_not(
+        self, client, sonos, mirror
+    ):
+        sonos.add_room(LOUNGE, "Lounge", model="Playbase", volume=40)
+        sonos.add_room(GARAGE, "Garage", model="Play:3", volume=20)
+        sonos.silence_room(LOUNGE)
+        mirror.start()
+
+        response = client.get("/api/speakers")
+
+        assert response.status_code == 200
+        assert response.get_json() == {"data": [GARAGE_ALONE]}
+        assert client.get(f"/api/speakers/{LOUNGE}").status_code == 404
+
+    def test_a_group_whose_coordinator_does_not_answer_is_not_listed(
+        self, client, sonos, mirror
+    ):
+        sonos.add_room(LOUNGE, "Lounge", model="Playbase", volume=40)
+        sonos.add_room(GARAGE, "Garage", model="Play:3", volume=20)
+        sonos.add_room(KITCHEN, "Kitchen", model="One", volume=60)
+        sonos.join(GARAGE, LOUNGE)
+        sonos.silence_room(LOUNGE)
+        mirror.start()
+
+        response = client.get("/api/speakers")
+
+        assert response.status_code == 200
+        assert response.get_json() == {"data": [KITCHEN_ALONE]}
+        assert client.get(f"/api/speakers/{GARAGE}").status_code == 404
+
     def test_a_name_is_nfc(self, client, household):
         household.rename_room(GARAGE, "Café")
         household.settle()

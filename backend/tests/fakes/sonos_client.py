@@ -172,9 +172,10 @@ class FakeSonosClient(SonosClient):
         self._lagging_group_volume: dict[str, int] = {}
         self._silent: set[str] = set()
         self._served: dict[str, bytes] = {}
-        # Called with the room's id before each call that reaches a room, and
-        # not for the calls it makes itself: a test makes something happen in
-        # the household between two calls of the code it tests.
+        # Called with the id of the room a call names before the call reaches
+        # a device, and not for the calls it makes itself: a test makes
+        # something happen in the household between two calls of the code it
+        # tests.
         self.before_call: Callable[[str], None] | None = None
         # False: no speaker answers, as when the household is switched off.
         self.reachable = True
@@ -341,8 +342,10 @@ class FakeSonosClient(SonosClient):
     def silence_room(self, speaker_id: str) -> None:
         """The room's device stops answering.
 
-        Every call to it fails, the end of a subscription included. The
-        household still lists the room.
+        Every call to it fails, the end of a subscription included: the
+        calls to the room itself, and the calls to a group it coordinates,
+        whichever room of the group they name. The household still lists the
+        room.
         """
         self._silent.add(speaker_id)
 
@@ -586,6 +589,22 @@ class FakeSonosClient(SonosClient):
             )
 
     def _room(self, speaker_id: str, operation: str = "reach") -> _Room:
+        """The room, for a call that goes to its own device."""
+        room = self._listed(speaker_id, operation)
+        self._require_answer(room.id, f"{operation} speaker {speaker_id}")
+        return room
+
+    def _coordinator(self, speaker_id: str, operation: str = "reach") -> _Room:
+        """The coordinator of the room's group, for a call that goes to the
+        group: SoCo sends it to the coordinator's device, and none to the
+        room's own."""
+        coordinator_id = self._listed(speaker_id, operation).coordinator_id
+        self._require_answer(coordinator_id, f"{operation} speaker {speaker_id}")
+        return self._rooms[coordinator_id]
+
+    def _listed(self, speaker_id: str, operation: str) -> _Room:
+        """The room a call names, as the household lists it when the call
+        reaches a device."""
         before_call = self.before_call
         if before_call is not None:
             self.before_call = None
@@ -599,11 +618,7 @@ class FakeSonosClient(SonosClient):
             raise ExternalServiceException(
                 described, f"speaker {speaker_id} is not in the household"
             )
-        self._require_answer(speaker_id, described)
         return self._rooms[speaker_id]
-
-    def _coordinator(self, speaker_id: str, operation: str = "reach") -> _Room:
-        return self._rooms[self._room(speaker_id, operation).coordinator_id]
 
     def _command(
         self, speaker_id: str, operation: str, action: TransportAction

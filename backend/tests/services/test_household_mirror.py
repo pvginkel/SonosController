@@ -713,6 +713,161 @@ class TestHouseholdMirrorLayout:
         assert started.speaker(LOUNGE).group.coordinator_id == LOUNGE
 
 
+class TestHouseholdMirrorRoomsThatDoNotAnswer:
+    """A room the layout lists that the mirror cannot subscribe to and read:
+    the layout is applied without it."""
+
+    def test_a_new_room_that_does_not_answer_holds_back_no_rename_and_no_regrouping(
+        self, started, household, connect
+    ):
+        stream = connect()
+        household.silence_room(KITCHEN)
+        household.add_room(KITCHEN, "Kitchen")
+        household.settle()
+        assert stream.events() == []
+
+        household.rename_room(GARAGE, "Workshop")
+        household.join(LOUNGE, GARAGE)
+        household.settle()
+
+        assert [speaker.name for speaker in started.speakers()] == [
+            "Lounge",
+            "Workshop",
+        ]
+        assert started.speaker(LOUNGE).group == SpeakerGroup(
+            coordinator_id=GARAGE, member_ids=(GARAGE, LOUNGE), volume=30, muted=False
+        )
+        assert started.playback(LOUNGE).track.title == "Track 1"
+        assert household.subscription_count(KITCHEN) == 0
+
+    def test_a_new_room_that_does_not_answer_holds_back_no_healing(
+        self, started, household
+    ):
+        household.silence_room(KITCHEN)
+        household.add_room(KITCHEN, "Kitchen")
+        household.settle()
+        # Made while the Garage has no subscription: only the read that
+        # follows its new subscriptions reports it.
+        household.before_call = once(lambda: household.set_volume(GARAGE, 33))
+
+        household.restart_room(GARAGE)
+        household.settle()
+
+        assert started.speaker(GARAGE).volume == 33
+        assert household.subscription_count(GARAGE) == 4
+        assert len(started.speakers()) == 2
+
+    def test_a_group_whose_coordinator_does_not_answer_is_left_out_whole(
+        self, household, mirror
+    ):
+        household.add_room(KITCHEN, "Kitchen", model="One", volume=60)
+        household.join(LOUNGE, GARAGE)
+        household.silence_room(GARAGE)
+        reached = []
+        household.before_call = reached.append
+
+        mirror.start()
+
+        assert [speaker.id for speaker in mirror.speakers()] == [KITCHEN]
+        for speaker_id in (GARAGE, LOUNGE):
+            with pytest.raises(SpeakerNotFoundException):
+                mirror.playback(speaker_id)
+        # No room of the group is asked once its coordinator did not answer.
+        assert LOUNGE not in reached
+        assert household.subscription_count(GARAGE) == 0
+        assert household.subscription_count(LOUNGE) == 0
+        assert household.subscription_count(KITCHEN) == 4
+
+    def test_a_held_room_is_left_out_when_it_joins_a_coordinator_that_does_not_answer(
+        self, started, household, connect
+    ):
+        stream = connect()
+        household.silence_room(KITCHEN)
+        household.add_room(KITCHEN, "Kitchen", model="One", volume=60)
+
+        household.join(LOUNGE, KITCHEN)
+        household.settle()
+
+        assert [speaker.id for speaker in started.speakers()] == [GARAGE]
+        with pytest.raises(SpeakerNotFoundException):
+            started.playback(LOUNGE)
+        assert household.subscription_count(LOUNGE) == 0
+        assert stream.events() == [speakers_changed()]
+
+        # What the other rooms report goes on.
+        household.set_volume(GARAGE, 21)
+        household.settle()
+        assert started.speaker(GARAGE).volume == 21
+        assert stream.events() == [volume_changed(GARAGE)] * 2
+
+    def test_a_room_that_does_not_answer_is_left_out_of_its_group(
+        self, household, mirror
+    ):
+        household.join(LOUNGE, GARAGE)
+        household.silence_room(LOUNGE)
+
+        mirror.start()
+
+        # The group's volume is what its coordinator reports: that of both.
+        assert mirror.speakers() == [
+            Speaker(
+                id=GARAGE,
+                name="Garage",
+                model="Play:3",
+                volume=20,
+                muted=False,
+                group=SpeakerGroup(
+                    coordinator_id=GARAGE, member_ids=(GARAGE,), volume=30, muted=False
+                ),
+            )
+        ]
+        assert mirror.playback(GARAGE).track.title == "Track 1"
+        assert household.subscription_count(LOUNGE) == 0
+
+    def test_a_room_that_now_coordinates_and_does_not_answer_is_left_out(
+        self, household, mirror, connect, caplog
+    ):
+        # Mirrored while it followed the Garage: what is held of it is not
+        # what it plays alone.
+        household.join(LOUNGE, GARAGE)
+        mirror.start()
+        household.settle()
+        stream = connect()
+        household.silence_room(LOUNGE)
+
+        with caplog.at_level(logging.WARNING, "app.services.household_mirror"):
+            household.unjoin(GARAGE)
+            household.settle()
+
+        assert [speaker.id for speaker in mirror.speakers()] == [GARAGE]
+        assert mirror.speaker(GARAGE).group == SpeakerGroup(
+            coordinator_id=GARAGE, member_ids=(GARAGE,), volume=20, muted=False
+        )
+        assert household.subscription_count(LOUNGE) == 0
+        events = stream.events()
+        assert speakers_changed() in events
+        assert volume_changed(GARAGE) in events
+        assert playback_changed(GARAGE) not in events
+        assert not [event for event in events if event["payload"] == {"speaker_id": LOUNGE}]
+        assert logged(caplog) == [
+            (
+                "WARNING",
+                "A subscription the mirror no longer uses was not ended; the "
+                "speaker ends it when it is not renewed: Cannot end the "
+                f"subscription to AVTransport events of speaker {LOUNGE} because "
+                "external service failed: the speaker did not answer "
+                "(ConnectTimeout)",
+            ),
+            (
+                "WARNING",
+                "The household is not mirrored in full; the layout is read again "
+                f"every 10.0 s: Cannot read the playback of speaker {LOUNGE} "
+                "because external service failed: the speaker did not answer "
+                "(ConnectTimeout)",
+            ),
+        ]
+
+
 class TestHouseholdMirrorSubscriptions:
     def test_it_subscribes_to_the_four_services_of_every_room(self, started, household):
         for speaker_id in (GARAGE, LOUNGE):
@@ -814,14 +969,33 @@ class TestHouseholdMirrorSubscriptions:
 
         assert mirror.speakers() == []
 
-    def test_a_room_that_fails_leaves_nothing_mirrored(self, household, mirror):
+    def test_start_mirrors_the_rooms_that_answer_when_one_does_not(
+        self, household, mirror, caplog
+    ):
         household.silence_room(LOUNGE)
 
-        mirror.start()
+        with caplog.at_level(logging.WARNING, "app.services.household_mirror"):
+            mirror.start()
 
-        assert mirror.speakers() == []
-        assert household.subscription_count(GARAGE) == 0
+        assert [speaker.id for speaker in mirror.speakers()] == [GARAGE]
+        assert mirror.playback(GARAGE).queue_length == 3
+        with pytest.raises(SpeakerNotFoundException):
+            mirror.speaker(LOUNGE)
+        assert household.subscription_count(GARAGE) == 4
         assert household.subscription_count(LOUNGE) == 0
+        assert logged(caplog) == [
+            (
+                "WARNING",
+                "The household is not mirrored in full; the layout is read again "
+                "every 10.0 s: Cannot subscribe to AVTransport events of speaker "
+                f"{LOUNGE} because external service failed: the speaker did not "
+                "answer (ConnectTimeout)",
+            )
+        ]
+
+        household.set_volume(GARAGE, 21)
+        household.settle()
+        assert mirror.speaker(GARAGE).volume == 21
 
     def test_stop_ends_the_other_subscriptions_when_a_speaker_fails(
         self, started, household
@@ -1208,16 +1382,105 @@ class TestHouseholdMirrorChecks:
         assert household.subscription_count(GARAGE) == 0
 
     def test_a_room_that_does_not_answer_at_start_is_mirrored_once_it_does(
-        self, household, mirror
+        self, household, mirror, connect
     ):
         household.silence_room(LOUNGE)
         mirror.start()
-        assert mirror.speakers() == []
+        stream = connect()
+        assert [speaker.id for speaker in mirror.speakers()] == [GARAGE]
 
         household.answer_again(LOUNGE)
         eventually(lambda: len(mirror.speakers()) == 2)
 
         assert household.subscription_count(GARAGE) == 4
+        assert household.subscription_count(LOUNGE) == 4
+        assert stream.events() == [speakers_changed()]
+
+        household.set_volume(LOUNGE, 41)
+        household.settle()
+        assert mirror.speaker(LOUNGE).volume == 41
+
+    def test_a_group_whose_coordinator_does_not_answer_is_mirrored_once_it_does(
+        self, household, mirror, connect
+    ):
+        household.join(LOUNGE, GARAGE)
+        household.silence_room(GARAGE)
+        mirror.start()
+        stream = connect()
+        assert mirror.speakers() == []
+
+        household.answer_again(GARAGE)
+        eventually(lambda: len(mirror.speakers()) == 2)
+
+        group = SpeakerGroup(
+            coordinator_id=GARAGE, member_ids=(GARAGE, LOUNGE), volume=30, muted=False
+        )
+        assert mirror.speaker(GARAGE).group == group
+        assert mirror.speaker(LOUNGE).group == group
+        assert mirror.playback(LOUNGE).track.title == "Track 1"
+        assert household.subscription_count(GARAGE) == 4
+        assert household.subscription_count(LOUNGE) == 4
+        assert stream.events() == [speakers_changed()]
+
+    def test_a_held_room_is_mirrored_again_once_the_coordinator_it_joined_answers(
+        self, started, household
+    ):
+        household.silence_room(KITCHEN)
+        household.add_room(KITCHEN, "Kitchen", model="One", volume=60)
+        household.join(LOUNGE, KITCHEN)
+        household.settle()
+        assert [speaker.id for speaker in started.speakers()] == [GARAGE]
+
+        household.answer_again(KITCHEN)
+        eventually(lambda: len(started.speakers()) == 3)
+
+        assert started.speaker(LOUNGE).group == SpeakerGroup(
+            coordinator_id=KITCHEN, member_ids=(LOUNGE, KITCHEN), volume=50, muted=False
+        )
+        assert started.playback(LOUNGE).queue_length == 0
+        assert household.subscription_count(LOUNGE) == 4
+        assert household.subscription_count(KITCHEN) == 4
+
+        household.load_queue(KITCHEN, [queue_track(9)])
+        household.settle()
+        assert started.playback(LOUNGE).track.title == "Track 9"
+
+    def test_a_room_left_out_of_its_group_is_in_it_once_it_answers(
+        self, household, mirror
+    ):
+        household.join(LOUNGE, GARAGE)
+        household.silence_room(LOUNGE)
+        mirror.start()
+        assert mirror.speaker(GARAGE).group.member_ids == (GARAGE,)
+
+        household.answer_again(LOUNGE)
+        eventually(lambda: len(mirror.speakers()) == 2)
+
+        group = SpeakerGroup(
+            coordinator_id=GARAGE, member_ids=(GARAGE, LOUNGE), volume=30, muted=False
+        )
+        assert mirror.speaker(GARAGE).group == group
+        assert mirror.speaker(LOUNGE).group == group
+        assert household.subscription_count(LOUNGE) == 4
+
+    def test_a_room_that_now_coordinates_is_mirrored_again_once_it_answers(
+        self, household, mirror
+    ):
+        household.join(LOUNGE, GARAGE)
+        mirror.start()
+        household.settle()
+        household.silence_room(LOUNGE)
+        household.unjoin(GARAGE)
+        household.settle()
+        assert [speaker.id for speaker in mirror.speakers()] == [GARAGE]
+
+        household.answer_again(LOUNGE)
+        eventually(lambda: len(mirror.speakers()) == 2)
+
+        assert mirror.speaker(LOUNGE).group == SpeakerGroup(
+            coordinator_id=LOUNGE, member_ids=(LOUNGE,), volume=40, muted=False
+        )
+        assert mirror.playback(LOUNGE).track is None
         assert household.subscription_count(LOUNGE) == 4
 
     def test_a_new_room_that_does_not_answer_is_mirrored_once_it_does(

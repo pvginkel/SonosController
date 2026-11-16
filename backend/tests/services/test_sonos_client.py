@@ -1078,6 +1078,35 @@ class TestSonosClientSubscriptions:
         assert len(household.read_household().rooms) == 2
         assert household.read_volume(LOUNGE) == Volume(40, False)
 
+    def test_a_silent_coordinator_fails_every_call_to_its_group(self, household):
+        household.join(LOUNGE, GARAGE)
+        household.silence_room(GARAGE)
+
+        # A call to a group goes to its coordinator, whichever room it names.
+        for speaker_id in (GARAGE, LOUNGE):
+            with pytest.raises(ExternalServiceException, match="did not answer"):
+                household.read_playback(speaker_id)
+            with pytest.raises(ExternalServiceException, match="did not answer"):
+                household.read_group_volume(speaker_id)
+            with pytest.raises(ExternalServiceException, match="did not answer"):
+                household.play(speaker_id)
+            with pytest.raises(ExternalServiceException, match="did not answer"):
+                household.set_group_volume(speaker_id, 10)
+        # The calls to the room that follows it reach that room.
+        assert household.read_volume(LOUNGE) == Volume(40, False)
+        assert household.read_model(LOUNGE) == "Playbase"
+
+    def test_a_silent_room_that_follows_fails_no_call_to_its_group(self, household):
+        household.join(LOUNGE, GARAGE)
+        household.silence_room(LOUNGE)
+
+        assert household.read_group_volume(LOUNGE) == Volume(30, False)
+        assert household.read_playback(LOUNGE) == household.read_playback(GARAGE)
+        household.play(LOUNGE)
+        assert household.read_playback(GARAGE).transport_state is TransportState.PLAYING
+        with pytest.raises(ExternalServiceException, match="did not answer"):
+            household.read_volume(LOUNGE)
+
     def test_a_silent_room_can_answer_again(self, household):
         household.silence_room(GARAGE)
         household.answer_again(GARAGE)
