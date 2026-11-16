@@ -64,12 +64,15 @@ Plex. pytest overrides the two client providers with hand-written in-memory fake
 in `backend/tests/fakes/` (a household's rooms with their queues, transport, volume and groups;
 Plex's library of artists, albums, tracks and playlists, with their pictures). Never `MagicMock`,
 never `monkeypatch` of SoCo or plexapi internals, and no other fake anywhere: everything above the
-clients is real. One test is the named exception:
+clients is real. Two tests are the named exceptions.
 `test_the_soco_client_asks_a_speaker_while_soco_holds_a_topology_subscription` in
 `backend/tests/services/test_sonos_client.py` sets SoCo's state by hand (a SoCo instance's private
 household id, a stand-in subscription in SoCo's registry, the client's private entry), because it is
 the only test that fails when the client answers a layout read from SoCo's cache while a topology
-subscription is held, and the live suite cannot fail on that.
+subscription is held, and the live suite cannot fail on that. The live suite's
+`test_an_artist_an_album_and_a_playlist_from_one_request` in `backend/tests/live/test_plex_client.py`
+counts the requests `read_items()` sends with `mock.patch.object(..., wraps=...)` on the Plex
+client's own session, a spy that passes every call on to the real Plex and fakes nothing.
 
 What the fakes cannot prove is what the real clients send, so a separate **live suite**,
 `backend/tests/live/`, marked `live` and deselected by default, runs the real clients against the
