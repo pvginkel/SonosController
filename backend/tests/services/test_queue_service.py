@@ -967,6 +967,40 @@ class TestQueueServiceQueueingInTurn:
         ]
         assert keys(household, GARAGE) == OLD_TRACKS
 
+    def test_a_task_ended_while_it_waits_reads_nothing_of_plex(
+        self, queue, household, items, tasks, calls, artist, monkeypatch
+    ):
+        artist_task, held = artist
+        waiting = queue.queue(GARAGE, asked("album", NEW_ALBUM, "add"))
+        tasks.started(waiting.task_id)
+        # Plex fails from here on for what a task reads in its turn; the
+        # Play below is still read when it is asked.
+        plex_fails = threading.Event()
+        plex_fails.set()
+        section_id = items.section_id
+
+        def failing_section_id() -> str:
+            if plex_fails.is_set():
+                raise ExternalServiceException(
+                    "read Plex's music library", "Plex did not answer (ConnectionError)"
+                )
+            return section_id()
+
+        monkeypatch.setattr(items, "section_id", failing_section_id)
+
+        later = queue.queue(GARAGE, asked("album", OLD_ALBUM, "play"))
+
+        # Ended while the artist still holds its turn: done, not failed.
+        completed(tasks.finish(waiting.task_id))
+        plex_fails.clear()
+        held.release()
+        completed(tasks.finish(artist_task))
+        completed(tasks.finish(later.task_id))
+        assert calls == [
+            *PROLIFIC_TO_THE_HELD_CALL,
+            *replaced(False, ("album", OLD_ALBUM)),
+        ]
+
     def test_a_task_that_fails_leaves_its_turn_to_the_next(
         self, queue, household, tasks, artist
     ):
