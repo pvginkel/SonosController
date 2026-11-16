@@ -217,11 +217,16 @@ class TestGetPlayback:
     def test_while_plex_is_down_it_is_served_without_artwork(
         self, client, household, plex
     ):
+        # Plex has answered: the backend knows which server it is.
+        assert playback(client, GARAGE)["track"]["track_id"] == "1001"
         plex.reachable = False
+        household.play(GARAGE)
+        household.settle()
 
         answer = playback(client, GARAGE)
 
         assert answer["track"]["title"] == "Track 1"
+        assert answer["track"]["track_id"] == "1001"
         assert answer["track"]["artwork_id"] is None
 
     @pytest.mark.parametrize("speaker_id", [NOWHERE, "Garage"])

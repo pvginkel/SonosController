@@ -225,6 +225,8 @@ class TestGetArtwork:
     def test_while_plex_is_down_the_playback_state_is_served_without_artwork(
         self, household, plex, mirror
     ):
+        # Plex has answered: the backend knows which server it is.
+        assert mirror.playback(GARAGE).track.track_id == "1001"
         plex.reachable = False
         household.play(GARAGE)
         household.settle()
