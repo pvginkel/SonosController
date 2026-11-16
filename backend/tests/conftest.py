@@ -21,9 +21,11 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from collections.abc import Callable, Generator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from queue import Empty
 from typing import Any
@@ -323,3 +325,70 @@ def connect(app: Flask) -> Generator[Callable[[], EventStream]]:
     finally:
         for stream in streams:
             manager.on_disconnect(stream.connection)
+
+
+class Held:
+    """Holds the first call of one name the household gets until
+    ``release()``, as a speaker that takes its time to answer holds the task
+    that asks it; ``fail()`` releases it as a failure of the speaker."""
+
+    def __init__(
+        self, household: FakeSonosClient, monkeypatch: pytest.MonkeyPatch, name: str
+    ) -> None:
+        self._first = threading.Lock()
+        self._reached = threading.Event()
+        self._released = threading.Event()
+        self._failure: Exception | None = None
+        original = getattr(household, name)
+
+        def held(speaker_id: str, *args: object) -> None:
+            if self._first.acquire(blocking=False):
+                self._reached.set()
+                assert self._released.wait(5.0), "the call was not released"
+                if self._failure is not None:
+                    raise self._failure
+            original(speaker_id, *args)
+
+        monkeypatch.setattr(household, name, held)
+
+    def wait(self) -> None:
+        """Wait until the call is held."""
+        assert self._reached.wait(5.0), "no such call came to the household"
+
+    def release(self) -> None:
+        self._released.set()
+
+    def fail(self, failure: Exception) -> None:
+        self._failure = failure
+        self._released.set()
+
+
+@pytest.fixture
+def hold(
+    sonos: FakeSonosClient, monkeypatch: pytest.MonkeyPatch
+) -> Generator[Callable[[str], Held]]:
+    """Hold the first call of a name; whatever is still held is released
+    after the test, before the household closes."""
+    holds: list[Held] = []
+
+    def hold(name: str) -> Held:
+        holds.append(Held(sonos, monkeypatch, name))
+        return holds[-1]
+
+    try:
+        yield hold
+    finally:
+        for held in holds:
+            held.release()
+
+
+@pytest.fixture
+def aside() -> Generator[ThreadPoolExecutor]:
+    """Run a call on a thread of its own, as the server runs a request: the
+    test goes on while the call waits. A call still waiting when the test
+    ends is not waited for."""
+    executor = ThreadPoolExecutor(max_workers=2)
+    try:
+        yield executor
+    finally:
+        executor.shutdown(wait=False)

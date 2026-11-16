@@ -10,8 +10,8 @@ identifier of the configured Plex server: it gets its rating key and Plex's
 picture, and every other entry neither. Every string is Unicode NFC.
 
 An item of the library is queued by a task, as containers of the Plex
-service linked in Sonos (sections 1.3 to 1.5). A group's queueing tasks take
-their turns in its lane (``QueueingLanes``).
+service linked in Sonos (sections 1.3 to 1.5). A group's queueing tasks and
+its Clears take their turns in its lane (``QueueingLanes``).
 """
 
 import logging
@@ -128,12 +128,18 @@ class QueueService:
     def clear(self, speaker_id: str) -> None:
         """Empty the queue of the room's group.
 
+        Every queueing task asked before on the group is ended, as a Play
+        ends them, and the queue is emptied in a turn of its own on the
+        group's lane: once the call under way has landed, and before every
+        task asked after it. It returns once the queue is empty.
+
         Raises:
             SpeakerNotFoundException: The household has no such room.
             ExternalServiceException: The speaker failed.
         """
-        self._mirror.speaker(speaker_id)
-        self._sonos.clear_queue(speaker_id)
+        group_id = self._mirror.speaker(speaker_id).group.coordinator_id
+        with self._lanes.clear_turn(group_id):
+            self._sonos.clear_queue(speaker_id)
 
     def queue(self, speaker_id: str, request: QueueRequestSchema) -> TaskStartResponse:
         """Start the task that plays, shuffles or adds an item of the library
@@ -230,8 +236,9 @@ class QueueingTask(BaseTask):
     ``ADD_MANY_LIMIT`` a call. Plex is read before the queue changes. A
     failure ends the task where it is, the queue as far as it got.
 
-    The task runs in its turn in the group's lane. A task a later Play or
-    Shuffle ends stops before its next call to the speaker and returns.
+    The task runs in its turn in the group's lane. A task a later Play,
+    Shuffle or Clear ends stops before its next call to the speaker and
+    returns.
     """
 
     def __init__(

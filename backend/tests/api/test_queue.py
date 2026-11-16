@@ -346,6 +346,31 @@ class TestClearQueue:
                 ("queue_changed", KITCHEN),
             ]
 
+    def test_it_ends_the_groups_queueing_and_answers_once_the_queue_is_empty(
+        self, client, household, library, tasks, hold, aside
+    ):
+        held = hold("add_many_to_queue")
+        artist = queue_item(
+            client, GARAGE, {"kind": "artist", "item_id": BAND, "action": "play"}
+        ).get_json()["task_id"]
+        held.wait()
+        waiting = queue_item(
+            client, GARAGE, {"kind": "album", "item_id": OLD_ALBUM, "action": "add"}
+        ).get_json()["task_id"]
+        tasks.started(waiting)
+
+        response = aside.submit(clear, client, GARAGE)
+
+        # The waiting task is ended at once; the Clear waits for the call
+        # under way.
+        assert tasks.finish(waiting)[-1]["event_type"] == "task_completed"
+        assert not response.done()
+        held.release()
+        assert response.result(5.0).status_code == 204
+        assert track_ids(client, GARAGE) == []
+        assert tasks.finish(artist)[-1]["event_type"] == "task_completed"
+        assert track_ids(client, GARAGE) == []
+
     def test_an_unknown_speaker_is_not_found(self, client, household):
         response = clear(client, NOWHERE)
 
@@ -703,8 +728,11 @@ class TestQueueDocument:
         assert operation["summary"] == "Clear the queue of the speaker's group."
         assert "requestBody" not in operation
         assert "content" not in operation["responses"]["204"]
+        description = " ".join(operation["description"].split())
+        assert "A queueing task still running on the group is ended" in description
+        assert "once the queue is empty" in description
         for event in ("`queue_changed`", "`playback_changed`"):
-            assert event in operation["description"]
+            assert event in description
 
     def test_queueing_says_what_it_does(self, path):
         operation = path["post"]

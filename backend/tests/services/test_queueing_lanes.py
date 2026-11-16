@@ -1,10 +1,10 @@
 """Tests for the queueing lanes, on a task service of their own and tasks
-that do nothing but take their turns.
+and Clears that do nothing but take their turns.
 
-The queue service's tests drive the lanes with queueing tasks on the fake
-household; these hold what those cannot reach: a task ended before a worker
-took it, one cancelled through the task service, and a task the task service
-refuses.
+The queue service's tests drive the lanes with queueing tasks and Clears on
+the fake household; these hold what those cannot reach: a task ended before a
+worker took it, one cancelled through the task service, a task the task
+service refuses, and a Clear that is held or fails in its turn.
 """
 
 import threading
@@ -15,6 +15,7 @@ import pytest
 from flask import Flask
 from pydantic import BaseModel
 
+from app.core_exceptions import ExternalServiceException
 from app.exceptions import InvalidOperationException
 from app.services.base_task import BaseTask, ProgressHandle
 from app.services.queueing_lanes import QueueingLanes
@@ -68,6 +69,37 @@ class Turn(BaseTask):
         self._released.set()
 
 
+class Clear:
+    """A Clear's turn on the group: ``run()`` writes ``clear`` down when its
+    turn comes, and ``/clear`` when the turn ends; with ``held``, it holds its
+    turn until ``release()``."""
+
+    def __init__(
+        self, lanes: QueueingLanes, group_id: str, taken: list[str], held: bool = False
+    ) -> None:
+        self._lanes = lanes
+        self._group_id = group_id
+        self._taken = taken
+        self._holding = threading.Event()
+        self._released = threading.Event()
+        if not held:
+            self._released.set()
+
+    def run(self) -> None:
+        with self._lanes.clear_turn(self._group_id):
+            self._taken.append("clear")
+            self._holding.set()
+            assert self._released.wait(5.0), "the turn was not released"
+            self._taken.append("/clear")
+
+    def wait(self) -> None:
+        """Wait until the Clear holds its turn."""
+        assert self._holding.wait(5.0), "the turn did not come"
+
+    def release(self) -> None:
+        self._released.set()
+
+
 @pytest.fixture
 def workers() -> int:
     return 4
@@ -101,9 +133,9 @@ def lanes(task_service: TaskService) -> QueueingLanes:
 
 
 @pytest.fixture
-def held(lanes: QueueingLanes) -> Generator[list[Turn]]:
-    """The held tasks a test makes, released after it."""
-    turns: list[Turn] = []
+def held(lanes: QueueingLanes) -> Generator[list[Turn | Clear]]:
+    """The held tasks and Clears a test makes, released after it."""
+    turns: list[Turn | Clear] = []
     try:
         yield turns
     finally:
@@ -252,3 +284,86 @@ class TestQueueingLanesTurn:
         # The task service sends no event for a task it cancelled.
         assert completed(tasks.finish(later.task_id))
         assert taken == ["first", "/first", "later", "/later"]
+
+
+class TestQueueingLanesClearTurn:
+    def test_a_clear_ends_the_task_in_its_turn_and_those_waiting(
+        self, lanes, first, taken, tasks, aside
+    ):
+        waiting = [
+            lanes.start(GROUP, Turn(lanes, GROUP, name, taken), replaces=False)
+            for name in ("second", "third")
+        ]
+        for task in waiting:
+            tasks.started(task.task_id)
+
+        cleared = aside.submit(Clear(lanes, GROUP, taken).run)
+
+        # At once, while the first still holds its turn.
+        for task in waiting:
+            assert completed(tasks.finish(task.task_id))
+        assert first.is_cancelled is True
+        assert not cleared.done()
+        first.release()
+        assert cleared.result(5.0) is None
+        assert taken == ["first", "/first", "clear", "/clear"]
+
+    @pytest.mark.parametrize("replaces", [False, True])
+    def test_a_task_asked_after_a_clear_takes_its_turn_after_it(
+        self, lanes, first, held, taken, tasks, aside, replaces
+    ):
+        waiting = lanes.start(GROUP, Turn(lanes, GROUP, "waiting", taken), replaces=False)
+        tasks.started(waiting.task_id)
+        clear = Clear(lanes, GROUP, taken, held=True)
+        held.append(clear)
+        cleared = aside.submit(clear.run)
+        # Ended by the Clear, which has its place in the lane from then on.
+        assert completed(tasks.finish(waiting.task_id))
+
+        later = lanes.start(GROUP, Turn(lanes, GROUP, "later", taken), replaces=replaces)
+        tasks.started(later.task_id)
+        first.release()
+
+        clear.wait()
+        assert taken == ["first", "/first", "clear"]
+        clear.release()
+        assert cleared.result(5.0) is None
+        assert completed(tasks.finish(later.task_id))
+        assert taken == ["first", "/first", "clear", "/clear", "later", "/later"]
+
+    def test_clears_take_their_turns_in_the_order_asked(
+        self, lanes, held, taken, aside
+    ):
+        clear = Clear(lanes, GROUP, taken, held=True)
+        held.append(clear)
+        cleared = aside.submit(clear.run)
+        clear.wait()
+
+        again = aside.submit(Clear(lanes, GROUP, taken).run)
+
+        assert not again.done()
+        clear.release()
+        assert cleared.result(5.0) is None
+        assert again.result(5.0) is None
+        assert taken == ["clear", "/clear", "clear", "/clear"]
+
+    def test_another_groups_clear_ends_nothing_and_takes_its_turn_meanwhile(
+        self, lanes, first, taken, aside
+    ):
+        assert aside.submit(Clear(lanes, OTHER_GROUP, taken).run).result(5.0) is None
+
+        assert first.is_cancelled is False
+        assert taken == ["first", "clear", "/clear"]
+
+    def test_a_clear_that_fails_in_its_turn_leaves_it_to_the_next(
+        self, lanes, taken, tasks
+    ):
+        with pytest.raises(ExternalServiceException):
+            with lanes.clear_turn(GROUP):
+                raise ExternalServiceException(
+                    "clear the queue", "the speaker did not answer"
+                )
+
+        later = lanes.start(GROUP, Turn(lanes, GROUP, "later", taken), replaces=False)
+        assert completed(tasks.finish(later.task_id))
+        assert taken == ["later", "/later"]

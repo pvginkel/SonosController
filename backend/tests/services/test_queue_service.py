@@ -7,7 +7,7 @@ household mirror.
 import logging
 import threading
 import unicodedata
-from collections.abc import Callable, Generator, Iterable
+from collections.abc import Iterable
 from dataclasses import replace
 from datetime import date
 
@@ -33,6 +33,7 @@ from app.services.sonos_client import (
 )
 from app.utils.artwork_id import plex_artwork_id
 from app.utils.plex_queue_entry import parse_plex_queue_entry
+from tests.conftest import Held
 from tests.fakes.plex_client import FakePlexClient
 from tests.fakes.sonos_client import FakeSonosClient, app_track, queue_track
 
@@ -823,61 +824,6 @@ class TestQueueServiceQueue:
         assert mirror.queue_position(GARAGE) == 1
 
 
-class Held:
-    """Holds the first call of one name the household gets until
-    ``release()``, as a speaker that takes its time to answer holds the task
-    that asks it; ``fail()`` releases it as a failure of the speaker."""
-
-    def __init__(
-        self, household: FakeSonosClient, monkeypatch: pytest.MonkeyPatch, name: str
-    ) -> None:
-        self._first = threading.Lock()
-        self._reached = threading.Event()
-        self._released = threading.Event()
-        self._failure: Exception | None = None
-        original = getattr(household, name)
-
-        def held(speaker_id: str, *args: object) -> None:
-            if self._first.acquire(blocking=False):
-                self._reached.set()
-                assert self._released.wait(5.0), "the call was not released"
-                if self._failure is not None:
-                    raise self._failure
-            original(speaker_id, *args)
-
-        monkeypatch.setattr(household, name, held)
-
-    def wait(self) -> None:
-        """Wait until the call is held."""
-        assert self._reached.wait(5.0), "no such call came to the household"
-
-    def release(self) -> None:
-        self._released.set()
-
-    def fail(self, failure: Exception) -> None:
-        self._failure = failure
-        self._released.set()
-
-
-@pytest.fixture
-def hold(
-    household: FakeSonosClient, monkeypatch: pytest.MonkeyPatch
-) -> Generator[Callable[[str], Held]]:
-    """Hold the first call of a name; whatever is still held is released
-    after the test, before the household closes."""
-    holds: list[Held] = []
-
-    def hold(name: str) -> Held:
-        holds.append(Held(household, monkeypatch, name))
-        return holds[-1]
-
-    try:
-        yield hold
-    finally:
-        for held in holds:
-            held.release()
-
-
 def completed(events: list[dict]) -> None:
     """The task's events are those of a task that is done, as one a later
     Play or Shuffle ended is: nothing failed."""
@@ -896,10 +842,10 @@ PROLIFIC_TRACKS = [f"3{n:02}0" for n in range(18)]
 
 
 class TestQueueServiceQueueingInTurn:
-    """A group's queueing tasks run one at a time, in the order asked, and a
-    Play or a Shuffle ends what the tasks asked before it still had to
-    queue. Each test holds an artist that is still being queued at its
-    first call of sixteen albums."""
+    """A group's queueing tasks and Clears run one at a time, in the order
+    asked, and a Play, a Shuffle or a Clear ends what the tasks asked before
+    it still had to queue. Each test holds an artist that is still being
+    queued at its first call of sixteen albums."""
 
     @pytest.fixture(autouse=True)
     def items(self, library: FakePlexClient) -> FakePlexClient:
@@ -1085,6 +1031,91 @@ class TestQueueServiceQueueingInTurn:
         # While the Garage's artist still holds its turn.
         completed(tasks.finish(lounge.task_id))
         assert keys(household, LOUNGE) == OLD_TRACKS
+        held.release()
+        completed(tasks.finish(artist_task))
+        assert keys(household, GARAGE) == PROLIFIC_TRACKS
+
+    def test_a_clear_ends_the_groups_tasks_and_empties_the_queue_once_the_call_landed(
+        self, queue, household, tasks, calls, artist, aside
+    ):
+        artist_task, held = artist
+        waiting = queue.queue(GARAGE, asked("album", NEW_ALBUM, "add"))
+        tasks.started(waiting.task_id)
+
+        cleared = aside.submit(queue.clear, GARAGE)
+
+        # The waiting task is ended at once; the Clear waits for the call
+        # under way.
+        completed(tasks.finish(waiting.task_id))
+        assert not cleared.done()
+        held.release()
+        assert cleared.result(5.0) is None
+        assert keys(household, GARAGE) == []
+        completed(tasks.finish(artist_task))
+        # The artist's last album is never queued.
+        assert calls == [*PROLIFIC_TO_THE_HELD_CALL, ("clear_queue", GARAGE)]
+
+    @pytest.mark.parametrize("action", ["add", "play"])
+    def test_what_is_asked_after_a_clear_lands_after_it(
+        self, queue, household, tasks, calls, artist, aside, action
+    ):
+        artist_task, held = artist
+        waiting = queue.queue(GARAGE, asked("album", NEW_ALBUM, "add"))
+        tasks.started(waiting.task_id)
+        cleared = aside.submit(queue.clear, GARAGE)
+        # Ended by the Clear, which has its place in the lane from then on.
+        completed(tasks.finish(waiting.task_id))
+
+        later = queue.queue(GARAGE, asked("album", OLD_ALBUM, action))
+        tasks.started(later.task_id)
+        held.release()
+
+        assert cleared.result(5.0) is None
+        completed(tasks.finish(artist_task))
+        completed(tasks.finish(later.task_id))
+        queued = (
+            [("add_to_queue", GARAGE, "album", OLD_ALBUM)]
+            if action == "add"
+            else replaced(False, ("album", OLD_ALBUM))
+        )
+        assert calls == [
+            *PROLIFIC_TO_THE_HELD_CALL,
+            ("clear_queue", GARAGE),
+            *queued,
+        ]
+        assert keys(household, GARAGE) == OLD_TRACKS
+
+    def test_a_clear_on_a_room_of_a_group_ends_what_the_group_still_queues(
+        self, queue, household, tasks, calls, hold, aside
+    ):
+        household.join(KITCHEN, GARAGE)
+        household.settle()
+        held = hold("add_many_to_queue")
+        artist = queue.queue(
+            GARAGE, asked("artist", PROLIFIC, "play", order="oldest_first")
+        )
+        held.wait()
+        waiting = queue.queue(GARAGE, asked("album", NEW_ALBUM, "add"))
+        tasks.started(waiting.task_id)
+
+        cleared = aside.submit(queue.clear, KITCHEN)
+
+        completed(tasks.finish(waiting.task_id))
+        held.release()
+        assert cleared.result(5.0) is None
+        completed(tasks.finish(artist.task_id))
+        assert calls == [*PROLIFIC_TO_THE_HELD_CALL, ("clear_queue", KITCHEN)]
+        assert keys(household, GARAGE) == []
+
+    def test_another_groups_clear_ends_nothing_of_a_group_still_queueing(
+        self, queue, household, tasks, artist
+    ):
+        artist_task, held = artist
+
+        queue.clear(LOUNGE)
+
+        # At once, while the Garage's artist still holds its turn.
+        assert keys(household, LOUNGE) == []
         held.release()
         completed(tasks.finish(artist_task))
         assert keys(household, GARAGE) == PROLIFIC_TRACKS

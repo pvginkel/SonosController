@@ -85,8 +85,10 @@ def clear_queue(
 ) -> tuple[str, int]:
     """Clear the queue of the speaker's group.
 
-    A group that plays from its queue stops. What changed arrives as the
-    events `queue_changed` and `playback_changed`.
+    A queueing task still running on the group is ended first, as a `play`
+    ends it, and the answer comes once the queue is empty. A group that
+    plays from its queue stops. What changed arrives as the events
+    `queue_changed` and `playback_changed`.
     """
     queue_service.clear(speaker_id)
     return "", 204
