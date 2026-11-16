@@ -13,6 +13,7 @@ from app.services.event_sender import EventSender
 from app.services.frontend_version_service import FrontendVersionService
 from app.services.health_service import HealthService
 from app.services.household_mirror import HouseholdMirror
+from app.services.library_service import LibraryService
 from app.services.metrics_service import MetricsService
 from app.services.plex_client import PlexapiPlexClient
 from app.services.sonos_client import SoCoSonosClient
@@ -144,6 +145,13 @@ class ServiceContainer(containers.DeclarativeContainer):
         household_mirror=household_mirror,
         sonos_client=sonos_client,
         plex_client=plex_client,
+    )
+
+    # Library service - the music library, read from Plex on each request
+    library_service = providers.Factory(
+        LibraryService,
+        plex_client=plex_client,
+        playlist_max_tracks=app_config.provided.playlist_max_tracks,
     )
 
     # Speaker service - playback and volume commands to the speakers

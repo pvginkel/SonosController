@@ -89,6 +89,19 @@ class SpeakerNotFoundException(RecordNotFoundException):
         self.error_code = "SPEAKER_NOT_FOUND"
 
 
+class ItemNotFoundException(RecordNotFoundException):
+    """Exception raised when Plex has no item of a kind with the given rating key.
+
+    Args:
+        kind: What was asked for, as the message starts ("Artist").
+        item_id: The rating key asked for.
+    """
+
+    def __init__(self, kind: str, item_id: str) -> None:
+        super().__init__(kind, item_id)
+        self.error_code = "ITEM_NOT_FOUND"
+
+
 class ActionNotAvailableException(InvalidOperationException):
     """Exception raised for a playback command the speaker does not allow now.
 

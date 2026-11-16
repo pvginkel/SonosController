@@ -46,6 +46,11 @@ class AppEnvironment(BaseSettings):
         default=None,
         description="The music library's name; optional when the server has one",
     )
+    PLAYLIST_MAX_TRACKS: int = Field(
+        default=1000,
+        ge=1,
+        description="The largest playlist, in tracks, that is shown and queued",
+    )
 
 
 class AppSettings(BaseModel):
@@ -63,6 +68,7 @@ class AppSettings(BaseModel):
     plex_url: str
     plex_token: Annotated[str, Sensitive] = Field(repr=False)
     plex_library: str | None = None
+    playlist_max_tracks: int = 1000
 
     def dump_for_logging(self) -> dict[str, str]:
         """Every setting, for the boot log, with the Sensitive ones as ``***``."""
@@ -93,6 +99,7 @@ class AppSettings(BaseModel):
             plex_url=_not_empty("PLEX_URL", env.PLEX_URL),
             plex_token=_not_empty("PLEX_TOKEN", env.PLEX_TOKEN),
             plex_library=env.PLEX_LIBRARY or None,
+            playlist_max_tracks=env.PLAYLIST_MAX_TRACKS,
         )
 
 

@@ -63,6 +63,20 @@ class TestAppSettings:
 
         assert settings.plex_library is None
 
+    def test_the_largest_playlist_is_1000_tracks_unless_set(self):
+        assert AppSettings.load(_environment()).playlist_max_tracks == 1000
+        assert (
+            AppSettings.load(
+                _environment(PLAYLIST_MAX_TRACKS="250")
+            ).playlist_max_tracks
+            == 250
+        )
+
+    @pytest.mark.parametrize("value", ["0", "-1", "many", ""])
+    def test_a_largest_playlist_that_is_no_count_stops_the_app(self, value):
+        with pytest.raises(ValidationError, match="PLAYLIST_MAX_TRACKS"):
+            _environment(PLAYLIST_MAX_TRACKS=value)
+
     @pytest.mark.parametrize("missing", sorted(REQUIRED))
     def test_a_required_setting_that_is_missing_stops_the_app(
         self, missing, monkeypatch, tmp_path
