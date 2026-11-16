@@ -278,11 +278,22 @@ those. Pause stops the stream when the speaker has no pause.
   stable than it.
 - **A lookup by `guid` works for music**: `/library/sections/<id>/all?type=<8|9|10>&guid=<guid>`
   returned the one item for an artist, an album and a track, in under 10 ms.
+- **A filter matches the start of a word, not the whole field.** `guid=<v>` and `title=<v>` find
+  the items whose field has `v` at the start of a word, without case: `title=phex` finds no
+  "Aphex Twin". A filter whose name ends in `=` (`title%3D=<v>`, the name `title=` encoded) is
+  Plex's "is": the whole field, without case. A comma in the value is "or", and has no escape. So
+  the backend asks "is", a value with a comma as its part before the first comma, and keeps the
+  items whose field is exactly the value. The section's list of albums carries no track count, so
+  an album found this way is read again.
 - **A `guid` is not unique.** Seven album `guid`s occur twice (the same release in the library
   twice).
 - **A playlist** has a rating key and a `guid` of its own (`com.plexapp.agents.none://<uuid>`).
   Playlists live outside the library section, so a scan does not touch them.
   `/playlists?guid=<guid>` finds one by its `guid`.
+- **Several items in one request**: `/library/metadata/<key>,<key>,…` answers the artists, albums,
+  tracks and playlists with those rating keys, the kinds mixed, and leaves out a key Plex does not
+  have. It answers a playlist as the list of playlists does, which is no read of the playlist on
+  its own (1.9).
 
 Rescans were not provoked on the operator's library. What a rating key and a `guid` survive is
 from Plex's forum and the tools that repair references after a rescan, which match on `guid`
@@ -293,8 +304,9 @@ first and title second. Section 5 stores a favourite accordingly.
 - **Plex gives every item a `thumb` path**, `/library/metadata/<rating key>/thumb/<stamp>`, and a
   playlist a `composite`, `/playlists/<rating key>/composite/<stamp>`. A track's `thumb` is its
   album's cover, so an album's tracks share one picture. An album without a cover carries its
-  artist's picture as its `thumb`, and its tracks carry none: 41 of the first 3,000 tracks have
-  no `thumb`. One album of 853 and two artists of 94 have no picture at all.
+  artist's picture as its `thumb`; its tracks carry no `thumb` and name that picture as their
+  `grandparentThumb`: 41 of the first 3,000 tracks have no `thumb`. One album of 853 and two
+  artists of 94 have no picture at all.
 - **A playlist's stamp is the time it was last read on its own**, not its picture's: every read
   of `/playlists/<rating key>` gives its `composite` a new stamp, and the list of playlists
   carries the latest.
@@ -373,12 +385,13 @@ first and title second. Section 5 stores a favourite accordingly.
   critical (READY-1, READY-2). Sonos's passes when a seed speaker answers; its probes of all the
   seeds share half a second, so a seed that does not answer leaves the next its turn within
   readyz's wait of 0.8 s. Plex's passes when Plex answers and has the music library. The app
-  serves favourites without either.
+  lists the favourites without either (3.6).
 - **Failures** of a speaker or of Plex are `ExternalServiceException`, a `502` in the template's
-  envelope (BE-3). Its message is the client's own wording, which names no address and never the
-  token. A queueing task's failure carries that message alone, without a traceback (3.4). A
-  transport command the speaker refuses because it does not allow it now (UPnP error 701 or 711)
-  is no failure of the speaker: it is a `409` (3.2).
+  envelope (BE-3), but for the favourites' listing, which is served from the store (3.6). Its
+  message is the client's own wording, which names no address and never the token. A queueing
+  task's failure carries that message alone, without a traceback (3.4). A transport command the
+  speaker refuses because it does not allow it now (UPnP error 701 or 711) is no failure of the
+  speaker: it is a `409` (3.2).
 
 ## 3. The API
 
@@ -551,8 +564,10 @@ page it is. Without a current track it answers the page asked.
   `502`.
 - `album` and `duration_ms` are `null` where the entry gives none.
 - A page of 100 costs the speaker 0.12 s (1.6).
-- **Clear** empties the queue of the group; a group that plays from it stops. It ends no queueing
-  task: what a task still running on the group has left to queue lands after the Clear.
+- **Clear** empties the queue of the group; a group that plays from it stops. It ends the group's
+  queueing tasks as a `play` does and empties the queue in a turn of its own in the group's lane,
+  on the request's thread (Queueing, below), and answers `204` once the queue is empty: after the
+  speaker call under way, which may take seconds (1.3), has landed.
 
 **Queueing.**
 
@@ -585,11 +600,12 @@ before the queue changes, then does what 1.4, 1.5 and 1.7 found:
   the rest 16 a call. Everything else is one container.
 - Music starts about half a second into the task. The queue grows behind it, and each step
   reaches the clients as `queue_changed`.
-- **A group's queueing tasks take their turns**, one at a time in the order asked, in a lane of
-  the coordinator the room's group has when the task is asked. An `add` lands after everything
-  asked before it. A `play` or `shuffle` ends every task asked before it on the group: one still
-  waiting makes no call, and the one under way stops before its next call to the speaker, so
-  nothing of an earlier item lands after the new one. A task that was ended reports
+- **A group's queueing tasks and its Clears take their turns**, one at a time in the order asked,
+  in a lane of the coordinator the room's group has when the task or the Clear is asked. An `add`
+  lands after everything asked before it. A `play`, a `shuffle` and a Clear end every task asked
+  before them on the group: one still waiting makes no call, and the one under way stops before
+  its next call to the speaker, so nothing of an earlier item lands after them. A Clear is never
+  ended: whatever is asked after it lands after it. A task that was ended reports
   `task_completed`, as one that is done.
 - A task that fails reports `task_failed` through the template's task events, to every
   connection, with `{"error": …}`: the failure in words a client can show (2). A call the speaker
@@ -609,7 +625,8 @@ agreed and are left out.
 ### 3.5 The library
 
 Read from Plex on each request; the backend keeps no copy. The whole artist list takes Plex
-140 ms.
+140 ms. Once Plex has answered, an answer of artists, albums or playlists reads the store, in one
+query, for the favourites that mark the items it holds.
 
 | Endpoint | Gives |
 |---|---|
@@ -624,12 +641,12 @@ Read from Plex on each request; the backend keeps no copy. The whole artist list
 An artist, an album, a track and a playlist:
 
 ```json
-{ "id": "37059", "title": "…", "index_letter": "R", "artwork_id": "…" }
+{ "id": "37059", "title": "…", "index_letter": "R", "artwork_id": "…", "favourite_id": 1 }
 ```
 
 ```json
 { "id": "37060", "title": "…", "artist_id": "37059", "artist": "…", "year": 2001,
-  "track_count": 11, "artwork_id": "…" }
+  "track_count": 11, "artwork_id": "…", "favourite_id": null }
 ```
 
 ```json
@@ -638,7 +655,8 @@ An artist, an album, a track and a playlist:
 ```
 
 ```json
-{ "id": "43830", "title": "…", "track_count": 148, "duration_ms": 37610000, "artwork_id": "…" }
+{ "id": "43830", "title": "…", "track_count": 148, "duration_ms": 37610000, "artwork_id": "…",
+  "favourite_id": null }
 ```
 
 - Every list's order ends in the rating key, so its pages cut one sequence. `sort_dir` defaults
@@ -652,9 +670,12 @@ An artist, an album, a track and a playlist:
   `null` where Plex has none; a track without a disc or a number comes before those that have
   one.
 - A track's `artist` is the track's own where Plex has one, as on a compilation.
-- An album without a cover has its artist's picture, and its tracks have none (1.9). A
+- An album without a cover has its artist's picture, and so do its tracks (1.9). A
   playlist's `artwork_id` is new after every `GET` of that playlist, and the list carries the
   latest (1.9, 3.7).
+- An artist, an album and a playlist carry `favourite_id`: the favourite that marks an item of its
+  kind and `guid`, the one a mark of it answers (3.6), or `null`. The two copies of a release the
+  library holds twice carry the one favourite. A track carries none.
 - An id Plex does not have, or one of another kind, is a `404` with code `ITEM_NOT_FOUND`.
 - The tracks of a playlist are not listed. The display plays a playlist and does not open it.
 - There is no search.
@@ -663,9 +684,9 @@ An artist, an album, a track and a playlist:
 
 | Endpoint | Does |
 |---|---|
-| `GET /api/favourites` | The favourites, paged. `sort_by=created_at` (default) or `title`. |
-| `POST /api/favourites` | Body `{"kind": "album", "item_id": "37060"}`. Marks the item. `201` with the favourite; `200` with the existing one when it is marked already. |
-| `DELETE /api/favourites/{favourite_id}` | Removes the mark. |
+| `GET /api/favourites` | The favourites, paged, each with its item as Plex has it now. `sort_by=created_at` (default) or `title`. |
+| `POST /api/favourites` | Body `{"kind": "album", "item_id": "37060"}`. Marks the item. `201` with the new favourite; `200` with the one that marks the item already. |
+| `DELETE /api/favourites/{favourite_id}` | Removes the mark. Answers `204`. Plex is not asked. |
 
 ```json
 {
@@ -680,14 +701,28 @@ An artist, an album, a track and a playlist:
 }
 ```
 
-- `kind`: `artist`, `album` or `playlist`.
+- `kind`: `artist`, `album` or `playlist`. A track's, or a body with a field that is not one of
+  the two, is a `400`.
 - An artist, an album and a playlist of the library (3.5) carry `favourite_id`: the favourite
   that marks the item, or `null`. The toggle deletes that favourite or creates one.
+- **Marking** reads the item from Plex as it is now: one Plex does not have as that kind is a
+  `404` with code `ITEM_NOT_FOUND`, and a Plex that fails is a `502`.
+- **Marking an item twice is not an error**: two displays may press the same star. The answer is
+  the favourite that marks it, also when two marks of the item meet. Marking the other copy of a
+  release the library holds twice answers the favourite of the first, with the copy just marked
+  as its item.
+- **Removing** an id the store does not hold is a `404` with code `RECORD_NOT_FOUND`.
 - `item_id` is where the item is in Plex **now**: what to pass to the queue and the library. It
   is `null`, and `available` is `false`, when Plex no longer has the item. The favourite is kept
-  and shown as unavailable, and comes back when the item does.
-- `subtitle` is the artist for an album, and `null` otherwise.
-- Marking an item twice is not an error: two displays may press the same star.
+  and shown as unavailable, with the title and subtitle it was stored with, and comes back when
+  the item does. While Plex fails, the list is served from the store, none of it available (2).
+- `subtitle` is the artist for an album, and `null` otherwise. `artwork_id` is the one the
+  library carries for the item (3.5), `null` while it is not available. The list reads no
+  playlist on its own, so a playlist's tile keeps its `artwork_id` between listings (1.9).
+- `sort_by=created_at` orders by when the item was marked, `title` by the title's letters first,
+  then its accents and case; each ends in `id`.
+- A mark that made a favourite, a removal, and a listing that found a favourite Plex had moved
+  (5) are announced as `favourites_changed` (4).
 - Section 5 has the record and how it finds its item again.
 
 ### 3.7 Artwork
@@ -742,7 +777,7 @@ ids and no replay.
 | `volume_changed` | `{"speaker_id": …}` | `GET /api/speakers/{speaker_id}` |
 | `playback_changed` | `{"speaker_id": …}` | `GET /api/speakers/{speaker_id}/playback` |
 | `queue_changed` | `{"speaker_id": …}` | `GET /api/speakers/{speaker_id}/queue`, when it shows the queue |
-| `favourites_changed` | `{}` | `GET /api/favourites` |
+| `favourites_changed` | `{}` | `GET /api/favourites`, and the artist, album or playlist it shows, for its `favourite_id` |
 | `task_event` | the task's `event_type`, `task_id`, `timestamp` and `data` | Nothing: it reports the queueing task (3.4). |
 
 - **Events name what changed and carry no state.** A client fetches, so there is one way to read
@@ -755,27 +790,46 @@ ids and no replay.
 - **`queue_changed`** is sent when a group's coordinator reports a change of its queue, a change
   of play mode included, and for a room that follows another coordinator after a regrouping. A
   follower's own queue events are dropped, as its playback's are.
+- **`favourites_changed`** is sent once the request that changed the favourites has committed,
+  one event however many it changed: a mark that made a favourite, a removal, and a listing that
+  brought a favourite up to date or removed one (5). A mark answered with the favourite that
+  holds the item already, a removal of an id not held and a request that failed send none.
 - **After `ready` a client fetches what it shows.** That covers the first connection and every
   reconnection, so the backend sends no snapshot.
-- **The backend coalesces**: at most one event of a type for a speaker in 250 ms, with the last
-  one always sent. A burst of 17 queue changes (1.1) becomes a handful.
-- The events come from the speakers' own notifications. A change made in the Sonos app reaches
+- **The backend coalesces**: at most one event of a type for a speaker, and one
+  `favourites_changed`, in 250 ms, with the last one always sent. A burst of 17 queue changes (1.1)
+  becomes a handful.
+- The speakers' events come from their own notifications. A change made in the Sonos app reaches
   a display the same way as one made on another display.
 
 ## 5. The data model
 
-**Scope.** What the backend stores: the household's favourites. Concept model.
+**Scope.** What the backend stores: the household's favourites, and the kinds of library item a
+favourite can mark. Logical model. The store is the table `favourites`, from the model in
+`backend/app/models/favourite.py` and its Alembic revisions.
 
 **Entities.**
 
-*Favourite.* A Favourite is an individual mark the household has put on one artist, one album or
-one playlist of the Plex library, so that it shows on every display's home screen. It records
-which item is meant, in a way that finds the item again after Plex has rescanned its library.
-Samples: the artist "Radiohead"; the album "Amnesiac" by Radiohead; a playlist the operator made;
-an album that has since been removed from Plex and is kept as unavailable; one of two copies of
-the same release that the library holds twice. Notes: a Favourite is not the item itself, which
-lives in Plex and is never copied. A track cannot be a Favourite. A Favourite belongs to the
-household, not to a display or a person. Also called: none.
+*Favourite*, kernel. A Favourite is an individual mark the household has put on one artist, one
+album or one playlist of the Plex library, so that it shows on every display's home screen. It
+records which item is meant, in a way that finds the item again after Plex has rescanned its
+library. Samples: the artist "Radiohead"; the album "Amnesiac" by Radiohead; a playlist the
+operator made; an album that has since been removed from Plex and is kept as unavailable; one of
+two copies of the same release that the library holds twice. Notes: a Favourite is not the item
+itself, which lives in Plex and is never copied. A track cannot be a Favourite. A Favourite
+belongs to the household, not to a display or a person. Also called: none.
+
+- `id`: the app's key for the favourite, an integer the store issues (3).
+- `item_kind`: the Item Kind of the item it marks.
+- `guid`: Plex's `guid` of the item when the favourite last found it.
+- `rating_key`: Plex's rating key of the item when the favourite last found it.
+- `title`: the item's title when the favourite last found it.
+- `artist_title`: for an album, its artist's title when the favourite last found it; none for an
+  artist and a playlist.
+- `created_at`: when the item was marked, the start of the transaction that marked it.
+
+*Item Kind*, reference. A kind of item of the Plex library that a Favourite can mark: `artist`,
+`album` or `playlist`, as the API's `kind` writes it. A track is a kind of item and no Item Kind.
 
 **Diagram.**
 
@@ -783,20 +837,31 @@ household, not to a display or a person. Also called: none.
 erDiagram
     direction TB
     Favourite {
-        string kind
+        int id PK
+        string item_kind FK, UK
+        string guid UK
+        string rating_key
         string title
+        string artist_title
+        datetime created_at
     }
+    ItemKind["Item Kind"] {
+        string code PK
+    }
+    ItemKind ||..o{ Favourite : "classifies"
 ```
 
 **Assertions.**
 
-1. A Favourite marks one item of the Plex library, which is an artist, an album or a playlist.
-2. No two Favourites mark the same item.
-3. A Favourite whose item Plex no longer has remains a Favourite.
+1. A Favourite marks one item of the Plex library, which is an artist, an album or a playlist: it
+   has one Item Kind.
+2. No two Favourites have the same Item Kind and `guid`: no two mark the same item.
+3. A Favourite of an album has an `artist_title`, and a Favourite of any other kind has none.
+4. A Favourite whose item Plex no longer has remains a Favourite, with what it last found.
 
 **Sample instances.**
 
-| kind | title | parent title | guid | rating key |
+| item_kind | title | artist_title | guid | rating_key |
 |---|---|---|---|---|
 | artist | Radiohead | | `plex://artist/5d07…` | 37059 |
 | album | Amnesiac | Radiohead | `plex://album/5d07…` | 37060 |
@@ -807,22 +872,36 @@ erDiagram
 **Decisions and open questions.**
 
 1. **What is stored to find the item again**, from 1.8: its kind, Plex's `guid`, the rating key
-   it had when last seen, its title, and for an album its artist's title. The logical model, with
-   keys and types, is the favourites slice's.
-2. **How the item is found**, in this order, stopping at the first that succeeds:
-   1. by the stored rating key, accepted when the item there has the stored `guid`. This is one
-      Plex call for all favourites together, and the usual case;
-   2. by `guid`, unless it is a `local://` one. Of several hits, the one whose title and artist
-      match;
-   3. by kind, title and artist's title, exactly;
-   4. not found: the favourite is unavailable.
+   it had when last found, its title, and for an album its artist's title. Nothing about the
+   item's picture, nor whether Plex still has it, is stored: both are read from Plex at each
+   listing.
+2. **How the item is found**, at every listing, for the favourites of the page, in this order,
+   stopping at the first that succeeds:
+   1. by the stored rating key, accepted when the item there is of the favourite's kind and has
+      its `guid`. This is one Plex call for the whole page (1.8), and the usual case;
+   2. by `guid`, unless it is a `local://` one: of several hits, the first whose title and
+      artist's title are the stored ones, else the first, since one favourite stands for every
+      item of a kind and `guid` (decision 3);
+   3. by kind and title: the first hit whose title and artist's title are the stored ones;
+   4. not found: the favourite is served as stored, unavailable, and kept.
 
-   Whenever a later step finds the item, the stored rating key, `guid` and titles are brought up
-   to date.
-3. **One mark per item** (assertion 2) is kept on kind and `guid`. Marking the second copy of a
-   release that the library holds twice answers the existing favourite.
-4. **Current state only.** A favourite is made and removed; nothing about its past is wanted.
-5. Open questions: none.
+   Titles compare exactly as Plex gives them, case and accents included (1.8). Whenever step 2
+   or 3 finds the item, the stored rating key, `guid` and titles are brought up to date, so that
+   the next listing finds it at step 1, and the change is announced (4). Where another favourite
+   already marks that item, by its kind and `guid`, the one marked later is removed and not
+   listed. A favourite found by step 2 or 3 costs a few Plex calls of its own, once; one found
+   nowhere costs both lookups at every listing. While Plex fails, no step runs and nothing
+   stored changes.
+3. **One mark per item** (assertion 2) is kept on kind and `guid`, by the store's unique key.
+   Marking the second copy of a release that the library holds twice answers the existing
+   favourite, and of two marks of one item made at once, the second is answered with the
+   favourite the first made.
+4. **The titles are kept as Plex gives them**, an empty one too, so that the lookup by title
+   compares Plex's text with Plex's text. What leaves the API is Unicode NFC (2).
+5. **Item Kind is held in the favourite**, as a text column the store checks against the three
+   kinds, not as a table of its own.
+6. **Current state only.** A favourite is made and removed; nothing about its past is wanted.
+7. Open questions: none.
 
 ## 6. Configuration, and what a pod in production needs
 
@@ -872,8 +951,9 @@ configuration, the token in its secret.
   leave to use Zitkuil: that the room joins, that the group's events and volume follow, what the
   leaving room's queue holds afterwards, and what becomes of the rest of a group when the room
   that leads it leaves or joins another.
-- **A favourite across a rescan** (1.8): the lookup by `guid` is proven; that a `guid` survives a
-  rescan is from Plex's forum, not from a rescan of this library.
+- **A favourite across a rescan** (1.8): the lookups by `guid` and by title are proven on the real
+  Plex, and finding a moved item again on the in-memory fake of the Plex client; that a `guid`
+  survives a rescan is from Plex's forum, not from a rescan of this library.
 - **A subscription across a day** on the real speakers: renewals for a day, a speaker that
   restarts, and a speaker whose address changes were not waited for. The healing in section 2 is
   built for them, and the suite shows each case on the in-memory fake of the Sonos client.

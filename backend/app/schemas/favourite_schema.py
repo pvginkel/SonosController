@@ -71,7 +71,8 @@ class FavouriteListQuerySchema(PaginationQuerySchema):
         "created_at",
         description=(
             "`created_at`: by when the item was marked, then `id`. `title`: "
-            "by title, without accents and in one case, then `id`."
+            "by the title's letters first, then its accents and its case, "
+            "then `id`."
         ),
     )
 
