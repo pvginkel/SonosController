@@ -11,7 +11,11 @@ import pytest
 from flask import Flask
 
 from app.core_exceptions import ExternalServiceException
-from app.exceptions import ActionNotAvailableException, SpeakerNotFoundException
+from app.exceptions import (
+    ActionNotAvailableException,
+    CommandRefusedException,
+    SpeakerNotFoundException,
+)
 from app.services.household_mirror import HouseholdMirror, PlaybackAction
 from app.services.sonos_client import Group, TransportState, Volume
 from app.services.speaker_service import SpeakerService
@@ -152,11 +156,40 @@ class TestSpeakerServiceCommand:
             GARAGE, [queue_track(1)]
         )
 
-        with pytest.raises(ExternalServiceException) as raised:
+        with pytest.raises(ActionNotAvailableException) as raised:
             speakers.command(GARAGE, NEXT)
 
-        assert raised.value.cause == (
+        assert raised.value.message == (
+            f"Cannot skip to the next track on speaker {GARAGE} because the "
+            "speaker does not allow it now"
+        )
+        refusal = raised.value.__cause__
+        assert isinstance(refusal, CommandRefusedException)
+        assert refusal.cause == (
             "the speaker answered UPnP error 711 (Illegal seek target)"
+        )
+
+    def test_a_refused_stop_is_a_pause_that_is_not_available(
+        self, speakers, household
+    ):
+        household.start_stream(GARAGE, "Radio One", "A Song")
+        household.settle()
+        # The stream ends and the queue is empty, and the event that says so
+        # has not arrived: the mirror still lists stop.
+        household.before_call = lambda speaker_id: household.load_queue(GARAGE, [])
+
+        with pytest.raises(ActionNotAvailableException) as raised:
+            speakers.command(GARAGE, PAUSE)
+
+        assert raised.value.message == (
+            f"Cannot pause speaker {GARAGE} because the speaker does not allow "
+            "it now"
+        )
+        refusal = raised.value.__cause__
+        assert isinstance(refusal, CommandRefusedException)
+        assert refusal.operation == f"stop speaker {GARAGE}"
+        assert refusal.cause == (
+            "the speaker answered UPnP error 701 (Transition not available)"
         )
 
     def test_an_unknown_speaker_is_not_found(self, speakers):

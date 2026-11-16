@@ -27,6 +27,7 @@ from urllib.parse import parse_qs, urlsplit
 from PIL import Image
 
 from app.core_exceptions import ExternalServiceException
+from app.exceptions import CommandRefusedException
 from app.services.health_service import CheckResult, CheckStatus, HealthService
 from app.services.sonos_client import (
     Group,
@@ -618,7 +619,7 @@ class FakeSonosClient(SonosClient):
                 if seek and room.queue and not room.stream
                 else "701 (Transition not available)"
             )
-            raise ExternalServiceException(
+            raise CommandRefusedException(
                 f"{operation} speaker {speaker_id}",
                 f"the speaker answered UPnP error {refusal}",
             )

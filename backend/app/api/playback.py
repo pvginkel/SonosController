@@ -25,7 +25,9 @@ def _command_answers() -> SpectreeResponse:
         HTTP_409=(
             ApiErrorResponseSchema,
             "The speaker does not allow the command now: it is not among the "
-            "playback's `actions`. The code is `ACTION_NOT_AVAILABLE`.",
+            "playback's `actions`, or the speaker refused it because what it "
+            "allows changed and `playback_changed` has yet to say so. The "
+            "code is `ACTION_NOT_AVAILABLE`.",
         ),
         HTTP_502=(ApiErrorResponseSchema, SPEAKER_FAILED),
     )

@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from app.core_exceptions import ExternalServiceException
+from app.exceptions import CommandRefusedException
 from app.services.health_service import CheckStatus
 from app.services.sonos_client import (
     UNREPORTED,
@@ -234,7 +235,7 @@ class TestLiveTransport:
         assert left.track == found.track
         assert left.shuffle == found.shuffle
 
-    def test_a_command_the_speaker_refuses_fails_in_the_clients_words(
+    def test_a_command_the_speaker_refuses_is_a_refusal_in_the_clients_words(
         self, sonos, garage
     ):
         found = sonos.read_playback(garage)
@@ -251,14 +252,15 @@ class TestLiveTransport:
             "put its queue at the first or the last track and stop it."
         )
 
-        with pytest.raises(ExternalServiceException) as raised:
+        with pytest.raises(CommandRefusedException) as raised:
             refused[0](garage)
 
         # The words are the client's: SoCo's own name the speaker's address.
         # A previous at a queue's first track is answered 711 (Illegal seek
         # target), a next on a radio stream 701 (docs/api-design.md 1.7).
         assert re.fullmatch(
-            r"the speaker answered UPnP error 7\d\d \([A-Za-z ]+\)",
+            r"the speaker answered UPnP error "
+            r"(701 \(Transition not available\)|711 \(Illegal seek target\))",
             raised.value.cause,
         )
         assert sonos.read_playback(garage) == found

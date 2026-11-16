@@ -12,6 +12,7 @@ from PIL import Image
 
 from app.app_config import AppSettings
 from app.core_exceptions import ExternalServiceException
+from app.exceptions import CommandRefusedException
 from app.services.health_service import CheckStatus
 from app.services.sonos_client import (
     UNREPORTED,
@@ -299,11 +300,30 @@ class TestSonosClientPlayback:
         household.previous(GARAGE)
         assert household.read_playback(GARAGE).queue_position == 2
 
-    def test_a_command_the_speaker_does_not_allow_fails(self, household):
-        with pytest.raises(ExternalServiceException, match="UPnP error 711"):
+    def test_a_command_the_speaker_does_not_allow_is_refused(self, household):
+        with pytest.raises(CommandRefusedException) as raised:
             household.previous(GARAGE)
 
+        assert raised.value.operation == (
+            f"go back to the previous track on speaker {GARAGE}"
+        )
+        assert raised.value.cause == (
+            "the speaker answered UPnP error 711 (Illegal seek target)"
+        )
         assert household.read_playback(GARAGE).queue_position == 1
+
+    @pytest.mark.parametrize("command", ["play", "pause", "stop", "next", "previous"])
+    def test_a_command_to_a_speaker_that_does_not_answer_is_no_refusal(
+        self, household, command
+    ):
+        household.silence_room(GARAGE)
+        try:
+            with pytest.raises(ExternalServiceException) as raised:
+                getattr(household, command)(GARAGE)
+        finally:
+            household.answer_again(GARAGE)
+
+        assert raised.value.cause == "the speaker did not answer (ConnectTimeout)"
 
     def test_a_command_goes_to_the_coordinator_of_the_group(self, household):
         household.join(LOUNGE, GARAGE)
@@ -331,10 +351,13 @@ class TestSonosClientPlayback:
         assert playback.track.duration_seconds == 0
         assert playback.track.picture == ""
 
-        with pytest.raises(ExternalServiceException, match="UPnP error 701"):
+        refused = "the speaker answered UPnP error 701 (Transition not available)"
+        with pytest.raises(CommandRefusedException) as raised:
             household.pause(GARAGE)
-        with pytest.raises(ExternalServiceException, match="UPnP error 701"):
+        assert raised.value.cause == refused
+        with pytest.raises(CommandRefusedException) as raised:
             household.next(GARAGE)
+        assert raised.value.cause == refused
 
         household.stop(GARAGE)
         assert household.read_playback(GARAGE).transport_state is TransportState.STOPPED

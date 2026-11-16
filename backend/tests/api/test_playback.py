@@ -380,22 +380,37 @@ class TestPlaybackCommands:
             "code": "EXTERNAL_SERVICE_ERROR",
         }
 
-    def test_a_command_the_speaker_refuses_after_all_is_a_bad_gateway(
+    def test_a_command_the_speaker_refuses_after_all_is_not_available(
         self, client, household
     ):
         # The queue ends at its first track, and the event that says so has
-        # not arrived: the mirror still lists next.
+        # not arrived: the mirror still lists next, and the speaker answers
+        # UPnP error 711.
         household.before_call = lambda speaker_id: household.load_queue(
             GARAGE, [queue_track(1)]
         )
 
         response = command(client, GARAGE, "next")
 
-        assert response.status_code == 502
-        assert response.get_json()["error"] == (
-            f"Cannot skip to the next track on speaker {GARAGE} because external "
-            "service failed: the speaker answered UPnP error 711 (Illegal seek "
-            "target)"
+        assert response.status_code == 409
+        assert without_correlation_id(response.get_json()) == not_available(
+            "next", GARAGE
+        )
+
+    def test_a_command_a_stream_refuses_after_all_is_not_available(
+        self, client, household
+    ):
+        # A stream starts, and the event that says so has not arrived: the
+        # mirror still lists next, and the speaker answers UPnP error 701.
+        household.before_call = lambda speaker_id: household.start_stream(
+            GARAGE, "Radio One", "A Song"
+        )
+
+        response = command(client, GARAGE, "next")
+
+        assert response.status_code == 409
+        assert without_correlation_id(response.get_json()) == not_available(
+            "next", GARAGE
         )
 
     @pytest.mark.parametrize("name", COMMANDS)
@@ -509,6 +524,7 @@ class TestPlaybackDocument:
         assert "`SPEAKER_NOT_FOUND`" in responses["404"]["description"]
         assert "`ACTION_NOT_AVAILABLE`" in responses["409"]["description"]
         assert "`actions`" in responses["409"]["description"]
+        assert "or the speaker refused it" in responses["409"]["description"]
         for status in ("404", "409", "502"):
             schema = responses[status]["content"]["application/json"]["schema"]
             assert "ApiErrorResponseSchema" in schema["$ref"]

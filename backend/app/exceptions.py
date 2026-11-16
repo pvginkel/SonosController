@@ -100,3 +100,14 @@ class ActionNotAvailableException(InvalidOperationException):
     def __init__(self, operation: str) -> None:
         super().__init__(operation, "the speaker does not allow it now")
         self.error_code = "ACTION_NOT_AVAILABLE"
+
+
+class CommandRefusedException(InvalidOperationException):
+    """Exception raised for a transport command the speaker refuses because
+    it does not allow the command now.
+
+    Args:
+        operation: The command, phrased to follow "Cannot" ("stop speaker
+            RINCON_…").
+        cause: The speaker's refusal, in the Sonos client's words.
+    """

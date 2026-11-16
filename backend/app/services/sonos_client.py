@@ -35,7 +35,7 @@ from soco.exceptions import SoCoException, SoCoUPnPException
 
 from app.app_config import AppSettings
 from app.core_exceptions import ExternalServiceException
-from app.exceptions import ConfigurationError
+from app.exceptions import CommandRefusedException, ConfigurationError
 from app.services.health_service import CheckResult, CheckStatus, HealthService
 
 logger = logging.getLogger(__name__)
@@ -232,6 +232,11 @@ class SonosClient(ABC):
     Playback is a group's: a transport read or command for a room goes to the
     coordinator of the room's group. A join or a leave goes to the room that
     moves.
+
+    A transport command (``play``, ``pause``, ``stop``, ``next``,
+    ``previous``) that the speaker refuses because it does not allow the
+    command now raises ``CommandRefusedException`` instead: the speaker
+    answered, and nothing changed.
     """
 
     def __init__(self, health_service: HealthService) -> None:
@@ -385,6 +390,10 @@ _SPEAKER_ERRORS = (
     _HouseholdError,
 )
 
+# The UPnP errors a speaker answers a transport command it does not allow
+# now: 701 (Transition not available) and 711 (Illegal seek target).
+_NOT_ALLOWED_NOW = frozenset({"701", "711"})
+
 
 @dataclass(frozen=True)
 class _Lost:
@@ -504,23 +513,23 @@ class SoCoSonosClient(SonosClient):
             return Volume(volume=int(group.volume), muted=bool(group.mute))
 
     def play(self, speaker_id: str) -> None:
-        with _speaker_call(f"play on speaker {speaker_id}"):
+        with _transport_command(f"play on speaker {speaker_id}"):
             self._coordinator(speaker_id).play()
 
     def pause(self, speaker_id: str) -> None:
-        with _speaker_call(f"pause speaker {speaker_id}"):
+        with _transport_command(f"pause speaker {speaker_id}"):
             self._coordinator(speaker_id).pause()
 
     def stop(self, speaker_id: str) -> None:
-        with _speaker_call(f"stop speaker {speaker_id}"):
+        with _transport_command(f"stop speaker {speaker_id}"):
             self._coordinator(speaker_id).stop()
 
     def next(self, speaker_id: str) -> None:
-        with _speaker_call(f"skip to the next track on speaker {speaker_id}"):
+        with _transport_command(f"skip to the next track on speaker {speaker_id}"):
             self._coordinator(speaker_id).next()
 
     def previous(self, speaker_id: str) -> None:
-        with _speaker_call(f"go back to the previous track on speaker {speaker_id}"):
+        with _transport_command(f"go back to the previous track on speaker {speaker_id}"):
             self._coordinator(speaker_id).previous()
 
     def set_volume(self, speaker_id: str, volume: int) -> None:
@@ -738,6 +747,19 @@ def _speaker_call(operation: str) -> Iterator[None]:
         yield
     except _SPEAKER_ERRORS as exc:
         raise ExternalServiceException(operation, _cause(exc)) from exc
+
+
+@contextmanager
+def _transport_command(operation: str) -> Iterator[None]:
+    """As ``_speaker_call()``, with the speaker's refusal of a command it does
+    not allow now as a CommandRefusedException."""
+    with _speaker_call(operation):
+        try:
+            yield
+        except SoCoUPnPException as exc:
+            if exc.error_code in _NOT_ALLOWED_NOW:
+                raise CommandRefusedException(operation, _cause(exc)) from exc
+            raise
 
 
 def _cause(exc: Exception) -> str:

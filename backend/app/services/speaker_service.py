@@ -10,7 +10,7 @@ brings the change there.
 
 from collections.abc import Callable
 
-from app.exceptions import ActionNotAvailableException
+from app.exceptions import ActionNotAvailableException, CommandRefusedException
 from app.services.household_mirror import HouseholdMirror, PlaybackAction
 from app.services.sonos_client import SonosClient, TransportAction, Volume
 
@@ -52,16 +52,21 @@ class SpeakerService:
         Raises:
             SpeakerNotFoundException: The household has no such speaker.
             ActionNotAvailableException: The speaker does not allow the
-                command now, by what the mirror holds.
+                command now: by what the mirror holds, or the speaker
+                refused a command the mirror still lists.
             ExternalServiceException: The speaker failed.
         """
         described, commands = _COMMANDS[action]
+        operation = f"{described} speaker {speaker_id}"
         allowed = self._mirror.transport_actions(speaker_id)
         for command in commands:
             if command in allowed:
-                self._send[command](speaker_id)
+                try:
+                    self._send[command](speaker_id)
+                except CommandRefusedException as refused:
+                    raise ActionNotAvailableException(operation) from refused
                 return
-        raise ActionNotAvailableException(f"{described} speaker {speaker_id}")
+        raise ActionNotAvailableException(operation)
 
     def join_group(self, speaker_id: str, member_id: str) -> None:
         """Have the speaker join the group another speaker plays in.
