@@ -416,6 +416,33 @@ class TestQueueItem:
         assert (playback["state"], playback["shuffle"]) == ("playing", False)
         assert playback["queue_position"] == 1
 
+    def test_an_album_played_from_a_track_plays_the_whole_album_from_it(
+        self, client, household, tasks
+    ):
+        response = queue_item(
+            client,
+            GARAGE,
+            {
+                "kind": "album",
+                "item_id": OLD_ALBUM,
+                "action": "play",
+                "start_track_id": "112",
+            },
+        )
+
+        assert response.status_code == 202
+        events = tasks.finish(response.get_json()["task_id"])
+        assert [event["event_type"] for event in events] == [
+            "task_started",
+            "task_completed",
+        ]
+        household.settle()
+        assert track_ids(client, GARAGE) == ["111", "112"]
+        playback = client.get(f"/api/speakers/{GARAGE}/playback").get_json()
+        assert (playback["state"], playback["shuffle"]) == ("playing", False)
+        assert playback["queue_position"] == 2
+        assert playback["track"]["track_id"] == "112"
+
     @pytest.mark.parametrize(
         ("kind", "item_id", "action", "queued"),
         [
@@ -566,6 +593,29 @@ class TestQueueItem:
         }
         assert listing(client, GARAGE)["meta"]["total"] == 5
 
+    @pytest.mark.parametrize("track", ["121", "99"])
+    def test_a_track_the_album_does_not_hold_is_not_found(
+        self, client, household, track
+    ):
+        response = queue_item(
+            client,
+            GARAGE,
+            {
+                "kind": "album",
+                "item_id": OLD_ALBUM,
+                "action": "play",
+                "start_track_id": track,
+            },
+        )
+
+        assert response.status_code == 404
+        assert without_correlation_id(response.get_json()) == {
+            "error": f"Track {track} of album {OLD_ALBUM} was not found",
+            "details": {"message": "The requested resource could not be found"},
+            "code": "ITEM_NOT_FOUND",
+        }
+        assert listing(client, GARAGE)["meta"]["total"] == 5
+
     @pytest.mark.parametrize(
         ("playlist", "cause"),
         [
@@ -622,6 +672,13 @@ class TestQueueItem:
             {"kind": "album", "item_id": OLD_ALBUM, "action": "play", "order": "new"},
             {"kind": "album", "item_id": OLD_ALBUM, "action": "play", "at": 1},
             {"kind": "track", "item_id": "112", "action": "shuffle"},
+            # A track to start at, but with an album's play.
+            {"kind": "track", "item_id": "112", "action": "play", "start_track_id": "112"},
+            {"kind": "album", "item_id": OLD_ALBUM, "action": "shuffle", "start_track_id": "112"},
+            {"kind": "album", "item_id": OLD_ALBUM, "action": "add", "start_track_id": "112"},
+            {"kind": "artist", "item_id": BAND, "action": "play", "start_track_id": "112"},
+            {"kind": "playlist", "item_id": MIX, "action": "play", "start_track_id": "111"},
+            {"kind": "album", "item_id": OLD_ALBUM, "action": "play", "start_track_id": 112},
         ],
     )
     def test_a_body_the_route_does_not_take_is_refused(self, client, household, body):
@@ -749,19 +806,29 @@ class TestQueueDocument:
             "`task_failed`",
             "`queue_changed`",
             "as far as it got",
+            "An album's `play` with `start_track_id` plays the album from that track",
+            "A track's `play` queues the track alone",
         ):
             assert part in description
         responses = operation["responses"]
         assert "`ITEM_NOT_FOUND`" in responses["404"]["description"]
+        assert "`start_track_id`" in responses["404"]["description"]
         assert "`PLAYLIST_NOT_PLAYABLE`" in responses["409"]["description"]
         assert "track" in responses["400"]["description"]
+        assert "`start_track_id`" in responses["400"]["description"]
 
     def test_queueing_takes_a_described_item(self, openapi_document, path):
         body = path["post"]["requestBody"]
         schema = json_schema(openapi_document, body)
 
         assert body["required"] is True
-        assert sorted(schema["properties"]) == ["action", "item_id", "kind", "order"]
+        assert sorted(schema["properties"]) == [
+            "action",
+            "item_id",
+            "kind",
+            "order",
+            "start_track_id",
+        ]
         assert sorted(schema["required"]) == ["action", "item_id", "kind"]
         assert undescribed(openapi_document, schema) == []
         fields = {
@@ -773,6 +840,9 @@ class TestQueueDocument:
         assert values(fields["order"]) == ["newest_first", "oldest_first"]
         assert fields["order"]["default"] == "newest_first"
         assert fields["item_id"]["type"] == "string"
+        assert fields["start_track_id"]["default"] is None
+        assert {"type": "string"} in fields["start_track_id"]["anyOf"]
+        assert "album's `play`" in fields["start_track_id"]["description"]
 
     def test_queueing_answers_the_started_task(self, openapi_document, path):
         accepted = path["post"]["responses"]["202"]

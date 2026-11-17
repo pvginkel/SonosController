@@ -107,13 +107,14 @@ def clear_queue(
             ApiErrorResponseSchema,
             "The body is not a JSON object, lacks `kind`, `item_id` or "
             "`action`, holds a value none of them takes or a field that is "
-            "not one of the four, or asks to shuffle a track.",
+            "not one of the five, asks to shuffle a track, or names "
+            "`start_track_id` for anything but an album's `play`.",
         ),
         HTTP_404=(
             ApiErrorResponseSchema,
             "No speaker has this id, the code `SPEAKER_NOT_FOUND`; or Plex has "
-            "no item of this `kind` with this `item_id`, the code "
-            "`ITEM_NOT_FOUND`.",
+            "no item of this `kind` with this `item_id`, or the album has no "
+            "track with the id `start_track_id`, the code `ITEM_NOT_FOUND`.",
         ),
         HTTP_409=(
             ApiErrorResponseSchema,
@@ -136,6 +137,11 @@ def queue_item(
     `add` appends and changes nothing else. An artist with `play` or `add`
     is its albums in release order, `order` deciding which comes first, each
     in disc and track order; with `shuffle` it is all its tracks, shuffled.
+
+    An album's `play` with `start_track_id` plays the album from that track:
+    the whole album replaces the queue and playback starts at the track, the
+    tracks before it in the queue before it. This is how a client plays a
+    track it lists in an album. A track's `play` queues the track alone.
 
     The speaker and the item are checked, then a task does the queueing and
     the answer is its `task_id`. Its events, `task_event`, reach every

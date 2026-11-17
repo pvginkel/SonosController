@@ -562,7 +562,7 @@ def queue_calls(
         "set_shuffle",
         "add_to_queue",
         "add_many_to_queue",
-        "play_from_start",
+        "play_from",
     ):
         record(name)
     return calls
@@ -579,7 +579,7 @@ def replaced(
         ("select_queue", speaker_id),
         ("set_shuffle", speaker_id, shuffle),
         ("add_to_queue", speaker_id, *first),
-        ("play_from_start", speaker_id),
+        ("play_from", speaker_id, 1),
         *(("add_many_to_queue", speaker_id, list(more)) for more in rest),
     ]
 
@@ -614,6 +614,48 @@ class TestQueueServiceQueue:
         playback = household.read_playback(GARAGE)
         assert playback.transport_state is TransportState.PLAYING
         assert (playback.queue_position, playback.shuffle) == (1, False)
+
+    @pytest.mark.parametrize("shuffled", [False, True])
+    def test_play_of_an_album_from_a_track_plays_the_whole_album_from_it(
+        self, queue, household, tasks, monkeypatch, shuffled
+    ):
+        household.set_shuffle(GARAGE, shuffled)
+        calls = queue_calls(household, monkeypatch)
+
+        self.run(
+            queue,
+            tasks,
+            GARAGE,
+            asked("album", OLD_ALBUM, "play", start_track_id=OLD_TRACKS[2]),
+        )
+
+        assert calls == [
+            ("clear_queue", GARAGE),
+            ("select_queue", GARAGE),
+            ("set_shuffle", GARAGE, False),
+            ("add_to_queue", GARAGE, "album", OLD_ALBUM),
+            ("play_from", GARAGE, 3),
+        ]
+        assert keys(household, GARAGE) == OLD_TRACKS
+        playback = household.read_playback(GARAGE)
+        assert playback.transport_state is TransportState.PLAYING
+        assert (playback.queue_position, playback.shuffle) == (3, False)
+        assert parse_plex_queue_entry(playback.track.uri).rating_key == OLD_TRACKS[2]
+
+    def test_an_album_played_from_a_track_finds_it_past_a_read_of_the_queue(
+        self, queue, household, tasks, plex
+    ):
+        # A box set: its track is past the first read of the queue the task
+        # makes.
+        box = [f"5{n:03}" for n in range(1, 131)]
+        plex.add_album("50", box, None, artist=BAND)
+
+        self.run(queue, tasks, GARAGE, asked("album", "50", "play", start_track_id=box[119]))
+
+        assert keys(household, GARAGE) == box
+        playback = household.read_playback(GARAGE)
+        assert playback.queue_position == 120
+        assert parse_plex_queue_entry(playback.track.uri).rating_key == box[119]
 
     def test_play_turns_shuffle_off_before_it_queues(self, queue, household, tasks):
         household.set_shuffle(GARAGE, True)
@@ -1186,6 +1228,27 @@ class TestQueueServiceQueueRefusals:
         assert raised.value.error_code == "ITEM_NOT_FOUND"
         assert reached == []
 
+    @pytest.mark.parametrize(
+        ("album", "track", "message"),
+        [
+            # A track of another album, and one Plex does not have.
+            (OLD_ALBUM, NEW_TRACKS[0], f"Track {NEW_TRACKS[0]} of album {OLD_ALBUM} was not found"),
+            (OLD_ALBUM, "99", f"Track 99 of album {OLD_ALBUM} was not found"),
+            ("99", OLD_TRACKS[0], "Album 99 was not found"),
+        ],
+    )
+    def test_a_track_the_album_does_not_hold_is_not_found(
+        self, queue, household, album, track, message
+    ):
+        reached = calls_from_here(household)
+
+        with pytest.raises(ItemNotFoundException) as raised:
+            queue.queue(GARAGE, asked("album", album, "play", start_track_id=track))
+
+        assert raised.value.message == message
+        assert raised.value.error_code == "ITEM_NOT_FOUND"
+        assert reached == []
+
     def test_a_playlist_without_tracks_is_not_playable(self, queue, household):
         with pytest.raises(PlaylistNotPlayableException) as raised:
             queue.queue(GARAGE, asked("playlist", EMPTY, "play"))
@@ -1262,6 +1325,37 @@ class TestQueueServiceQueueFailures:
             )
         }
         assert keys(household, GARAGE) == TRACKS
+
+    def test_an_album_queued_without_the_track_to_play_from_fails_the_task(
+        self, queue, household, tasks, plex, hold
+    ):
+        # Plex moves the track to another album after the request was
+        # checked: the speaker queues the album without it.
+        held = hold("clear_queue")
+        started = queue.queue(
+            GARAGE, asked("album", OLD_ALBUM, "play", start_track_id=OLD_TRACKS[1])
+        )
+        held.wait()
+        plex.add_track(NEW_ALBUM, OLD_TRACKS[1], number=3)
+        held.release()
+
+        events = tasks.finish(started.task_id)
+
+        assert [event["event_type"] for event in events] == [
+            "task_started",
+            "task_failed",
+        ]
+        assert events[-1]["data"] == {
+            "error": (
+                f"Cannot play album {OLD_ALBUM} from track {OLD_TRACKS[1]} on "
+                f"speaker {GARAGE} because the speaker queued the album without "
+                "the track"
+            )
+        }
+        assert keys(household, GARAGE) == [OLD_TRACKS[0], OLD_TRACKS[2]]
+        assert household.read_playback(GARAGE).transport_state is (
+            TransportState.STOPPED
+        )
 
     def test_a_failed_play_leaves_the_queue_as_far_as_it_got(
         self, queue, household, tasks
@@ -1368,6 +1462,7 @@ class TestQueueServiceQueueFailures:
             "Gone",
             "play",
             newest_first=True,
+            start_track_id=None,
         )
 
         started = lanes.start(GARAGE, task, replaces=True)
@@ -1403,6 +1498,7 @@ class TestQueueServiceQueueFailures:
             "Album 11",
             "play",
             newest_first=True,
+            start_track_id=None,
         )
 
         started = lanes.start(GARAGE, task, replaces=True)

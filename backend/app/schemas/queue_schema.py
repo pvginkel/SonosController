@@ -88,7 +88,9 @@ QueueAction = Literal["play", "shuffle", "add"]
 
 class QueueRequestSchema(BaseModel):
     """An item of the library to play, shuffle or add to the queue of the
-    speaker's group. A track is played or added, never shuffled."""
+    speaker's group. A track is played or added, never shuffled. An album is
+    played from its first track, or from the track ``start_track_id``
+    names."""
 
     model_config = ConfigDict(strict=True, extra="forbid")
 
@@ -117,11 +119,30 @@ class QueueRequestSchema(BaseModel):
             "track order. Ignored for every other item and action."
         ),
     )
+    start_track_id: str | None = Field(
+        None,
+        description=(
+            "With an album's `play` only: the `id` of one of the album's "
+            "tracks, from `/api/library/albums/{album_id}/tracks`. The whole "
+            "album replaces the queue, in disc and track order, and plays "
+            "from this track: the tracks before it are in the queue, before "
+            "it. Without it the album plays from its first track. With any "
+            "other `kind` or `action` it is refused."
+        ),
+    )
 
     @model_validator(mode="after")
     def _a_track_is_not_shuffled(self) -> Self:
         if self.kind == "track" and self.action == "shuffle":
             raise ValueError("a track is played or added, not shuffled")
+        return self
+
+    @model_validator(mode="after")
+    def _only_an_album_played_starts_at_a_track(self) -> Self:
+        if self.start_track_id is not None and (
+            self.kind != "album" or self.action != "play"
+        ):
+            raise ValueError("start_track_id is taken with an album's play only")
         return self
 
 

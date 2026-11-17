@@ -52,6 +52,10 @@ from app.utils.plex_queue_entry import parse_plex_queue_entry
 
 logger = logging.getLogger(__name__)
 
+# The entries one read of the queue asks for while a task looks for the
+# track it plays from: a page of the queue listing at most (section 1.6).
+_QUEUE_READ_LIMIT = 100
+
 
 @dataclass(frozen=True)
 class QueueEntry:
@@ -150,15 +154,20 @@ class QueueService:
         Play or a Shuffle ends those. The task's events go to every
         connection (``docs/api-design.md`` section 4).
 
+        An album played from a track is checked to hold the track.
+
         Raises:
             SpeakerNotFoundException: The household has no such room.
-            ItemNotFoundException: Plex has no such item.
+            ItemNotFoundException: Plex has no such item, or the album has
+                no such track.
             PlaylistNotPlayableException: The playlist holds no tracks, or
                 more than ``PLAYLIST_MAX_TRACKS``.
             ExternalServiceException: Plex failed.
         """
         group_id = self._mirror.speaker(speaker_id).group.coordinator_id
         title = self._title(request.kind, request.item_id)
+        if request.start_track_id is not None:
+            self._check_album_track(request.item_id, request.start_track_id)
         task = QueueingTask(
             self._sonos,
             self._plex,
@@ -170,6 +179,7 @@ class QueueService:
             title,
             request.action,
             newest_first=request.order == "newest_first",
+            start_track_id=request.start_track_id,
         )
         return self._lanes.start(group_id, task, replaces=request.action != "add")
 
@@ -197,6 +207,14 @@ class QueueService:
                     f"{self._playlist_max_tracks} a playlist may hold to be queued",
                 )
         return item.title
+
+    def _check_album_track(self, album_id: str, track_id: str) -> None:
+        """Plex has the track on the album."""
+        tracks = self._plex.read_album_tracks(album_id)
+        if tracks is None:
+            raise ItemNotFoundException("Album", album_id)
+        if all(track.rating_key != track_id for track in tracks):
+            raise ItemNotFoundException("Track", f"{track_id} of album {album_id}")
 
     def _track_ids(self, speaker_id: str, tracks: Sequence[Track]) -> list[str | None]:
         """The rating key of each entry queued from the configured Plex
@@ -253,6 +271,10 @@ class QueueingTask(BaseTask):
     ``ADD_MANY_LIMIT`` a call. Plex is read before the queue changes. A
     failure ends the task where it is, the queue as far as it got.
 
+    A Play or a Shuffle plays from the queue's first entry, and an album
+    played from a track from that track's entry, looked for in the queue as
+    the speaker gives it.
+
     The task runs in its turn in the group's lane. A task a later Play,
     Shuffle or Clear ends stops before its next call to the speaker and
     returns.
@@ -270,6 +292,7 @@ class QueueingTask(BaseTask):
         title: str,
         action: QueueAction,
         newest_first: bool,
+        start_track_id: str | None,
     ) -> None:
         super().__init__()
         self._sonos = sonos_client
@@ -282,6 +305,7 @@ class QueueingTask(BaseTask):
         self._title = title
         self._action = action
         self._newest_first = newest_first
+        self._start_track_id = start_track_id
 
     def execute(
         self, progress_handle: ProgressHandle, **kwargs: Any
@@ -293,7 +317,8 @@ class QueueingTask(BaseTask):
 
         Raises:
             ItemNotFoundException: Plex no longer has the artist.
-            InvalidOperationException: Plex has no albums of the artist.
+            InvalidOperationException: Plex has no albums of the artist, or
+                the album the speaker queued lacks the track to play from.
             ExternalServiceException: Plex or the speaker failed.
         """
         with self._lanes.turn(self._group_id, self):
@@ -336,8 +361,10 @@ class QueueingTask(BaseTask):
                 partial(sonos.set_shuffle, speaker_id, self._action == "shuffle"),
             ]
         calls.append(partial(sonos.add_to_queue, speaker_id, first))
-        if replaces:
-            calls.append(partial(sonos.play_from_start, speaker_id))
+        if replaces and self._start_track_id is not None:
+            calls.append(partial(self._play_from_track, first.machine_identifier))
+        elif replaces:
+            calls.append(partial(sonos.play_from, speaker_id, 1))
         calls += [
             partial(
                 sonos.add_many_to_queue,
@@ -367,6 +394,29 @@ class QueueingTask(BaseTask):
             PlexItem(PlexItemKind.ALBUM, server, section, album.rating_key, album.title)
             for album in albums
         ]
+
+    def _play_from_track(self, server: str) -> None:
+        """Play from the entry of the track to start at, the first of the
+        queue that is that track of the server."""
+        offset = 0
+        while True:
+            page = self._sonos.read_queue(self._speaker_id, offset, _QUEUE_READ_LIMIT)
+            for position, track in enumerate(page.tracks, start=offset + 1):
+                entry = parse_plex_queue_entry(track.uri)
+                if (
+                    entry is not None
+                    and entry.machine_identifier == server
+                    and entry.rating_key == self._start_track_id
+                ):
+                    self._sonos.play_from(self._speaker_id, position)
+                    return
+            offset += len(page.tracks)
+            if not page.tracks or offset >= page.total:
+                raise InvalidOperationException(
+                    f"play album {self._rating_key} from track "
+                    f"{self._start_track_id} on speaker {self._speaker_id}",
+                    "the speaker queued the album without the track",
+                )
 
 
 def _entry(

@@ -661,7 +661,7 @@ class TestLiveQueue:
         # The current track stays first.
         assert shuffled.tracks[0] == in_order.tracks[0]
 
-        sonos.play_from_start(garage)
+        sonos.play_from(garage, 1)
         playing = _wait_for(
             lambda: sonos.read_playback(garage),
             lambda p: p.transport_state is TransportState.PLAYING,
@@ -678,6 +678,49 @@ class TestLiveQueue:
 
         assert sonos.read_queue(garage, 0, 1000) == in_order
         assert sonos.read_playback(garage).shuffle is False
+
+    def test_an_album_plays_from_one_of_its_tracks(
+        self, sonos, garage, quiet, kept_queue, library, plex
+    ):
+        # What a queueing task does to play an album from a track: the album
+        # replaces the queue, the track is looked for in it, and the speaker
+        # plays from there. quiet before kept_queue: the Garage stops before
+        # its volume is put back.
+        album = max(library.albums, key=lambda a: a.track_count)
+        assert album.track_count >= 2
+        tracks = plex.read_album_tracks(album.rating_key)
+        assert tracks is not None
+        start = tracks[-1]
+        sonos.clear_queue(garage)
+        sonos.select_queue(garage)
+        sonos.set_shuffle(garage, False)
+        sonos.add_to_queue(garage, library.album(album))
+
+        page = sonos.read_queue(garage, 0, 1000)
+        # The service queues the album in Plex's disc and track order.
+        assert _keys(page) == [track.rating_key for track in tracks]
+        position = _keys(page).index(start.rating_key) + 1
+        # A seek past the last track is refused, and changes nothing.
+        with pytest.raises(ExternalServiceException) as raised:
+            sonos.play_from(garage, page.total + 1)
+        assert raised.value.cause == (
+            "the speaker answered UPnP error 711 (Illegal seek target)"
+        )
+        assert sonos.read_playback(garage).transport_state is TransportState.STOPPED
+
+        sonos.play_from(garage, position)
+
+        playing = _wait_for(
+            lambda: sonos.read_playback(garage),
+            lambda p: p.transport_state is TransportState.PLAYING,
+        )
+        assert playing.transport_state is TransportState.PLAYING
+        assert (playing.queue_position, playing.queue_length) == (
+            position,
+            album.track_count,
+        )
+        assert playing.track == page.tracks[position - 1]
+        sonos.stop(garage)
 
     def test_the_emptied_queue_is_selected_and_shuffled_before_it_is_filled(
         self, sonos, garage, kept_queue, library
@@ -757,7 +800,7 @@ class TestLiveQueue:
         sonos.clear_queue(garage)
 
         with pytest.raises(ExternalServiceException) as raised:
-            sonos.play_from_start(garage)
+            sonos.play_from(garage, 1)
 
         assert raised.value.cause == (
             "the speaker answered UPnP error 711 (Illegal seek target)"

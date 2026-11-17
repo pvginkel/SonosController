@@ -492,8 +492,14 @@ class SonosClient(ABC):
         """One call of ``add_many_to_queue()``, as ``_send_add()``."""
 
     @abstractmethod
-    def play_from_start(self, speaker_id: str) -> None:
-        """Play the group's queue from its first track."""
+    def play_from(self, speaker_id: str, position: int) -> None:
+        """Play the group's queue from the entry at ``position``, from 1, in
+        the order the speaker presents the queue: with shuffle on, the play
+        order.
+
+        A position the queue does not hold, which is every position of an
+        empty queue, the speaker refuses (UPnP error 711).
+        """
 
     @abstractmethod
     def read_picture(self, speaker_id: str, picture: str) -> bytes:
@@ -835,9 +841,11 @@ class SoCoSonosClient(SonosClient):
                 timeout=_QUEUE_TIMEOUT_SECONDS,
             )
 
-    def play_from_start(self, speaker_id: str) -> None:
-        with _speaker_call(f"play from the first track on speaker {speaker_id}"):
-            self._coordinator(speaker_id).play_from_queue(0)
+    def play_from(self, speaker_id: str, position: int) -> None:
+        with _speaker_call(
+            f"play from queue position {position} on speaker {speaker_id}"
+        ):
+            self._coordinator(speaker_id).play_from_queue(position - 1)
 
     def read_picture(self, speaker_id: str, picture: str) -> bytes:
         with _speaker_call(f"read the picture speaker {speaker_id} serves"):

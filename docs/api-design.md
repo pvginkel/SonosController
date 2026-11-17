@@ -20,6 +20,7 @@ could not be tried, it says so, and section 7 lists it.
 | Queueing | Through the Plex service linked in Sonos, with addresses the backend builds itself. SoCo's `PlexPlugin` is not used: it starts multicast discovery, which fails in a pod. |
 | Order of an artist | The Plex service gives the newest album first. The backend does not rely on that: it reads the albums from Plex, sorts them by release date, and queues them album by album. Newest first is the default, since that is what the speaker does today; oldest first is one request field. |
 | Shuffle | The speaker's own shuffle mode. Play always sets the mode back to normal before it queues, so Play is in order whatever was shuffled before. |
+| Playing a track of an album | An album's Play names the track to start at (`start_track_id`): the whole album replaces the queue and plays from that track, as the Sonos app plays a track of an album. A track's own Play still queues the track alone. |
 | Large playlists | The speaker refuses a playlist of 12,019 tracks and queues nothing. The library shows playlists of 1 to 1,000 tracks. |
 | Long work | Queueing music runs as a task (`202` and a task id). Every other call answers directly. |
 | Favourites | Stored with Plex's `guid`, the item's rating key as a shortcut, and its title as a last resort. |
@@ -208,7 +209,7 @@ The speaker's shuffle mode (`SHUFFLE_NOREPEAT`) does more than pick tracks at ra
 So:
 
 - **Play** clears the queue, makes the queue the source, sets the mode to `NORMAL`, queues, and
-  plays from the first track.
+  plays from the first track; an album played from one of its tracks, from that track (3.4).
 - **Shuffle** clears the queue, makes the queue the source, sets `SHUFFLE_NOREPEAT`, queues the
   item as **one** container (for an artist the artist container, so every track is there before
   the first is drawn), and plays from the first track of the shuffled order.
@@ -573,6 +574,7 @@ page it is. Without a current track it answers the page asked.
 
 ```json
 { "kind": "artist", "item_id": "37059", "action": "play", "order": "newest_first" }
+{ "kind": "album", "item_id": "37060", "action": "play", "start_track_id": "37064" }
 ```
 
 - `kind`: `artist`, `album`, `track` or `playlist`. `item_id`: its rating key.
@@ -582,8 +584,22 @@ page it is. Without a current track it answers the page asked.
   - `add` appends and changes nothing else: not the mode, not what plays.
 - `order`: `newest_first` (the default) or `oldest_first`. It is read for an artist with `play`
   or `add`, and ignored otherwise.
-- A track is played or added, never shuffled: `shuffle` with a track is a `400`, as is a body
-  with a field that is not one of the four.
+- `start_track_id`: with an album's `play` only, the `id` of one of the album's tracks. The whole
+  album replaces the queue, in disc and track order, and plays from that track, the tracks before
+  it in the queue. Without it the album plays from its first track.
+- A track is played or added, never shuffled: `shuffle` with a track is a `400`, as is
+  `start_track_id` with anything but an album's `play`, and a body with a field that is not one
+  of the five.
+
+**Playing an album from a track.** What the operator asked for, at the display's try-out on
+2026-11-17: a track pressed in an album's track list plays the album from that track, as the
+Sonos app does. It is an option of the album's `play`, not a new meaning of a track's `play`,
+which still queues the track alone. What a track is played from decides what is queued: the
+display only lists a track in its album, but a later client that lists a playlist's tracks, or a
+favourite track, would queue something else around it, and a track's `play` that always queued
+its album would tie the API to the display's one list. The client knows the album it lists the
+track in, so it names both. The display's firmware moves to it when a press on a track's line
+becomes its Play.
 
 The endpoint checks the speaker in the mirror and the item in Plex, as it is now, then starts a
 task and answers `202` with the template's `TaskStartResponse` (API-2): a large artist takes 33
@@ -592,7 +608,7 @@ before the queue changes, then does what 1.4, 1.5 and 1.7 found:
 
 | Action | Steps on the coordinator |
 |---|---|
-| `play` | Clear. Make the queue the source. Set `NORMAL`. Queue the first container. Play from the first track. Queue the rest. |
+| `play` | Clear. Make the queue the source. Set `NORMAL`. Queue the first container. Play from the first track, or, with `start_track_id`, from the first entry of the queue that is that track, read from the speaker. Queue the rest. |
 | `shuffle` | Clear. Make the queue the source. Set `SHUFFLE_NOREPEAT`. Queue the item as one container. Play from the first track. |
 | `add` | Queue the containers at the end. |
 
@@ -613,10 +629,17 @@ before the queue changes, then does what 1.4, 1.5 and 1.7 found:
   call is refused too. A display watches
   for the id it was given and shows the error. A failure in Plex, an artist Plex no longer has
   and an artist without albums leave the queue as it was; a failure of the speaker leaves the
-  queue as far as it got, which for `play` and `shuffle` may be empty.
+  queue as far as it got, which for `play` and `shuffle` may be empty. An album that the speaker
+  queued without the track to start at, as when Plex moved the track after the request was
+  checked, fails the task with the album queued and not playing.
+- The track to start at is looked for in the queue rather than counted from Plex's track list,
+  so that it is the speaker's own order that decides where playback starts. The queue holds only
+  the album then, and the task reads it 100 entries a read until it finds the track: one read for
+  an album of up to 100 tracks.
 - Refused before any task starts: a speaker the mirror does not hold (`404`,
-  `SPEAKER_NOT_FOUND`), an item Plex does not have (`404`, `ITEM_NOT_FOUND`), and a playlist that
-  holds no tracks or more than `PLAYLIST_MAX_TRACKS` (`409`, `PLAYLIST_NOT_PLAYABLE`). A Plex
+  `SPEAKER_NOT_FOUND`), an item Plex does not have or a `start_track_id` that is not a track of
+  the album (`404`, `ITEM_NOT_FOUND`), and a playlist that holds no tracks or more than
+  `PLAYLIST_MAX_TRACKS` (`409`, `PLAYLIST_NOT_PLAYABLE`). A Plex
   that fails is a `502`.
 
 Playing from a chosen place in the queue, removing one entry and reordering are not in what is

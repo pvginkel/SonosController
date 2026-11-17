@@ -703,13 +703,13 @@ class FakeSonosClient(SonosClient):
     def _send_add_many(self, speaker_id: str, items: Sequence[PlexItem]) -> None:
         self._add(speaker_id, f"add {len(items)} Plex items to the queue of", items)
 
-    def play_from_start(self, speaker_id: str) -> None:
-        operation = "play from the first track on"
+    def play_from(self, speaker_id: str, position: int) -> None:
+        operation = f"play from queue position {position} on"
         room = self._coordinator(speaker_id, operation)
         # The speaker takes the queue as its transport before it seeks.
         transport_changed = room.stream is not None
         room.stream = None
-        if not room.queue:
+        if not 1 <= position <= len(room.queue):
             if transport_changed:
                 room.state = TransportState.STOPPED
                 self._send_playback(room, full=True)
@@ -717,7 +717,7 @@ class FakeSonosClient(SonosClient):
                 f"{operation} speaker {speaker_id}",
                 "the speaker answered UPnP error 711 (Illegal seek target)",
             )
-        room.position = 1
+        room.position = position
         room.state = TransportState.PLAYING
         self._send_playback(
             room, full=transport_changed, via=TransportState.TRANSITIONING

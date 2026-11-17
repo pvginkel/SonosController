@@ -1057,20 +1057,27 @@ class TestSonosClientQueue:
         assert household.read_playback(LOUNGE).shuffle is True
         assert household.read_queue(LOUNGE, 0, 100).total == 0
 
-    def test_play_from_start_plays_the_first_track(self, household):
+    def test_play_from_the_first_position_plays_the_first_track(self, household):
         household.next(GARAGE)
         household.next(GARAGE)
 
-        household.play_from_start(GARAGE)
+        household.play_from(GARAGE, 1)
 
         playback = household.read_playback(GARAGE)
         assert playback.transport_state is TransportState.PLAYING
         assert (playback.queue_position, playback.track) == (1, queue_track(1))
 
-    def test_play_from_start_takes_the_queue_from_a_stream(self, household):
+    def test_play_from_a_position_plays_the_track_there(self, household):
+        household.play_from(GARAGE, 2)
+
+        playback = household.read_playback(GARAGE)
+        assert playback.transport_state is TransportState.PLAYING
+        assert (playback.queue_position, playback.track) == (2, queue_track(2))
+
+    def test_play_from_takes_the_queue_from_a_stream(self, household):
         household.start_stream(GARAGE, "Radio One")
 
-        household.play_from_start(GARAGE)
+        household.play_from(GARAGE, 1)
 
         playback = household.read_playback(GARAGE)
         assert playback.transport_uri == f"x-rincon-queue:{GARAGE}#0"
@@ -1128,13 +1135,13 @@ class TestSonosClientQueue:
         household.set_shuffle(GARAGE, True)
         assert household.read_playback(GARAGE).shuffle is True
 
-    def test_play_from_start_of_an_empty_queue_fails(self, household):
+    def test_play_from_the_start_of_an_empty_queue_fails(self, household):
         with pytest.raises(ExternalServiceException) as raised:
-            household.play_from_start(LOUNGE)
+            household.play_from(LOUNGE, 1)
 
         # As the Garage answered: the seek to the first track fails.
         assert (
-            raised.value.operation == f"play from the first track on speaker {LOUNGE}"
+            raised.value.operation == f"play from queue position 1 on speaker {LOUNGE}"
         )
         assert raised.value.cause == (
             "the speaker answered UPnP error 711 (Illegal seek target)"
@@ -1142,6 +1149,19 @@ class TestSonosClientQueue:
         assert household.read_playback(LOUNGE).transport_state is (
             TransportState.STOPPED
         )
+
+    def test_play_from_past_the_end_of_the_queue_fails(self, household):
+        found = household.read_playback(GARAGE)
+
+        with pytest.raises(ExternalServiceException) as raised:
+            household.play_from(GARAGE, 4)
+
+        # As the live suite's test_an_album_plays_from_one_of_its_tracks has
+        # the Garage answer a seek past its last track.
+        assert raised.value.cause == (
+            "the speaker answered UPnP error 711 (Illegal seek target)"
+        )
+        assert household.read_playback(GARAGE) == found
 
     def test_a_queue_call_goes_to_the_coordinator_of_the_group(
         self, household, library
@@ -1173,7 +1193,7 @@ class TestSonosClientQueue:
                 lambda s, room: s.add_many_to_queue(room, [_album("10")]),
                 "add 1 Plex items to the queue of",
             ),
-            (lambda s, room: s.play_from_start(room), "play from the first track on"),
+            (lambda s, room: s.play_from(room, 1), "play from queue position 1 on"),
         ],
     )
     def test_a_queue_call_fails_when_the_coordinator_does_not_answer(
@@ -1197,7 +1217,7 @@ class TestSonosClientQueue:
         listener, _ = _subscribe(household, LOUNGE, SonosService.AV_TRANSPORT)
 
         household.add_to_queue(LOUNGE, _album("10"))
-        household.play_from_start(LOUNGE)
+        household.play_from(LOUNGE, 1)
         household.clear_queue(LOUNGE)
         household.settle()
 
