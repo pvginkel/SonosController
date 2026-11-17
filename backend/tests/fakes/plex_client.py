@@ -23,6 +23,8 @@ A test builds its library with ``add_artist()``, ``add_album()``,
 ``add_track()`` and ``add_playlist()``, and with ``move()`` has Plex see an
 item as new, as after a rescan found its files moved. ``served_tracks()`` is what the Plex
 service linked in Sonos gives the fake household for a container of it.
+``close()`` drops the library and its pictures, which the ``plex`` fixture
+does after every test.
 """
 
 from __future__ import annotations
@@ -325,6 +327,17 @@ class FakePlexClient(PlexClient):
             )
         self._pictures[rating_key] = _Picture(image, self._next_stamp)
         self._next_stamp += 1
+
+    def close(self) -> None:
+        """Drop the library and its pictures. A finished test's fakes can
+        outlive it: its household mirror and its fake household hold each
+        other, and this fake with them, until a garbage collection, and a
+        picture of the default size is megabytes."""
+        self._artists.clear()
+        self._albums.clear()
+        self._tracks.clear()
+        self._playlists.clear()
+        self._pictures.clear()
 
     # ------------------------------------------------------------------
     # The Plex service linked in Sonos

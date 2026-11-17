@@ -135,6 +135,10 @@ def plex(app: Flask) -> Generator[FakePlexClient]:
     fixtures of this file up by name, this one before
     ``session_app_isolation``, which therefore takes the override for what
     it is to keep. The live suite replaces this fixture with the real client.
+
+    It closes the fake after the test, dropping its library: the test's
+    household mirror and fake household hold each other, and the fake with
+    them, until a garbage collection, which may come many tests later.
     """
     fake = FakePlexClient(health_service=app.container.health_service())
     app.container.plex_client.override(fake)
@@ -142,16 +146,20 @@ def plex(app: Flask) -> Generator[FakePlexClient]:
         yield fake
     finally:
         app.container.plex_client.reset_last_overriding()
+        fake.close()
 
 
 @pytest.fixture
-def committed_plex(committed_app: Flask) -> FakePlexClient:
+def committed_plex(committed_app: Flask) -> Generator[FakePlexClient]:
     """The Plex ``committed_app`` runs against: the in-memory fake, its
-    library empty. The app is disposed of after the test, its override
-    with it."""
+    library empty, closed after the test as ``plex`` is. The app is disposed
+    of after the test, its override with it."""
     fake = FakePlexClient(health_service=committed_app.container.health_service())
     committed_app.container.plex_client.override(fake)
-    return fake
+    try:
+        yield fake
+    finally:
+        fake.close()
 
 
 @pytest.fixture

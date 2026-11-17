@@ -1084,6 +1084,13 @@ class TestPlexClientPicture:
                 for got, want in zip(image.getpixel(at), colour, strict=True)
             )
 
+    def test_a_closed_fake_serves_no_picture(self, library):
+        picture = library.read_track_picture(TRACKS[0])
+
+        library.close()
+
+        assert library.read_picture(picture, 100) is None
+
     def test_a_playlists_picture_is_read(self, music):
         picture = music.read_playlist(MIX).picture
 
