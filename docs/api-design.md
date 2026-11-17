@@ -789,7 +789,10 @@ ids and no replay.
 - **Group events go out for every member**, since each display follows its own room.
 - **`queue_changed`** is sent when a group's coordinator reports a change of its queue, a change
   of play mode included, and for a room that follows another coordinator after a regrouping. A
-  follower's own queue events are dropped, as its playback's are.
+  follower's own queue events are dropped, as its playback's are. It is also sent for every room
+  of a group whose coordinator the backend subscribed to and read again (its subscriptions
+  lapsed, it restarted, it took another address): the backend holds no queue, so what the queue
+  did while the coordinator had no subscription is unknown.
 - **`favourites_changed`** is sent once the request that changed the favourites has committed,
   one event however many it changed: a mark that made a favourite, a removal, and a listing that
   brought a favourite up to date or removed one (5). A mark answered with the favourite that

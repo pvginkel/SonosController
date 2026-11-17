@@ -1316,7 +1316,7 @@ class TestHouseholdMirrorEvents:
         # Every room's device reports the layout: one event all the same.
         assert stream.events() == [speakers_changed()]
 
-    def test_a_room_read_again_that_has_not_changed_sends_nothing(
+    def test_a_room_read_again_that_has_not_changed_sends_only_queue_changed(
         self, started, household, connect
     ):
         stream = connect()
@@ -1324,7 +1324,8 @@ class TestHouseholdMirrorEvents:
         household.move_room(GARAGE)
         household.settle()
 
-        assert stream.events() == []
+        # The queue is not held: the read cannot tell whether it changed.
+        assert stream.events() == [queue_changed(GARAGE)]
 
     def test_joining_a_group_changes_the_speakers_and_what_the_room_plays(
         self, started, household, connect
@@ -1479,7 +1480,10 @@ class TestHouseholdMirrorHealing:
         assert started.speaker(GARAGE).volume == 33
         assert started.speaker(GARAGE).group.volume == 33
         assert household.subscription_count(GARAGE) == 5
-        assert stream.events() == [volume_changed(GARAGE)]
+        assert in_any_order(stream.events()) == [
+            queue_changed(GARAGE),
+            volume_changed(GARAGE),
+        ]
 
         household.set_volume(GARAGE, 34)
         household.play(GARAGE)
@@ -1516,7 +1520,10 @@ class TestHouseholdMirrorHealing:
 
         assert started.playback(GARAGE).state is PlaybackStatus.STOPPED
         assert household.subscription_count(GARAGE) == 5
-        assert stream.events() == [playback_changed(GARAGE)]
+        assert in_any_order(stream.events()) == [
+            playback_changed(GARAGE),
+            queue_changed(GARAGE),
+        ]
 
         household.play(GARAGE)
         household.settle()
@@ -1557,7 +1564,27 @@ class TestHouseholdMirrorHealing:
         assert in_any_order(stream.events()) == [
             playback_changed(GARAGE),
             playback_changed(LOUNGE),
+            queue_changed(GARAGE),
+            queue_changed(LOUNGE),
         ]
+
+    def test_a_queue_changed_while_its_coordinator_is_read_again_reaches_the_group(
+        self, started, household, connect
+    ):
+        household.join(LOUNGE, GARAGE)
+        household.settle()
+        stream = connect()
+        stream.events()
+        # Made while the restarted device has no subscription: no Queue event
+        # reports it.
+        household.before_call = once(lambda: household.clear_queue(GARAGE))
+
+        household.restart_room(GARAGE)
+        household.settle()
+
+        events = stream.events()
+        assert queue_changed(GARAGE) in events
+        assert queue_changed(LOUNGE) in events
 
     def test_a_restarted_speaker_that_does_not_answer_keeps_what_is_held(
         self, started, household, connect, caplog
@@ -2060,7 +2087,10 @@ class TestHouseholdMirrorChecks:
         eventually(lambda: mirror.playback(GARAGE).state is PlaybackStatus.STOPPED)
 
         assert sonos.subscription_count(GARAGE) == 5
-        assert stream.events() == [playback_changed(GARAGE)]
+        assert in_any_order(stream.events()) == [
+            playback_changed(GARAGE),
+            queue_changed(GARAGE),
+        ]
 
         sonos.play(GARAGE)
         sonos.settle()

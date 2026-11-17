@@ -6,8 +6,10 @@ room in full when it does, and merges each event into what it holds. The API
 reads rooms and playback from it without asking a speaker, and it sends
 section 4's ``speakers_changed``, ``volume_changed`` and ``playback_changed``
 when what it holds changes. A group's queue is not held: the mirror sends
-``queue_changed`` when the speakers report that it changed, and when a room
-plays from another queue after a regrouping. Nothing of it is stored.
+``queue_changed`` when the speakers report that it changed, when a room
+plays from another queue after a regrouping, and for every room of a group
+whose coordinator was subscribed to and read again: what its queue did while
+it had no subscription is unknown. Nothing of it is stored.
 
 Its subscriptions live in this process, which is why the app runs as one
 replica. They heal themselves: a room is subscribed to and read again after
@@ -714,6 +716,11 @@ class HouseholdMirror:
                     for feed in ended:
                         feed.ended = True
                     events = _layout_events(before, self._served())
+                    events += _read_again_queue_events(
+                        events,
+                        applied,
+                        {room_id for room_id in read if room_id in held},
+                    )
             for stream_event in events:
                 self._events.send(stream_event)
         finally:
@@ -913,6 +920,31 @@ def _layout_events(
         if regrouped:
             events.append(QueueChangedEvent(payload=SpeakerPayload(speaker_id=room_id)))
     return events
+
+
+def _read_again_queue_events(
+    events: list[StreamEvent], household: Household, read_again: set[str]
+) -> list[StreamEvent]:
+    """The ``queue_changed`` of every room of a group whose held coordinator
+    was subscribed to and read again, but for the rooms the layout's events
+    already send it for.
+
+    A queue is not held, so the read cannot tell whether it changed while the
+    coordinator had no subscription, and a Queue event that waited in the
+    coordinator's feed was merged into nothing.
+    """
+    sent = {
+        event.payload.speaker_id
+        for event in events
+        if isinstance(event, QueueChangedEvent)
+    }
+    return [
+        QueueChangedEvent(payload=SpeakerPayload(speaker_id=member_id))
+        for group in household.groups
+        if group.coordinator_id in read_again
+        for member_id in group.member_ids
+        if member_id not in sent
+    ]
 
 
 def _merged_volume(held: Volume, event: VolumeChanged | GroupVolumeChanged) -> Volume:
