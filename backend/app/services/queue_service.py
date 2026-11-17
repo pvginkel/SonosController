@@ -98,14 +98,15 @@ class QueueService:
 
         ``current_position`` is the mirror's ``queue_position()``. With
         ``locate`` the page is the one that holds it, while there is one. The
-        pictures of the page's Plex tracks are one call to Plex. While Plex
-        has never answered, which server it is is not known: the page's
-        entries then have no track id and no artwork, which is logged.
+        pictures of the page's Plex tracks are one call to Plex; while Plex
+        fails to give them, the entries keep their track ids and have no
+        artwork, which is logged. While Plex has never answered, which server
+        it is is not known: the page's entries then have no track id and no
+        artwork, which is logged.
 
         Raises:
             SpeakerNotFoundException: The household has no such room.
-            ExternalServiceException: The speaker failed, or Plex failed to
-                give the pictures of the page's tracks.
+            ExternalServiceException: The speaker failed.
         """
         current_position = self._mirror.queue_position(speaker_id)
         page = query.page
@@ -114,9 +115,7 @@ class QueueService:
         offset = (page - 1) * query.per_page
         queue = self._sonos.read_queue(speaker_id, offset, query.per_page)
         track_ids = self._track_ids(speaker_id, queue.tracks)
-        pictures = self._plex.read_track_pictures(
-            track_id for track_id in track_ids if track_id is not None
-        )
+        pictures = self._pictures(speaker_id, track_ids)
         entries = [
             _entry(offset + index, track, track_id, pictures)
             for index, (track, track_id) in enumerate(
@@ -225,6 +224,24 @@ class QueueService:
             else None
             for entry in entries
         ]
+
+    def _pictures(
+        self, speaker_id: str, track_ids: Sequence[str | None]
+    ) -> dict[str, str]:
+        """The pictures of the page's Plex tracks, by rating key; none while
+        Plex fails to give them, which is logged."""
+        try:
+            return self._plex.read_track_pictures(
+                track_id for track_id in track_ids if track_id is not None
+            )
+        except ExternalServiceException as error:
+            logger.warning(
+                "The queue of speaker %s is served without the artwork of its "
+                "Plex tracks: %s",
+                speaker_id,
+                error,
+            )
+            return {}
 
 
 class QueueingTask(BaseTask):

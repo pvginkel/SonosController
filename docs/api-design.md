@@ -560,8 +560,8 @@ page it is. Without a current track it answers the page asked.
 - `track_id` and `artwork_id` are set for an entry that is a track of the configured Plex server
   (1.3, 2), and `null` for every other entry. The pictures of a page's tracks come from one Plex
   call for the whole page (`/library/metadata/<key>,<key>,…`, 21 ms for four items; a key Plex
-  does not have is left out of the answer). Once Plex has answered, a failure of that call is a
-  `502`.
+  does not have is left out of the answer). While Plex fails to give them, each entry keeps its
+  `track_id` with a `null` `artwork_id`, which is logged; the listing's `502` is the speaker's.
 - `album` and `duration_ms` are `null` where the entry gives none.
 - A page of 100 costs the speaker 0.12 s (1.6).
 - **Clear** empties the queue of the group; a group that plays from it stops. It ends the group's

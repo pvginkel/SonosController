@@ -242,17 +242,21 @@ class TestListQueue:
             "the speaker did not answer (ConnectTimeout)",
         )
 
-    def test_plex_that_does_not_answer_is_a_bad_gateway(self, client, household, plex):
+    def test_while_plex_does_not_answer_it_is_served_without_artwork(
+        self, client, household, plex
+    ):
         plex.machine_identifier()
         plex.reachable = False
 
-        response = client.get(f"/api/speakers/{GARAGE}/queue")
+        answer = listing(client, GARAGE)
 
-        assert response.status_code == 502
-        assert without_correlation_id(response.get_json()) == failed(
-            "read the pictures of 5 Plex tracks",
-            "Plex did not answer (ConnectionError)",
-        )
+        assert [entry["title"] for entry in answer["data"]] == [
+            f"Track {number}" for number in range(1, 6)
+        ]
+        assert [entry["track_id"] for entry in answer["data"]] == [
+            str(1000 + number) for number in range(1, 6)
+        ]
+        assert [entry["artwork_id"] for entry in answer["data"]] == [None] * 5
 
     def test_while_plex_has_never_answered_it_is_served_without_plex_ids(
         self, client, household, plex
@@ -269,26 +273,20 @@ class TestListQueue:
         assert [entry["artwork_id"] for entry in answer["data"]] == [None, None]
 
     def test_a_failure_names_no_address_and_no_token(
-        self, client, household, plex, test_app_settings
+        self, client, household, test_app_settings
     ):
-        plex.machine_identifier()
-        plex.reachable = False
         household.silence_room(LOUNGE)
 
         try:
-            responses = [
-                client.get(f"/api/speakers/{speaker_id}/queue")
-                for speaker_id in (GARAGE, LOUNGE)
-            ]
+            response = client.get(f"/api/speakers/{LOUNGE}/queue")
         finally:
             household.answer_again(LOUNGE)
 
-        for response in responses:
-            assert response.status_code == 502
-            text = response.get_data(as_text=True)
-            assert "192.0.2." not in text
-            assert "32400" not in text
-            assert test_app_settings.plex_token not in text
+        assert response.status_code == 502
+        text = response.get_data(as_text=True)
+        assert "192.0.2." not in text
+        assert "32400" not in text
+        assert test_app_settings.plex_token not in text
 
     @pytest.mark.parametrize("query", REFUSED_QUERIES)
     def test_a_query_the_list_does_not_take_is_refused(self, client, household, query):

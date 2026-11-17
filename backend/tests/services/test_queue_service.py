@@ -365,17 +365,26 @@ class TestQueueServiceListQueue:
             "because external service failed: Plex did not answer (ConnectionError)"
         )
 
-    def test_plex_that_fails_to_give_the_pictures_fails_the_listing(self, queue, plex):
+    def test_while_plex_fails_to_give_the_pictures_tracks_keep_their_ids(
+        self, queue, plex, caplog
+    ):
         # Plex answered once: which server it is is known.
         plex.machine_identifier()
         plex.reachable = False
 
-        with pytest.raises(ExternalServiceException) as raised:
-            queue.list_queue(GARAGE, query())
+        with caplog.at_level(logging.WARNING, "app.services.queue_service"):
+            entries = queue.list_queue(GARAGE, query()).entries
 
-        assert raised.value.message == (
-            "Cannot read the pictures of 7 Plex tracks because external service "
-            "failed: Plex did not answer (ConnectionError)"
+        assert [entry.track_id for entry in entries] == TRACKS
+        assert [entry.artwork_id for entry in entries] == [None] * len(TRACKS)
+        assert [entry.title for entry in entries] == [
+            f"Track {number}" for number in range(1, 8)
+        ]
+        assert [record.levelname for record in caplog.records] == ["WARNING"]
+        assert caplog.records[0].getMessage() == (
+            f"The queue of speaker {GARAGE} is served without the artwork of its "
+            "Plex tracks: Cannot read the pictures of 7 Plex tracks because "
+            "external service failed: Plex did not answer (ConnectionError)"
         )
 
     def test_a_speaker_that_does_not_answer_fails_the_listing(self, queue, household):
