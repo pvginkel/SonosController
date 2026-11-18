@@ -93,9 +93,12 @@ class FavouriteService:
         One found that way is brought up to date with its item's rating key,
         ``guid`` and titles, so that the next listing finds it at its rating
         key; and where another favourite marks that item, the one marked
-        first stays and the other is removed, and not listed. A listing that
-        brought one up to date or removed one is announced. One found
-        nowhere is served as it is stored, not available, and kept.
+        first stays and the other is removed, and not listed. One found at
+        its rating key whose item Plex has retitled is brought up to date
+        with the item's titles, so that the order by title and the lookup by
+        title follow the rename. A listing that brought one up to date or
+        removed one is announced. One found nowhere is served as it is
+        stored, not available, and kept.
 
         While Plex fails, the page is served from the store alone, none of it
         available, nothing stored changes, and the failure is logged.
@@ -114,15 +117,20 @@ class FavouriteService:
             logger.warning("The favourites are served without their items: %s", error)
             found = {}
         removed: set[int] = set()
+        retitled: list[tuple[Favourite, PlexArtist | PlexAlbum | PlexPlaylist]] = []
         for favourite in page:
             item = found.get(favourite.id)
-            if (
-                item is None
-                or favourite.id in removed
-                or _at_its_rating_key(favourite, item)
-            ):
+            if item is None or favourite.id in removed:
                 continue
-            removed |= self._bring_up_to_date(favourite, item)
+            if not _at_its_rating_key(favourite, item):
+                removed |= self._bring_up_to_date(favourite, item)
+            elif not _titled(item, favourite):
+                retitled.append((favourite, item))
+        self._retitle(
+            (favourite, item)
+            for favourite, item in retitled
+            if favourite.id not in removed
+        )
         total = self._db.execute(
             select(func.count()).select_from(Favourite)
         ).scalar_one()
@@ -289,6 +297,26 @@ class FavouriteService:
             )
         )
         return {other.id} if other is not None else set()
+
+    def _retitle(
+        self,
+        retitled: Iterable[tuple[Favourite, PlexArtist | PlexAlbum | PlexPlaylist]],
+    ) -> None:
+        """Have favourites found at their rating keys hold the titles Plex
+        gives their items now.
+
+        They are written in the order of their ids, whatever the page's
+        order: two listings at once that meet the same renames, each in its
+        own order, then lock the rows in one order and do not deadlock.
+        """
+        for favourite, item in sorted(retitled, key=lambda pair: pair[0].id):
+            self._announce()
+            # A statement, as in _bring_up_to_date().
+            self._db.execute(
+                update(Favourite)
+                .where(Favourite.id == favourite.id)
+                .values(title=item.title, artist_title=_artist_title(item))
+            )
 
 
 def _marking(kind: ItemKind, guid: str) -> Select[Favourite]:

@@ -50,7 +50,7 @@ went, was renamed, or joined or left a group. |
 | `favourites_changed` | `{}` | `GET /api/favourites`, when it shows the \
 favourites, and the artist, album or playlist it shows, for its \
 `favourite_id`: one was marked or unmarked, or a listing found one Plex had \
-moved. |
+moved or retitled. |
 | `task_event` | the task's `event_type`, `task_id`, `timestamp` and \
 `data` | Nothing: it reports a task the client started, such as \
 `POST /api/speakers/{speaker_id}/queue`'s |

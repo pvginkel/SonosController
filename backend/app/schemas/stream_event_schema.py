@@ -104,10 +104,10 @@ class QueueChangedEvent(BaseModel):
 
 class FavouritesChangedEvent(BaseModel):
     """The favourites changed: one was marked or unmarked, or a listing found
-    one whose item Plex had moved and brought it up to date, or removed it
-    as a second mark of that item. A client that shows the favourites
-    fetches `GET /api/favourites`, and one that shows an artist, an album or
-    a playlist fetches it again, for its `favourite_id`.
+    one whose item Plex had moved or retitled and brought it up to date, or
+    removed it as a second mark of that item. A client that shows the
+    favourites fetches `GET /api/favourites`, and one that shows an artist,
+    an album or a playlist fetches it again, for its `favourite_id`.
     """
 
     model_config = _EVENT

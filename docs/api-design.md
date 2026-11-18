@@ -745,7 +745,7 @@ An artist, an album, a track and a playlist:
 - `sort_by=created_at` orders by when the item was marked, `title` by the title's letters first,
   then its accents and case; each ends in `id`.
 - A mark that made a favourite, a removal, and a listing that found a favourite Plex had moved
-  (5) are announced as `favourites_changed` (4).
+  or retitled (5) are announced as `favourites_changed` (4).
 - Section 5 has the record and how it finds its item again.
 
 ### 3.7 Artwork
@@ -915,7 +915,12 @@ erDiagram
    or 3 finds the item, the stored rating key, `guid` and titles are brought up to date, so that
    the next listing finds it at step 1, and the change is announced (4). Where another favourite
    already marks that item, by its kind and `guid`, the one marked later is removed and not
-   listed. A favourite found by step 2 or 3 costs a few Plex calls of its own, once; one found
+   listed. Whenever step 1 finds the item with titles other than the stored ones, Plex having
+   retitled it, the stored titles are brought up to date, so that the order by title and step 3
+   follow the rename, and that too is announced. The listing that meets the rename is still in
+   the order of the old title; the announcement has the displays list again. These writes come
+   after the page's other ones, in the order of the favourites' ids, so that two listings at once
+   that meet the same renames lock them in one order and do not deadlock. A favourite found by step 2 or 3 costs a few Plex calls of its own, once; one found
    nowhere costs both lookups at every listing. While Plex fails, no step runs and nothing
    stored changes.
 3. **One mark per item** (assertion 2) is kept on kind and `guid`, by the store's unique key.

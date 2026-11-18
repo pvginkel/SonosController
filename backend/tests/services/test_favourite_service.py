@@ -146,6 +146,13 @@ def store(
     return favourite
 
 
+def row_versions(session: Session) -> list[tuple[object, ...]]:
+    """Each favourite's id, with where the store holds its row's version: an
+    update writes a new version, elsewhere, even of the values it held."""
+    rows = session.execute(text("SELECT id, ctid::text FROM favourites ORDER BY id"))
+    return [tuple(row) for row in rows]
+
+
 def query(**fields: object) -> FavouriteListQuerySchema:
     return FavouriteListQuerySchema.model_validate(fields)
 
@@ -356,24 +363,6 @@ class TestListFavourites:
         album = listed[3]
         assert (album.title, album.subtitle) == (HOMOGENIC_COMPOSED, BJORK_COMPOSED)
         assert all(favourite.available for favourite in listed)
-
-    def test_a_favourite_shows_the_titles_plex_gives_now_not_the_stored_ones(
-        self, service, session, library
-    ):
-        # Marked as "Homogenic" by "Bjork"; Plex has renamed the album and its
-        # artist since, at the same rating key and guid.
-        favourite = store(
-            session, ItemKind.ALBUM, HOMOGENIC, "Homogenic", artist_title="Bjork"
-        )
-
-        (listed,), _ = service.list_favourites(query())
-
-        assert (listed.id, listed.item_id, listed.available) == (
-            favourite.id,
-            HOMOGENIC,
-            True,
-        )
-        assert (listed.title, listed.subtitle) == (HOMOGENIC_COMPOSED, BJORK_COMPOSED)
 
     def test_a_playlist_carries_the_artwork_id_the_list_of_playlists_carries(
         self, service, container, library
@@ -791,6 +780,151 @@ class TestFindingAgain:
         )
 
 
+class TestRetitled:
+    """A favourite found at its rating key whose item Plex has retitled
+    (``docs/api-design.md`` section 5, decision 2)."""
+
+    def test_it_shows_the_titles_plex_gives_now_and_stores_them(
+        self, service, session, library
+    ):
+        # Marked as "Homogenic" by "Bjork"; Plex has renamed the album and its
+        # artist since, at the same rating key and guid.
+        favourite = store(
+            session, ItemKind.ALBUM, HOMOGENIC, "Homogenic", artist_title="Bjork"
+        )
+        library.requests.clear()
+
+        (listed,), _ = service.list_favourites(query())
+
+        assert library.requests == ["read 1 Plex items"]
+        assert (listed.id, listed.item_id, listed.available) == (
+            favourite.id,
+            HOMOGENIC,
+            True,
+        )
+        assert (listed.title, listed.subtitle) == (HOMOGENIC_COMPOSED, BJORK_COMPOSED)
+        # Stored as Plex gives them.
+        assert stored(session) == [
+            (
+                ItemKind.ALBUM,
+                f"plex://album/{HOMOGENIC}",
+                HOMOGENIC,
+                HOMOGENIC_DECOMPOSED,
+                BJORK_DECOMPOSED,
+            )
+        ]
+
+    def test_an_artist_and_a_playlist_have_their_titles_stored(
+        self, service, session, library
+    ):
+        store(session, ItemKind.ARTIST, RADIOHEAD, "On a Friday")
+        store(session, ItemKind.PLAYLIST, ROAD_TRIP, "Road trip 2025")
+
+        listed, _ = service.list_favourites(query())
+
+        assert [favourite.title for favourite in listed] == ["Radiohead", "Road trip"]
+        assert stored(session) == [
+            (
+                ItemKind.ARTIST,
+                f"plex://artist/{RADIOHEAD}",
+                RADIOHEAD,
+                "Radiohead",
+                None,
+            ),
+            (
+                ItemKind.PLAYLIST,
+                f"com.plexapp.agents.none://{ROAD_TRIP}",
+                ROAD_TRIP,
+                "Road trip",
+                None,
+            ),
+        ]
+
+    def test_the_next_listing_by_title_puts_it_in_its_new_place(
+        self, service, session, library
+    ):
+        # Marked as "Abbey", before "Björk"; Plex calls it "Radiohead" now.
+        radiohead = store(session, ItemKind.ARTIST, RADIOHEAD, "Abbey").id
+        bjork = store(session, ItemKind.ARTIST, BJORK, BJORK_DECOMPOSED).id
+
+        meeting, _ = service.list_favourites(query(sort_by="title"))
+        commit(session)
+        following, _ = service.list_favourites(query(sort_by="title"))
+
+        # The listing that meets the rename is in the order of the old title:
+        # its announcement has the displays list again.
+        assert [(favourite.id, favourite.title) for favourite in meeting] == [
+            (radiohead, "Radiohead"),
+            (bjork, BJORK_COMPOSED),
+        ]
+        assert [favourite.id for favourite in following] == [bjork, radiohead]
+
+    def test_an_unmatched_item_retitled_then_moved_is_found_by_its_new_title(
+        self, service, session, library
+    ):
+        library.add_album(
+            KID_A, [], size=None, artist=RADIOHEAD, title="Kid A", guid=KID_A_GUID
+        )
+        # Marked as "Kid A (demo)"; Plex calls it "Kid A" now, and then sees
+        # it as new.
+        favourite = store(
+            session,
+            ItemKind.ALBUM,
+            KID_A,
+            "Kid A (demo)",
+            guid=KID_A_GUID,
+            artist_title="Radiohead",
+        )
+        service.list_favourites(query())
+        library.move(KID_A, MOVED, guid=f"local://{MOVED}")
+
+        (listed,), _ = service.list_favourites(query())
+
+        assert (listed.id, listed.item_id, listed.available) == (
+            favourite.id,
+            MOVED,
+            True,
+        )
+        assert stored(session) == [
+            (ItemKind.ALBUM, f"local://{MOVED}", MOVED, "Kid A", "Radiohead")
+        ]
+
+    def test_a_listing_whose_titles_are_plex_s_writes_and_announces_nothing(
+        self, service, session, library, connect
+    ):
+        # Stored as a mark stores them: as Plex gives them, accents
+        # decomposed, which the listing serves composed.
+        store(session, ItemKind.ARTIST, RADIOHEAD, "Radiohead")
+        store(session, ItemKind.ARTIST, BJORK, BJORK_DECOMPOSED)
+        store(
+            session,
+            ItemKind.ALBUM,
+            AMNESIAC,
+            "Amnesiac",
+            guid=AMNESIAC_GUID,
+            artist_title="Radiohead",
+        )
+        store(
+            session,
+            ItemKind.ALBUM,
+            HOMOGENIC,
+            HOMOGENIC_DECOMPOSED,
+            artist_title=BJORK_DECOMPOSED,
+        )
+        store(session, ItemKind.PLAYLIST, ROAD_TRIP, "Road trip")
+        commit(session)
+        before = row_versions(session)
+        stream = connect()
+
+        listed, _ = service.list_favourites(query(sort_by="title"))
+        commit(session)
+
+        assert len(listed) == 5
+        assert all(favourite.available for favourite in listed)
+        assert row_versions(session) == before
+        assert stream.events() == []
+
+
 class TestOneMarkPerItemAfterARefresh:
     """A favourite found again at an item another favourite marks."""
 
@@ -998,6 +1132,24 @@ class TestFavouritesChanged:
         listed, _ = service.list_favourites(query())
         commit(session)
         assert [favourite.item_id for favourite in listed] == [MOVED, "5902"]
+        assert stream.events() == []
+
+    def test_a_listing_that_brought_titles_up_to_date_is_announced_once(
+        self, service, session, library, connect
+    ):
+        # At their rating keys, Plex having retitled both.
+        store(session, ItemKind.ARTIST, RADIOHEAD, "On a Friday")
+        store(session, ItemKind.PLAYLIST, ROAD_TRIP, "Road trip 2025")
+        stream = connect()
+
+        service.list_favourites(query())
+
+        assert stream.events() == []
+        commit(session)
+        assert stream.events() == [CHANGED]
+        # The listing made in answer finds both with Plex's titles.
+        service.list_favourites(query())
+        commit(session)
         assert stream.events() == []
 
     def test_a_listing_that_removed_a_second_mark_of_an_item_is_announced(
